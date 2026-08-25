@@ -3,8 +3,8 @@
 The command accepts one remote-free local Git repository and two immutable
 commits. It runs the production Java request builder, isolated Redis/RAG
 namespaces, and the normal inference queue twice: once with an empty plugin
-catalog and once with the assembled catalog. Review and embedding provider calls
-are impossible unless the caller supplies the explicit spend acknowledgement.
+catalog and once with the assembled catalog. Review-provider calls require the
+explicit spend acknowledgement.
 
 This is an operator tool for creating paired evidence. It does not label
 findings, infer provider cost, or make a precision/recall claim.
@@ -51,7 +51,7 @@ from .isolated_paired_capture_preflight import audit_paired_requests
 
 
 SPEND_ACKNOWLEDGEMENT = (
-    "I_UNDERSTAND_THIS_CALLS_OPENROUTER_EMBEDDINGS_AND_THE_BYOK_REVIEW_PROVIDER"
+    "I_UNDERSTAND_THIS_CALLS_THE_BYOK_REVIEW_PROVIDER"
 )
 _CASE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40,64}$")
@@ -865,15 +865,6 @@ def run_capture(args: argparse.Namespace) -> dict[str, Any]:
         preflight_only=args.preflight_only,
         acknowledgement=args.authorize_provider_spend,
     )
-    rag_environment = _env_values(args.rag_env_file)
-    if rag_environment.get("EMBEDDING_PROVIDER", "").strip().casefold() != "openrouter":
-        raise RuntimeError(
-            "isolated paired capture requires EMBEDDING_PROVIDER=openrouter"
-        )
-    if not rag_environment.get("OPENROUTER_API_KEY", "").strip():
-        raise RuntimeError("OpenRouter embedding API key is missing")
-    if not rag_environment.get("OPENROUTER_MODEL", "").strip():
-        raise RuntimeError("OpenRouter embedding model is missing")
     deployment_environment = _env_values(args.deployment_env_file)
     service_secret = deployment_environment.get("INTERNAL_API_SECRET", "").strip()
     if not service_secret:
@@ -946,11 +937,6 @@ def run_capture(args: argparse.Namespace) -> dict[str, Any]:
                 "effectiveCandidatePlugins": list(
                     case.candidate_plugins
                 ),
-            },
-            "embedding": {
-                "provider": "openrouter",
-                "model": rag_environment["OPENROUTER_MODEL"],
-                "callsExecuted": not args.preflight_only,
             },
             "review": {
                 "provider": provider.provider,

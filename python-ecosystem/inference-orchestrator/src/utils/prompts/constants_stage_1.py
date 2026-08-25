@@ -94,6 +94,14 @@ TASK-CONTEXT BATCH SAFETY:
   contradicts the task.
 - PR-wide task coverage is evaluated after all batches in Stage 2/Stage 3.
 
+DEPENDENCY EDGES CROSSING THIS BATCH:
+{batch_boundary_context}
+
+These are exact changed-file relationships whose endpoints could not all be
+co-located in this input pack. They preserve cross-pack awareness; do not assume
+the unseen endpoint is absent or broken. Stage 2 evaluates the complete graph and
+all changed hunks after every Stage 1 pack completes.
+
 PROJECT RULES:
 {project_rules}
 
@@ -171,7 +179,7 @@ Return ONLY valid JSON with this structure:
         }}
       ],
       "confidence": "HIGH|MEDIUM|LOW|INFO",
-      "note": "Optional note"
+      "note": ""
     }}
   ]
 }}
@@ -188,5 +196,9 @@ OUTPUT CONSTRAINTS:
   matched previous issue resolution with isResolved=true; never create a new
   informational issue.
 - isResolved must be a JSON boolean, not a string.
+- When a review has no issues or note, return `"issues": []` and `"note": ""`;
+  never return null for either field.
+- When an issue has no retrieved evidence or plugin claim, return
+  `"evidenceRefs": []` and `"claimKind": ""`; never return null for these fields.
 - Do not include markdown fences or commentary outside the JSON object.
 """

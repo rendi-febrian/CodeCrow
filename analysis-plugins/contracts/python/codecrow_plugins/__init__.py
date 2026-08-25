@@ -31,7 +31,7 @@ from .api import (
     ValidationResult,
 )
 from .catalog import PluginCatalog
-from .facts import build_repository_facts, overlay_repository_facts
+from .facts import build_repository_facts
 from .import_graph import (
     ImportBinding,
     ImportFileRecord,
@@ -85,7 +85,6 @@ __all__ = [
     "ValidationDecision",
     "ValidationResult",
     "build_repository_facts",
-    "overlay_repository_facts",
     "load_descriptor",
     "load_descriptors",
 ]

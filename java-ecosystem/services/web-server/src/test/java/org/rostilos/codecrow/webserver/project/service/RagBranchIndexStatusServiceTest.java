@@ -12,7 +12,6 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.OffsetDateTime;
 import java.util.List;
-import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -23,8 +22,7 @@ class RagBranchIndexStatusServiceTest {
     @Test
     void reportsPrimaryAndEachExplicitRetainedBranchWithoutTransientIndexes() {
         RagBranchIndexRepository branches = mock(RagBranchIndexRepository.class);
-        RagIndexStatusService projectStatus = mock(RagIndexStatusService.class);
-        RagBranchIndexStatusService service = new RagBranchIndexStatusService(branches, projectStatus);
+        RagBranchIndexStatusService service = new RagBranchIndexStatusService(branches);
 
         Project project = new Project();
         ReflectionTestUtils.setField(project, "id", 42L);
@@ -42,8 +40,6 @@ class RagBranchIndexStatusServiceTest {
         temporary.setLifecycleStatus(RagBranchIndexLifecycleStatus.READY);
 
         when(branches.findByProjectId(42L)).thenReturn(List.of(develop, temporary));
-        when(projectStatus.getIndexStatus(project)).thenReturn(Optional.empty());
-
         var statuses = service.getConfiguredBranches(project);
 
         assertThat(statuses).extracting(value -> value.branchName())

@@ -7,8 +7,7 @@ from unittest.mock import patch
 
 from rag_pipeline.api.models import (
     IndexRequest,
-    QueryRequest,
-    PRContextRequest,
+    CodeSearchRequest,
     DeterministicContextRequest,
     ParseFileRequest,
     ParseBatchRequest,
@@ -17,14 +16,8 @@ from rag_pipeline.api.models import (
     PRIndexRequest,
     EstimateRequest,
     EstimateResponse,
-    DeleteBranchRequest,
-    DeleteFilesRequest,
-    ApplyChangesRequest,
-    UpdateFilesRequest,
-    CleanupStaleBranchesRequest,
-    GenerationAliasPublicationRequest,
-    VectorGraphRequest,
-    VectorNodeRequest,
+    RepositoryIndexGraphRequest,
+    RepositoryIndexNodeRequest,
 )
 
 
@@ -38,35 +31,36 @@ class TestIndexRequest:
             project="proj",
             branch="main",
             commit="abc123",
+            source_tree_sha256="a" * 64,
+            collection_target="generation-target",
         )
         assert req.workspace == "ws"
-        assert req.preserve_other_branches is False
-        assert req.cleanup_repo_path is False
         assert req.transfer_repo_ownership is False
 
     @patch.dict(os.environ, {"ALLOWED_REPO_ROOT": "/tmp"})
-    def test_other_branch_preservation_requires_explicit_opt_in(self):
+    def test_direct_api_may_delegate_exact_identity_to_server(self):
         req = IndexRequest(
             repo_path="/tmp/repo",
             workspace="ws",
             project="proj",
             branch="main",
             commit="abc123",
-            preserve_other_branches=True,
         )
-        assert req.preserve_other_branches is True
+
+        assert req.source_tree_sha256 is None
+        assert req.collection_target is None
 
     @patch.dict(os.environ, {"ALLOWED_REPO_ROOT": "/tmp"})
-    def test_queue_consumer_cleanup_requires_explicit_opt_in(self):
-        req = IndexRequest(
-            repo_path="/tmp/codecrow-rag-owned",
-            workspace="ws",
-            project="proj",
-            branch="main",
-            commit="abc123",
-            cleanup_repo_path=True,
-        )
-        assert req.cleanup_repo_path is True
+    def test_malformed_explicit_source_identity_is_rejected(self):
+        with pytest.raises(ValueError, match="source_tree_sha256"):
+            IndexRequest(
+                repo_path="/tmp/repo",
+                workspace="ws",
+                project="proj",
+                branch="main",
+                commit="abc123",
+                source_tree_sha256="not-a-sha256",
+            )
 
     @patch.dict(os.environ, {"ALLOWED_REPO_ROOT": "/tmp"})
     def test_stream_repository_ownership_requires_explicit_opt_in(self):
@@ -76,6 +70,8 @@ class TestIndexRequest:
             project="proj",
             branch="main",
             commit="abc123",
+            source_tree_sha256="a" * 64,
+            collection_target="generation-target",
             transfer_repo_ownership=True,
         )
         assert req.transfer_repo_ownership is True
@@ -89,6 +85,8 @@ class TestIndexRequest:
                 project="proj",
                 branch="main",
                 commit="abc123",
+                source_tree_sha256="a" * 64,
+                collection_target="generation-target",
             )
 
     @patch.dict(os.environ, {"ALLOWED_REPO_ROOT": "/tmp"})
@@ -99,6 +97,8 @@ class TestIndexRequest:
             project="proj",
             branch="main",
             commit="abc123",
+            source_tree_sha256="a" * 64,
+            collection_target="generation-target",
             project_type="magento",
             source_root=r"magento\src\etc",
         )
@@ -114,6 +114,8 @@ class TestIndexRequest:
             project="proj",
             branch="main",
             commit="abc123",
+            source_tree_sha256="a" * 64,
+            collection_target="generation-target",
             project_type=" AUTO ",
         )
 
@@ -129,108 +131,40 @@ class TestIndexRequest:
                 project="proj",
                 branch="main",
                 commit="abc123",
+                source_tree_sha256="a" * 64,
+                collection_target="generation-target",
                 project_type="magento",
                 source_root=source_root,
             )
 
 
-class TestIncrementalFileRequests:
+class TestCodeSearchRequest:
 
-    @patch.dict(os.environ, {"ALLOWED_REPO_ROOT": "/tmp"})
-    def test_update_rejects_repository_path_traversal(self):
-        with pytest.raises(ValueError, match="repository-relative"):
-            UpdateFilesRequest(
-                file_paths=["../etc/passwd"],
-                repo_base="/tmp/repo",
-                workspace="ws",
-                project="project",
-                branch="main",
-                commit="abc123",
-            )
-
-    def test_delete_carries_commit_and_rejects_absolute_paths(self):
-        request = DeleteFilesRequest(
-            file_paths=["app/code/Acme/Module/etc/di.xml"],
-            workspace="ws",
-            project="project",
-            branch="main",
-            commit="abc123",
-        )
-        assert request.commit == "abc123"
-
-        with pytest.raises(ValueError, match="repository-relative"):
-            DeleteFilesRequest(
-                file_paths=["/etc/passwd"],
-                workspace="ws",
-                project="project",
-                branch="main",
-            )
-
-    @patch.dict(os.environ, {"ALLOWED_REPO_ROOT": "/tmp"})
-    def test_change_set_validates_both_path_sets(self):
-        request = ApplyChangesRequest(
-            updated_file_paths=["src/Updated.py"],
-            deleted_file_paths=["src/Deleted.py"],
-            repo_base="/tmp/repository",
-            workspace="ws",
-            project="project",
-            branch="main",
-            commit="abc123",
-        )
-        assert request.updated_file_paths == ["src/Updated.py"]
-        assert request.deleted_file_paths == ["src/Deleted.py"]
-
-        with pytest.raises(ValueError, match="repository-relative"):
-            ApplyChangesRequest(
-                updated_file_paths=["src/Updated.py"],
-                deleted_file_paths=["../Deleted.py"],
-                repo_base="/tmp/repository",
-                workspace="ws",
-                project="project",
-                branch="main",
-                commit="abc123",
-            )
-
-
-class TestPRContextRequest:
-
-    def test_valid_request(self):
-        req = PRContextRequest(
+    def test_exact_generation_binding_is_required(self):
+        request = CodeSearchRequest(
+            query="UserService",
             workspace="ws",
             project="proj",
-            changed_files=["src/main.py"],
+            branch="main",
+            repository_revision="abc123",
+            repository_generation_manifest_sha256="a" * 64,
+            collection_target="generation-target",
         )
-        assert req.top_k == 15  # default
-        assert req.enable_priority_reranking is True
+        assert request.limit is None
+        assert request.repository_revision == "abc123"
 
-    def test_too_many_files_rejected(self):
-        with patch.dict(os.environ, {"RAG_MAX_FILES_PER_REQUEST": "5"}):
-            with pytest.raises(ValueError, match="Too many changed files"):
-                PRContextRequest(
-                    workspace="ws",
-                    project="proj",
-                    changed_files=[f"file{i}.py" for i in range(10)],
-                )
-
-    def test_too_many_snippets_rejected(self):
-        with patch.dict(os.environ, {"RAG_MAX_SNIPPETS_PER_REQUEST": "2"}):
-            with pytest.raises(ValueError, match="Too many diff snippets"):
-                PRContextRequest(
-                    workspace="ws",
-                    project="proj",
-                    changed_files=["a.py"],
-                    diff_snippets=["s1", "s2", "s3"],
-                )
-
-    def test_defaults(self):
-        req = PRContextRequest(
-            workspace="ws",
-            project="proj",
-            changed_files=["a.py"],
-        )
-        assert req.diff_snippets == []
-        assert req.deleted_files == []
-        assert req.min_relevance_score == 0.7
+    def test_limit_is_bounded(self):
+        with pytest.raises(ValueError):
+            CodeSearchRequest(
+                query="UserService",
+                workspace="ws",
+                project="proj",
+                branch="main",
+                repository_revision="abc123",
+                repository_generation_manifest_sha256="a" * 64,
+                collection_target="generation-target",
+                limit=5001,
+            )
 
 
 class TestDeterministicContextRequest:
@@ -241,8 +175,11 @@ class TestDeterministicContextRequest:
             project="proj",
             branches=["main"],
             file_paths=["src/main.py"],
+            base_revision="abc123",
+            base_generation_manifest_sha256="a" * 64,
+            collection_target="generation-target",
         )
-        assert req.limit_per_file == 10
+        assert req.limit_per_file is None
         assert req.additional_identifiers is None
 
     def test_with_additional_identifiers(self):
@@ -251,6 +188,9 @@ class TestDeterministicContextRequest:
             project="proj",
             branches=["main"],
             file_paths=["a.py"],
+            base_revision="abc123",
+            base_generation_manifest_sha256="a" * 64,
+            collection_target="generation-target",
             additional_identifiers=["UserService", "OrderRepository"],
         )
         assert len(req.additional_identifiers) == 2
@@ -287,6 +227,8 @@ class TestPRIndexRequest:
             branch="feature",
             source_revision="head-commit",
             base_revision="base-commit",
+            base_generation_manifest_sha256="a" * 64,
+            collection_target="generation-target",
             files=[
                 PRFileInfo(path="src/main.py", content="x = 1", change_type="MODIFIED"),
             ],
@@ -343,95 +285,24 @@ class TestEstimateResponse:
         assert restored.within_limits is True
 
 
-class TestDeleteBranchRequest:
-
-    def test_construction(self):
-        req = DeleteBranchRequest(workspace="ws", project="proj", branch="feature/old")
-        assert req.branch == "feature/old"
-
-
-class TestGenerationAliasPublicationRequest:
-
-    def test_accepts_legacy_caller_without_registry_manifest_receipt(self):
-        legacy_request = GenerationAliasPublicationRequest(
-            workspace="ws",
-            project="project",
-            branch="main",
-            commit="a" * 40,
-            collection_target="target",
-        )
-        assert legacy_request.generation_manifest_sha256 is None
-
-        request = GenerationAliasPublicationRequest(
-            workspace="ws",
-            project="project",
-            branch="main",
-            commit="a" * 40,
-            collection_target="target",
-            generation_manifest_sha256="b" * 64,
-        )
-        assert request.generation_manifest_sha256 == "b" * 64
-
-        with pytest.raises(ValueError):
-            GenerationAliasPublicationRequest(
-                workspace="ws",
-                project="project",
-                branch="main",
-                commit="a" * 40,
-                collection_target="target",
-                generation_manifest_sha256="invalid",
-            )
-
-
-class TestCleanupStaleBranches:
-
-    def test_requires_authoritative_branches(self):
-        with pytest.raises(ValueError):
-            CleanupStaleBranchesRequest(workspace="ws", project="proj")
-        with pytest.raises(ValueError):
-            CleanupStaleBranchesRequest(
-                workspace="ws",
-                project="proj",
-                protected_branches=[],
-            )
-
-    def test_preserves_explicit_branch_identity(self):
-        req = CleanupStaleBranchesRequest(
-            workspace="ws",
-            project="proj",
-            protected_branches=["synthetic-target"],
-        )
-        assert req.protected_branches == ["synthetic-target"]
-        assert req.branches_to_keep is None
-
-    @pytest.mark.parametrize("branches", [[""], [" main"], ["main", "main"]])
-    def test_rejects_invalid_branch_identities(self, branches):
-        with pytest.raises(ValueError):
-            CleanupStaleBranchesRequest(
-                workspace="ws",
-                project="proj",
-                protected_branches=branches,
-            )
-
-
-class TestVectorStorageInspectionModels:
+class TestRepositoryIndexInspectionModels:
 
     def test_graph_request_defaults(self):
-        req = VectorGraphRequest()
+        req = RepositoryIndexGraphRequest(collection_target="generation-target")
         assert req.limit == 160
         assert req.scan_limit == 2500
         assert req.filters.include_pr is True
 
     def test_graph_limits_are_bounded(self):
         with pytest.raises(ValueError):
-            VectorGraphRequest(limit=5001)
+            RepositoryIndexGraphRequest(collection_target="generation-target", limit=5001)
 
         with pytest.raises(ValueError):
-            VectorGraphRequest(scan_limit=99)
+            RepositoryIndexGraphRequest(collection_target="generation-target", scan_limit=99)
 
     def test_node_neighbor_limit_is_bounded(self):
-        req = VectorNodeRequest(neighbor_limit=40)
+        req = RepositoryIndexNodeRequest(collection_target="generation-target", neighbor_limit=40)
         assert req.neighbor_limit == 40
 
         with pytest.raises(ValueError):
-            VectorNodeRequest(neighbor_limit=500)
+            RepositoryIndexNodeRequest(collection_target="generation-target", neighbor_limit=500)

@@ -1,8 +1,7 @@
 """
 Unit tests for utils.diff_parser — DiffParser, DiffFileInfo.
 """
-import pytest
-from utils.diff_parser import DiffParser, DiffFileInfo
+from utils.diff_parser import DiffParser
 
 
 # ── Sample diffs ─────────────────────────────────────────────────
@@ -108,6 +107,11 @@ class TestExtractSnippets:
     def test_empty_lines(self):
         assert DiffParser._extract_snippets([], 3) == []
 
+    def test_fallback_bounds_long_unicode_line(self):
+        line = "value = " + ("\U0001f9ea" * 500)
+
+        assert DiffParser._extract_snippets([line], 1) == [line[:200]]
+
     def test_comments_skipped(self):
         lines = ["# comment", "// comment", "real_code = True"]
         snippets = DiffParser._extract_snippets(lines, max_snippets=3)
@@ -126,33 +130,3 @@ class TestGetChangedFilePaths:
 
     def test_empty(self):
         assert DiffParser.get_changed_file_paths([]) == []
-
-
-class TestBuildRagQueryFromDiff:
-
-    def test_includes_title_and_description(self):
-        files = DiffParser.parse_diff(SIMPLE_DIFF)
-        query = DiffParser.build_rag_query_from_diff(
-            files, pr_description="Add system import", pr_title="Add logging"
-        )
-        assert "Add logging" in query
-        assert "Add system import" in query
-
-    def test_includes_file_paths(self):
-        files = DiffParser.parse_diff(SIMPLE_DIFF)
-        query = DiffParser.build_rag_query_from_diff(files)
-        assert "src/main.py" in query
-
-    def test_truncation(self):
-        files = DiffParser.parse_diff(SIMPLE_DIFF)
-        query = DiffParser.build_rag_query_from_diff(files, max_query_length=30)
-        assert len(query) <= 34  # 30 + "..."
-
-    def test_empty_files(self):
-        query = DiffParser.build_rag_query_from_diff([])
-        assert query == ""
-
-    def test_no_title_no_description(self):
-        files = DiffParser.parse_diff(SIMPLE_DIFF)
-        query = DiffParser.build_rag_query_from_diff(files)
-        assert len(query) > 0  # Should still have file paths

@@ -6,9 +6,8 @@ provider.  It creates immutable local Git commits with no remote, publishes the
 base snapshot into a unique RAG namespace, and sends the exact head diff through
 an isolated Redis database to a one-off inference-orchestrator container.
 
-The review LLM is replaced by the production prompt-capture adapter.  Embedding
-requests remain enabled and this command refuses to run unless the configured RAG
-provider is OpenRouter.
+The review LLM is replaced by the production prompt-capture adapter. Repository
+context uses the deployed structural index.
 """
 
 from __future__ import annotations
@@ -930,19 +929,6 @@ def _queue_review(
 
 
 def _run_isolated_replay_locked(args: argparse.Namespace) -> dict[str, Any]:
-    rag_environment = _env_values(args.rag_env_file)
-    embedding_provider = rag_environment.get(
-        "EMBEDDING_PROVIDER",
-        "ollama",
-    ).strip().casefold()
-    if embedding_provider != "openrouter":
-        raise RuntimeError(
-            "isolated deployed replay requires EMBEDDING_PROVIDER=openrouter"
-        )
-    embedding_model = rag_environment.get("OPENROUTER_MODEL", "").strip()
-    if not embedding_model:
-        raise RuntimeError("OPENROUTER_MODEL is required")
-
     deployment_environment = _env_values(args.deployment_env_file)
     service_secret = deployment_environment.get("INTERNAL_API_SECRET", "")
     if not service_secret:
@@ -1179,8 +1165,6 @@ def _run_isolated_replay_locked(args: argparse.Namespace) -> dict[str, Any]:
                     "project": project_namespace,
                     "connectedProjectCreated": False,
                     "reviewProviderCalls": 0,
-                    "embeddingProvider": embedding_provider,
-                    "embeddingModel": embedding_model,
                 },
                 "snapshot": {
                     "baseRevision": repository.base_revision,
@@ -1286,17 +1270,6 @@ def _parser() -> argparse.ArgumentParser:
         default=REPOSITORY_ROOT / "deployment" / ".env",
     )
     parser.add_argument(
-        "--rag-env-file",
-        type=Path,
-        default=(
-            REPOSITORY_ROOT
-            / "deployment"
-            / "config"
-            / "rag-pipeline"
-            / ".env"
-        ),
-    )
-    parser.add_argument(
         "--inference-env-file",
         type=Path,
         default=(
@@ -1331,7 +1304,6 @@ def main() -> int:
     args = _parser().parse_args()
     for path in (
         args.deployment_env_file,
-        args.rag_env_file,
         args.inference_env_file,
     ):
         if not path.is_file():

@@ -56,7 +56,10 @@ def test_current_java_source_produces_java_and_spring_architecture_context():
     )
     triples = {(fact.kind, fact.relation, fact.target) for fact in facts}
 
-    assert diagnostics == ()
+    assert len(diagnostics) == 1
+    assert diagnostics[0].code == "plugin-index-output-limit"
+    assert diagnostics[0].path == JAVA_CONTROLLER
+    assert diagnostics[0].recoverable is True
     assert ("java-type", "declares", "org.rostilos.codecrow.pipelineagent.generic.controller.ProviderWebhookController") in triples
     assert ("spring-route", "handles", "POST /api/webhooks/{provider}/{authToken}") in triples
     assert ("spring-injection", "depends-on", "WebhookProjectResolver") in triples
@@ -104,7 +107,12 @@ def test_current_python_sources_produce_python_and_fastapi_architecture_context(
         FileArtifact(FASTAPI_ROUTER, _source(FASTAPI_ROUTER)), capabilities,
     )
 
-    assert app_diagnostics == route_diagnostics == ()
+    assert app_diagnostics == ()
+    assert len(route_diagnostics) == 1
+    assert route_diagnostics[0].code == "plugin-index-output-limit"
+    assert route_diagnostics[0].plugin_id == "python"
+    assert route_diagnostics[0].path == FASTAPI_ROUTER
+    assert route_diagnostics[0].recoverable is True
     assert any(fact.kind == "python-import" and fact.target == "fastapi.FastAPI" for fact in app_facts)
     assert any(fact.kind == "fastapi-application" and fact.target == "app" for fact in app_facts)
     assert any(fact.kind == "fastapi-middleware" and fact.target == "ServiceSecretMiddleware" for fact in app_facts)

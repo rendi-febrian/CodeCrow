@@ -31,7 +31,6 @@ from model.output_schemas import (
     ReconciliationOutput,
 )
 from llm.provider_guard import forbid_llm_provider_construction
-from service.rag.llm_reranker import LLMReranker, RerankResponse
 from service.review.orchestrator import MultiStageReviewOrchestrator
 from service.review.plugin_context import (
     capture_plugin_diagnostics,
@@ -42,11 +41,12 @@ from service.review.evidence_scopes import process_review_evidence_scopes
 
 _FILE_SECTION = re.compile(
     r"^FILE #\d+:\s*(?P<path>[^\r\n]+).*?"
-    r"Current File Content \(post-change; may be bounded when explicitly labelled\):\s*\n"
-    r"(?P<content>.*?)\n\n(?:Delta )?Diff:\s*\n(?P<diff>.*?)(?=\n---(?:\n|$)|\Z)",
+    r"Current File Content \(post-change"
+    r"(?:; may be bounded when explicitly labelled)?\):\s*\n"
+    r"(?P<content>.*?)\n\n(?:Delta Diff \(NEW CHANGES ONLY\)|Diff):\s*\n"
+    r"(?P<diff>.*?)(?=\n---(?:\n|$)|\Z)",
     re.MULTILINE | re.DOTALL,
 )
-_RERANK_ID = re.compile(r'"id"\s*:\s*(\d+)')
 _HIDDEN_PLUGIN_EVIDENCE = re.compile(
     r"\[(?P<count>\d+) plugin evidence target\(s\) omitted because "
     r"no matching exact fact is visible"
@@ -126,7 +126,6 @@ def _classify_stage(schema: Any, rendered: str, tools: tuple[dict[str, Any], ...
         "DeduplicatedIssueList": "deduplication",
         "ReconciliationOutput": "branch_reconciliation",
         "CodeReviewOutput": "branch_analysis",
-        "RerankResponse": "rag_reranking",
     }
     if _schema_name(schema) in by_schema:
         return by_schema[_schema_name(schema)]
@@ -360,13 +359,6 @@ class PromptCaptureSession:
                 issues=[],
             )
 
-        if schema is RerankResponse:
-            rankings = sorted({int(value) for value in _RERANK_ID.findall(rendered)})
-            return RerankResponse(
-                rankings=rankings,
-                reasoning="Dry-run preserves the supplied order.",
-            )
-
         if schema is not None and hasattr(schema, "model_validate"):
             return schema.model_validate({})
         raise TypeError(f"unsupported dry-run response schema: {_schema_name(schema)}")
@@ -514,18 +506,17 @@ class PromptCaptureSession:
             warnings.insert(
                 0,
                 (
-                    "The review LLM provider was disabled. Normal deterministic and "
-                    "semantic RAG retrieval plus PR overlay indexing remained active "
-                    "so the captured prompts contain real assembled project context."
+                    "The review LLM provider was disabled. Deterministic repository "
+                    "retrieval plus PR overlay indexing remained active so the captured "
+                    "prompts contain real assembled project context."
                 ),
             )
         else:
             warnings.insert(
                 0,
                 (
-                    "Provider and embedding calls were disabled. Semantic and duplication "
-                    "RAG context is intentionally absent; deterministic indexed context "
-                    "is included when requested and available."
+                    "Provider calls and index mutations were disabled. Deterministic "
+                    "indexed context is included when requested and available."
                 ),
             )
         if self.simulated_findings_per_file == 0:
@@ -543,7 +534,6 @@ class PromptCaptureSession:
             "dryRun": True,
             "providerCalls": 0,
             "providerCallsScope": "review-llm-only",
-            "embeddingProviderCallsMeasured": False,
             "providerConstructionGuard": {
                 "enabled": True,
                 "boundary": "LLMFactory.create_llm",
@@ -557,8 +547,6 @@ class PromptCaptureSession:
                 "fullPipelineContext": full_pipeline_context,
                 "deterministicRagEnabled": deterministic_rag_enabled,
                 "deterministicRagRequests": deterministic_rag_requests,
-                "semanticRagEnabled": full_pipeline_context,
-                "duplicationRagEnabled": full_pipeline_context,
                 "prIndexMutationEnabled": full_pipeline_context,
                 "mcpToolsEnabled": False,
             },
@@ -578,7 +566,7 @@ class PromptCaptureSession:
                 "headRevision": (
                     self.request.currentCommitHash or self.request.commitHash
                 ),
-                "baseRevision": self.request.baseCommitHash,
+                "baseRevision": self.request.get_target_head_commit_hash(),
                 "changedFiles": sorted(set(self.request.changedFiles or ())),
                 "deletedFiles": sorted(set(self.request.deletedFiles or ())),
                 "rawDiffSha256": (
@@ -683,8 +671,7 @@ class PromptCaptureLLM:
 class DeterministicOnlyRagClient:
     """Read-only RAG facade used by dry runs.
 
-    Exact metadata retrieval is safe because it does not generate embeddings.
-    Every mutation and every embedding-backed search path is replaced locally.
+    Exact metadata retrieval is safe and every mutation is replaced locally.
     """
 
     def __init__(
@@ -704,11 +691,8 @@ class DeterministicOnlyRagClient:
         self.deterministic_requests += 1
         return await self._delegate.get_deterministic_context(**kwargs)
 
-    async def get_pr_context(self, **_: Any) -> dict[str, Any]:
-        return {"context": {"relevant_code": []}}
-
-    async def search_for_duplicates(self, **_: Any) -> list[dict[str, Any]]:
-        return []
+    async def search_code(self, **_: Any) -> dict[str, Any]:
+        return {"results": []}
 
     async def index_pr_files(self, **_: Any) -> dict[str, Any]:
         # Report the shape expected by the orchestrator so it follows the same
@@ -818,7 +802,6 @@ async def capture_review_prompts(
             mcp_client=None,
             rag_client=dry_rag,
             event_callback=capture_event,
-            llm_reranker=LLMReranker(llm_client=llm),
         )
 
         if (
@@ -844,7 +827,6 @@ async def capture_review_prompts(
             evidence_scopes = process_review_evidence_scopes(safe_request)
             await orchestrator.orchestrate_review(
                 request=safe_request,
-                rag_context=None,
                 processed_diff=evidence_scopes.review,
                 full_pr_processed_diff=evidence_scopes.full_pr,
             )
@@ -932,9 +914,6 @@ async def capture_and_store_review_prompts(
         "qualitySignals": report["qualitySignals"],
         "providerCalls": report["providerCalls"],
         "providerCallsScope": report["providerCallsScope"],
-        "embeddingProviderCallsMeasured": report[
-            "embeddingProviderCallsMeasured"
-        ],
         "providerConstructionGuard": report["providerConstructionGuard"],
         "pipeline": {
             "completed": report["pipeline"]["completed"],

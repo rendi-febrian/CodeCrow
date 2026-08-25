@@ -18,8 +18,6 @@ if SRC_DIR not in sys.path:
 # ── Environment variables ─────────────────────────────────────
 os.environ.setdefault("SERVICE_SECRET", "test-secret-token")
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("OLLAMA_BASE_URL", "http://localhost:11434")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/1")
 
 
@@ -44,32 +42,18 @@ def _mock_qdrant():
 
 
 @pytest.fixture(scope="session")
-def _mock_embedding():
-    """Mock embedding model."""
-    mock_embed = MagicMock()
-    mock_embed.get_query_embedding.return_value = [0.1] * 384
-    mock_embed.get_text_embedding.return_value = [0.1] * 384
-    mock_embed.get_text_embedding_batch.return_value = [[0.1] * 384]
-    mock_embed.embed_documents.return_value = [[0.1] * 384]
-    mock_embed.embed_query.return_value = [0.1] * 384
-    mock_embed.close = MagicMock()
-    return mock_embed
-
-
-@pytest.fixture(scope="session")
-def rag_app(_mock_qdrant, _mock_embedding):
+def rag_app(_mock_qdrant):
     """
     Create the RAG FastAPI app with mocked services.
 
     The RAG app is a module-level singleton (not a factory), so we:
     1. Patch service constructors at source (RAGConfig, RAGIndexManager, etc.)
     2. Set the module-level globals that routers read via _get_singletons()
-    3. Patch RAGQueueConsumer at its source module (it's imported inside lifespan)
+    3. Patch thread-pool execution so mocked endpoints stay deterministic
     """
     with patch("rag_pipeline.models.config.RAGConfig") as MockConfig, \
          patch("rag_pipeline.core.index_manager.RAGIndexManager") as MockIM, \
          patch("rag_pipeline.services.query_service.RAGQueryService") as MockQS, \
-         patch("rag_pipeline.server.rag_queue_consumer.RAGQueueConsumer") as MockRQC, \
          patch(
              "fastapi.routing.run_in_threadpool",
              new=_run_in_threadpool_inline,
@@ -77,23 +61,36 @@ def rag_app(_mock_qdrant, _mock_embedding):
 
         mock_config = MagicMock()
         mock_config.qdrant_url = "http://localhost:6333"
-        mock_config.embedding_provider = "ollama"
-        mock_config.max_chunks_per_index = 50000
+        mock_config.max_file_size_bytes = 512 * 1024
         mock_config.max_files_per_index = 5000
-        mock_config.max_file_size_bytes = 1048576
-        mock_config.chunk_size = 1024
-        mock_config.chunk_overlap = 128
+        mock_config.max_chunks_per_index = 1_000_000
+        mock_config.chunk_size = 8000
+        mock_config.chunk_overlap = 200
         MockConfig.return_value = mock_config
 
         mock_im = MagicMock()
+        mock_im._get_project_collection_name.return_value = "code_index_ws__project"
+        mock_im._collection_manager.resolve_collection_target.return_value = (
+            "code_index_ws__project_generation"
+        )
+        mock_im._collection_manager.require_structural_collection.return_value = (
+            "code_index_ws__project_generation"
+        )
+        mock_im.get_revision_preflight.return_value = {
+            "workspace": "ws1",
+            "project": "proj1",
+            "branch": "main",
+            "commit": "revision-1",
+            "generation_manifest_sha256": "a" * 64,
+        }
         mutation_context = MagicMock()
         mutation_context.__enter__.return_value = SimpleNamespace(
             assert_owned=MagicMock()
         )
         mock_im.project_mutation.return_value = mutation_context
         mock_im.pr_overlay_mutation.return_value = mutation_context
-        mock_im.embed_model = _mock_embedding
         mock_im.qdrant_client = _mock_qdrant
+        mock_im.splitter.split_documents.return_value = []
         mock_im.splitter.split_documents_resilient.side_effect = (
             lambda documents, capabilities=None: (
                 mock_im.splitter.split_documents(
@@ -106,23 +103,18 @@ def rag_app(_mock_qdrant, _mock_embedding):
         MockIM.return_value = mock_im
 
         mock_qs = MagicMock()
-        mock_qs.embed_model = _mock_embedding
-        mock_qs.semantic_search.return_value = [
-            {"path": "a.py", "content": "class A: pass", "score": 0.95}
+        mock_qs.search_code.return_value = [
+            {
+                "path": "a.py",
+                "text": "class A: pass",
+                "score": 180,
+                "match_reasons": ["exact identifier"],
+            }
         ]
-        mock_qs.get_context_for_pr.return_value = {
-            "relevant_code": [{"path": "a.py", "content": "class A: pass"}],
-            "related_files": [],
-        }
         mock_qs.get_deterministic_context.return_value = {
             "files": [], "definitions": []
         }
         MockQS.return_value = mock_qs
-
-        mock_rqc_instance = MagicMock()
-        mock_rqc_instance.start = MagicMock()
-        mock_rqc_instance.stop = MagicMock()
-        MockRQC.return_value = mock_rqc_instance
 
         # Directly set module-level globals that routers access
         import rag_pipeline.api.api as api_module

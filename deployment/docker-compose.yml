@@ -276,8 +276,6 @@ services:
       dockerfile: python-ecosystem/rag-pipeline/Dockerfile.observable
     container_name: codecrow-rag-pipeline
     environment:
-      CODECROW_WEB_SERVER_URL: http://web-server:8081
-      CODECROW_INTERNAL_SECRET: ${INTERNAL_API_SECRET:?INTERNAL_API_SECRET must be set in .env}
       SERVICE_SECRET: ${INTERNAL_API_SECRET:?INTERNAL_API_SECRET must be set in .env}
       QDRANT_API_KEY: ${QDRANT_API_KEY:?QDRANT_API_KEY must be set in .env}
       REDIS_URL: redis://redis:6379/1
@@ -291,8 +289,6 @@ services:
       fix-permissions:
         condition: service_completed_successfully
       qdrant:
-        condition: service_healthy
-      web-server:
         condition: service_healthy
     networks:
       - codecrow-network

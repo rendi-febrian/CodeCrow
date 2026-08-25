@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .repository_overlay import IncrementalIndexPreconditionError
+from .exact_index import ExactIndexPreconditionError
 
 
 def require_repository_generation(
@@ -12,22 +12,14 @@ def require_repository_generation(
     project: str,
     branch: str,
     revision: str,
-    generation_manifest_sha256: str | None = None,
-    collection_target: str | None = None,
+    generation_manifest_sha256: str,
+    collection_target: str,
 ):
-    """Load one exact sealed generation and optionally match its receipt."""
-    logical_collection = index_manager._get_project_collection_name(
-        workspace,
-        project,
-    )
-    requested_target = collection_target or logical_collection
-    active_target = index_manager._collection_manager.resolve_collection_target(
+    """Load one exact sealed generation and match its registry receipt."""
+    requested_target = collection_target
+    active_target = index_manager._collection_manager.require_structural_collection(
         requested_target
     )
-    if active_target is None:
-        raise IncrementalIndexPreconditionError(
-            "requested repository collection is unavailable"
-        )
     bound_target = active_target
     result = index_manager.get_revision_preflight(
         workspace,
@@ -37,16 +29,12 @@ def require_repository_generation(
         collection_target=bound_target,
     )
     if result is None:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "requested repository revision is not available as one complete "
             f"sealed generation: {branch}@{revision}"
         )
-    if (
-        generation_manifest_sha256 is not None
-        and result["generation_manifest_sha256"]
-        != generation_manifest_sha256
-    ):
-        raise IncrementalIndexPreconditionError(
+    if result["generation_manifest_sha256"] != generation_manifest_sha256:
+        raise ExactIndexPreconditionError(
             "requested repository generation changed or does not match its "
             f"receipt: {branch}@{revision}"
         )

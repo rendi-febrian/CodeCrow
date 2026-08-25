@@ -66,6 +66,29 @@ class TestExecuteTool:
         assert e.call_log[0]["evidence_complete_file"] is True
 
     @pytest.mark.asyncio(loop_scope="function")
+    async def test_current_client_uses_named_vcs_session(self):
+        vcs_session = MagicMock()
+        vcs_session.call_tool = AsyncMock(return_value=SimpleNamespace(
+            content=[SimpleNamespace(text="named session content")]
+        ))
+        rag_session = MagicMock()
+        client = MagicMock()
+        client.get_all_active_sessions.return_value = {
+            "codecrow-vcs-mcp": vcs_session,
+            "codecrow-rag-mcp": rag_session,
+        }
+
+        executor = McpToolExecutor(client, _make_request(), "stage_1")
+        result = await executor.execute_tool(
+            "getBranchFileContent",
+            {"filePath": "a.py", "branch": "main"},
+        )
+
+        assert result == "named session content"
+        vcs_session.call_tool.assert_awaited_once()
+        rag_session.call_tool.assert_not_called()
+
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_call_failure(self):
         mock_client = MagicMock()
         mock_client.session.call_tool = AsyncMock(side_effect=Exception("timeout"))

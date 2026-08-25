@@ -2,6 +2,7 @@
 Unit tests for utils.mcp_config — MCPConfigBuilder.
 """
 import os
+import sys
 import pytest
 from unittest.mock import patch
 from utils.mcp_config import MCPConfigBuilder
@@ -64,6 +65,34 @@ class TestBuildConfig:
         result = MCPConfigBuilder.build_config("/vcs.jar")
         assert "codecrow-platform-mcp" not in result["mcpServers"]
 
+    @patch.dict(
+        os.environ,
+        {
+            "RAG_API_URL": "http://rag.test:8001",
+            "SERVICE_SECRET": "test-secret",
+        },
+    )
+    def test_rag_mcp_uses_request_binding_and_current_python(self):
+        result = MCPConfigBuilder.build_config(
+            "/vcs.jar",
+            rag_mcp_context={
+                "workspace": "tenant-workspace",
+                "project": "project-namespace",
+                "branch": "main",
+                "revision": "abc123",
+                "manifest": "manifest-sha",
+                "collection_target": "collection",
+            },
+        )
+
+        config = result["mcpServers"]["codecrow-rag-mcp"]
+        assert config["command"] == sys.executable
+        assert config["args"] == ["-m", "service.rag.rag_mcp_server"]
+        assert config["env"]["CODECROW_RAG_MCP_WORKSPACE"] == "tenant-workspace"
+        assert config["env"]["CODECROW_RAG_MCP_REVISION"] == "abc123"
+        assert config["env"]["RAG_API_URL"] == "http://rag.test:8001"
+        assert config["env"]["SERVICE_SECRET"] == "test-secret"
+
 
 class TestBuildJvmProps:
 
@@ -95,13 +124,13 @@ class TestBuildJvmProps:
         assert result["oAuthClient"] == "client"
         assert result["oAuthSecret"] == "secret"
 
-    def test_max_allowed_tokens(self):
+    def test_explicit_token_limit_property_is_emitted(self):
         result = MCPConfigBuilder.build_jvm_props(
             project_id=1, pull_request_id=1,
             workspace="ws", repo_slug="r",
-            max_allowed_tokens=5000,
+            max_allowed_tokens=40_000,
         )
-        assert result["max.allowed.tokens"] == "5000"
+        assert result["max.allowed.tokens"] == "40000"
 
     def test_vcs_provider(self):
         result = MCPConfigBuilder.build_jvm_props(
@@ -110,6 +139,21 @@ class TestBuildJvmProps:
             vcs_provider="github",
         )
         assert result["vcs.provider"] == "github"
+
+    def test_local_repository_binding(self):
+        result = MCPConfigBuilder.build_jvm_props(
+            project_id=1,
+            pull_request_id=42,
+            workspace="ws",
+            repo_slug="repo",
+            local_repo_path="/tmp/codecrow-pr-review-1",
+            local_repo_target_branch="main",
+            local_repo_revision="abc123",
+        )
+
+        assert result["local.repo.path"] == "/tmp/codecrow-pr-review-1"
+        assert result["local.repo.targetBranch"] == "main"
+        assert result["local.repo.revision"] == "abc123"
 
     def test_vcs_base_url(self):
         result = MCPConfigBuilder.build_jvm_props(

@@ -396,7 +396,7 @@ public class BranchAnalysisProcessor {
 				EventNotificationEmitter.emitStatus(consumer, "skipped",
 						"No changed files match the project analysis scope");
 				requireConfirmedLease(lockLease);
-				performIncrementalRagUpdate(request, project, repositoryDiff, consumer, directPushLimited);
+				performRagGenerationRefresh(request, project, consumer);
 				requireConfirmedLease(lockLease);
 				branchHealthService.markBranchHealthy(project, request);
 				requireConfirmedLease(lockLease);
@@ -489,7 +489,7 @@ public class BranchAnalysisProcessor {
 
 			// ── Post-analysis housekeeping ────────────────────────────────────
 			requireConfirmedLease(lockLease);
-			performIncrementalRagUpdate(request, project, repositoryDiff, consumer, directPushLimited);
+			performRagGenerationRefresh(request, project, consumer);
 			requireConfirmedLease(lockLease);
 			branchHealthService.markBranchHealthy(project, request);
 			requireConfirmedLease(lockLease);
@@ -935,34 +935,28 @@ public class BranchAnalysisProcessor {
 		}
 	}
 
-	// ── RAG incremental update ──────────────────────────────────────────────
-	private void performIncrementalRagUpdate(BranchProcessRequest request, Project project, String commitDiff,
-			Consumer<Map<String, Object>> consumer, boolean scopedOnly) {
+	// ── Immutable repository generation refresh ─────────────────────────────
+	private void performRagGenerationRefresh(BranchProcessRequest request, Project project,
+			Consumer<Map<String, Object>> consumer) {
 		if (ragOperationsService == null) {
-			log.info("Skipping RAG incremental update - RagOperationsService not available");
+			log.info("Skipping repository generation refresh - RagOperationsService not available");
 			EventNotificationEmitter.emitStatus(consumer, "rag_skipped",
-					"RAG module not deployed — skipping incremental update");
-			return;
-		}
-		if (scopedOnly && (commitDiff == null || commitDiff.isBlank())) {
-			log.info("Skipping RAG incremental update - no scoped files require an update");
-			EventNotificationEmitter.emitStatus(consumer, "rag_skipped",
-					"No scoped files require a RAG update");
+					"Repository index module not deployed — skipping generation refresh");
 			return;
 		}
 		try {
 			if (!ragOperationsService.isRagEnabled(project)) {
-				log.info("Skipping RAG incremental update - RAG not enabled for project={}",
+				log.info("Skipping repository generation refresh - repository index not enabled for project={}",
 						project.getId());
 				EventNotificationEmitter.emitStatus(consumer, "rag_skipped",
-						"RAG not enabled for this project — skipping incremental update");
+						"Repository index not enabled for this project — skipping generation refresh");
 				return;
 			}
 			if (!ragOperationsService.isRagIndexReady(project)) {
-				log.info("Skipping RAG incremental update - RAG index not yet ready for project={}",
+				log.info("Skipping repository generation refresh - repository index not yet ready for project={}",
 						project.getId());
 				EventNotificationEmitter.emitStatus(consumer, "rag_skipped",
-						"RAG index not yet ready (initial indexing may still be in progress) — skipping incremental update");
+						"Repository index not yet ready (a full generation build may still be in progress)");
 				return;
 			}
 
@@ -971,57 +965,44 @@ public class BranchAnalysisProcessor {
 
 			if (!targetBranch.equals(baseBranch)
 					&& !ragOperationsService.shouldHaveBranchIndex(project, targetBranch)) {
-				log.info("Skipping RAG update for non-retained branch: project={}, branch={}",
+				log.info("Skipping repository generation refresh for non-retained branch: project={}, branch={}",
 						project.getId(), targetBranch);
 				EventNotificationEmitter.emitStatus(consumer, "rag_skipped",
-						"Branch is analyzed but is not configured as a retained RAG branch");
+						"Branch is analyzed but is not configured for a retained repository index");
 				return;
 			}
 
 			// Health check: verify RAG pipeline is reachable before starting
 			if (!ragOperationsService.isRagPipelineHealthy()) {
-				log.warn("RAG pipeline is not reachable — skipping incremental update for project={}",
+				log.warn("Repository index pipeline is not reachable — skipping generation refresh for project={}",
 						project.getId());
 				EventNotificationEmitter.emitStatus(consumer, "rag_skipped",
-						"RAG pipeline not reachable — skipping incremental update");
+						"Repository index pipeline not reachable — skipping generation refresh");
 				return;
 			}
 
-			if (targetBranch.equals(baseBranch) || scopedOnly) {
-				log.info("Incrementally updating RAG index for project={}, branch={}, commit={}, scopedOnly={}",
-						project.getId(), targetBranch, request.getCommitHash(), scopedOnly);
-				EventNotificationEmitter.emitStatus(consumer, "rag_update",
-						scopedOnly
-								? "Updating RAG index for changed files with previous issues only"
-								: "Updating RAG index with changed files for main branch push");
-				boolean ragUpdated = ragOperationsService.triggerIncrementalUpdate(
-						project, targetBranch, request.getCommitHash(), commitDiff, consumer);
-				if (!ragUpdated) {
-					log.info("RAG incremental update did not complete; retaining the last usable index "
-							+ "for project={}, branch={}, commit={}",
-							project.getId(), targetBranch, request.getCommitHash());
-					return;
-				}
-			} else {
-				log.info("Non-main branch push - updating branch index for project={}, branch={}",
-						project.getId(), targetBranch);
-				if (!ragOperationsService.updateBranchIndex(project, targetBranch, consumer)) {
-					log.info("RAG branch index update did not complete; retaining the last usable index "
-							+ "for project={}, branch={}",
-							project.getId(), targetBranch);
-					return;
-				}
+			log.info("Refreshing exact repository generation for project={}, branch={}, commit={}",
+					project.getId(), targetBranch, request.getCommitHash());
+			EventNotificationEmitter.emitStatus(consumer, "rag_update",
+					"Building a complete repository generation for branch '" + targetBranch + "'");
+			boolean ragUpdated = ragOperationsService.refreshBranchGeneration(
+					project, targetBranch, request.getCommitHash(), consumer);
+			if (!ragUpdated) {
+				log.info("Repository generation refresh did not complete; retaining the last usable index "
+						+ "for project={}, branch={}, commit={}",
+						project.getId(), targetBranch, request.getCommitHash());
+				return;
 			}
 
 			// RagOperationsService owns the precise terminal event. A boolean true
 			// also covers an already-current revision, so translating it into a
 			// generic "updated" event here would be a false success report.
-			log.info("RAG reconciliation completed for project={}, branch={}, commit={}",
+			log.info("Repository generation refresh completed for project={}, branch={}, commit={}",
 					project.getId(), targetBranch, request.getCommitHash());
 		} catch (Exception e) {
-			log.warn("RAG incremental update failed (non-critical): {}", e.getMessage());
+			log.warn("Repository generation refresh failed (non-critical): {}", e.getMessage());
 			EventNotificationEmitter.emitStatus(consumer, "rag_update_failed",
-					"RAG incremental update failed (non-critical): " + e.getMessage());
+					"Repository generation refresh failed (non-critical): " + e.getMessage());
 		}
 	}
 

@@ -11,17 +11,33 @@ from .api import DetectionAlternative, PluginDescriptor, PluginKind, ProjectCapa
 from .plugin_glob import plugin_glob_matches
 from .registry import PluginRegistry
 
+
 MAX_DETECTION_EVIDENCE_PER_PLUGIN = 64
 
 
 def _bounded_evidence(evidence: Iterable[str]) -> tuple[str, ...]:
-    """Keep dispatch-critical roots when descriptive evidence is capped."""
-    ordered = tuple(sorted(set(evidence)))
+    """Keep dispatch-critical roots and make any evidence omission explicit."""
+    raw = tuple(sorted(set(evidence)))
+    diagnostics = {
+        item for item in raw
+        if item.startswith("partial:")
+        and not item.startswith("partial:detection-evidence-limit:")
+    }
+    previously_omitted = sum(
+        int(item.rsplit(":", 1)[-1])
+        for item in raw
+        if item.startswith("partial:detection-evidence-limit:")
+    )
+    ordered = tuple(item for item in raw if not item.startswith("partial:"))
     roots = tuple(item for item in ordered if item.startswith("root:"))
     non_roots = tuple(item for item in ordered if not item.startswith("root:"))
     retained_roots = roots[:MAX_DETECTION_EVIDENCE_PER_PLUGIN]
     remaining = MAX_DETECTION_EVIDENCE_PER_PLUGIN - len(retained_roots)
-    return tuple(sorted((*retained_roots, *non_roots[:remaining])))
+    retained = tuple(sorted((*retained_roots, *non_roots[:remaining])))
+    omitted = previously_omitted + len(ordered) - len(retained)
+    if omitted:
+        diagnostics.add(f"partial:detection-evidence-limit:{omitted}")
+    return tuple(sorted((*retained, *diagnostics)))
 
 
 def _under_source_root(path: str, source_root: str | None) -> bool:
@@ -165,6 +181,11 @@ def _group_evidence(group: DetectionAlternative, facts: RepositoryFacts) -> tupl
         matched_evidence.update(evidence)
         matched_roots += 1
         if matched_roots == MAX_DETECTION_EVIDENCE_PER_PLUGIN:
+            if len(candidate_roots) > matched_roots:
+                matched_evidence.add(
+                    "partial:detection-root-limit:"
+                    f"{len(candidate_roots) - matched_roots}"
+                )
             break
     return _bounded_evidence(matched_evidence) if matched_evidence else None
 

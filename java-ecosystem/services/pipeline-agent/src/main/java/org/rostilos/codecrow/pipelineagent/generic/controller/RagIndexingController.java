@@ -2,7 +2,6 @@ package org.rostilos.codecrow.pipelineagent.generic.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.rostilos.codecrow.core.dto.project.ProjectDTO;
-import org.rostilos.codecrow.ragengine.service.VcsRagIndexingService;
 import org.rostilos.codecrow.ragengine.branch.BranchIndexMaintenanceService;
 import org.rostilos.codecrow.core.persistence.repository.project.ProjectRepository;
 import org.slf4j.Logger;
@@ -31,18 +30,15 @@ public class RagIndexingController {
     private static final Logger log = LoggerFactory.getLogger(RagIndexingController.class);
     private static final String EOF_MARKER = "__EOF__";
 
-    private final VcsRagIndexingService vcsRagIndexingService;
     private final BranchIndexMaintenanceService branchIndexMaintenanceService;
     private final ProjectRepository projectRepository;
     private final ObjectMapper objectMapper;
 
     public RagIndexingController(
-            VcsRagIndexingService vcsRagIndexingService,
             BranchIndexMaintenanceService branchIndexMaintenanceService,
             ProjectRepository projectRepository,
             ObjectMapper objectMapper
     ) {
-        this.vcsRagIndexingService = vcsRagIndexingService;
         this.branchIndexMaintenanceService = branchIndexMaintenanceService;
         this.projectRepository = projectRepository;
         this.objectMapper = objectMapper;
@@ -73,14 +69,13 @@ public class RagIndexingController {
 
             CompletableFuture<Map<String, Object>> indexingFuture = CompletableFuture.supplyAsync(() -> {
                 try {
-                    if (request.allConfiguredBranches()
-                            || (request.branch() != null && !request.branch().isBlank())) {
-                        var project = projectRepository.findByIdWithFullDetails(authProject.id())
-                                .orElseThrow(() -> new IllegalStateException("Project not found"));
-                        return branchIndexMaintenanceService.rebuild(
-                                project, request.branch(), request.allConfiguredBranches(), messageConsumer);
-                    }
-                    return vcsRagIndexingService.indexProjectFromVcs(authProject, null, messageConsumer);
+                    var project = projectRepository.findByIdWithFullDetails(authProject.id())
+                            .orElseThrow(() -> new IllegalStateException("Project not found"));
+                    return branchIndexMaintenanceService.rebuild(
+                            project,
+                            request.branch(),
+                            request.allConfiguredBranches(),
+                            messageConsumer);
                 } catch (Exception e) {
                     log.error("RAG indexing failed", e);
                     return Map.of(

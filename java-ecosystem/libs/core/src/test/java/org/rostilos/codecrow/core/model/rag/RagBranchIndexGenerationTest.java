@@ -26,9 +26,8 @@ class RagBranchIndexGenerationTest {
         assertThat(generation.getStatus()).isEqualTo(RagBranchIndexGenerationStatus.ACTIVE);
         assertThat(generation.getActivatedAt()).isNotNull();
         assertThat(branchIndex.getActiveGeneration()).isSameAs(generation);
-        assertThat(branchIndex.getCommitHash()).isEqualTo("develop-002");
         assertThat(branchIndex.getDesiredCommitHash()).isEqualTo("develop-002");
-        assertThat(branchIndex.getChunkCount()).isEqualTo(840);
+        assertThat(branchIndex.getActiveGeneration().getChunkCount()).isEqualTo(840);
         assertThat(branchIndex.getLifecycleStatus()).isEqualTo(RagBranchIndexLifecycleStatus.READY);
     }
 
@@ -50,7 +49,7 @@ class RagBranchIndexGenerationTest {
         branchIndex.failUpdate(replacement.getErrorMessage());
 
         assertThat(branchIndex.getActiveGeneration()).isSameAs(active);
-        assertThat(branchIndex.getCommitHash()).isEqualTo("master-100");
+        assertThat(branchIndex.getActiveGeneration().getRevision()).isEqualTo("master-100");
         assertThat(branchIndex.getDesiredCommitHash()).isEqualTo("master-101");
         assertThat(branchIndex.getLifecycleStatus()).isEqualTo(RagBranchIndexLifecycleStatus.READY);
         assertThat(branchIndex.getErrorMessage()).isEqualTo("Qdrant unavailable");

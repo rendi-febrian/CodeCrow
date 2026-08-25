@@ -1,4 +1,5 @@
 import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -188,6 +189,82 @@ def test_stage_2_candidate_cannot_claim_a_hunk_omitted_from_its_prompt():
     }
 
 
+def test_stage_2_candidate_uses_issue_specific_prompt_visibility():
+    processed = DiffProcessor().process(TWO_HUNK_DIFF)
+    first_hunk, second_hunk = processed.files[0].hunks
+    issue = _issue(snippet="second_new()").model_copy(update={"id": "CROSS_001"})
+    review_units = Stage1ReviewUnitState(
+        units_by_hunk={
+            first_hunk.id: {"sha256:first-unit"},
+            second_hunk.id: {"sha256:second-unit"},
+        },
+        unit_owner={
+            "sha256:first-unit": 1,
+            "sha256:second-unit": 2,
+        },
+        completed_unit_ids={
+            "sha256:first-unit",
+            "sha256:second-unit",
+        },
+        registered=True,
+    )
+    ledger = CandidateEvidenceLedger()
+
+    _register_stage_2_candidates(
+        [issue],
+        _request(),
+        processed,
+        review_units,
+        ledger,
+        {first_hunk.id, second_hunk.id},
+        {},
+        {
+            "issuePromptDigests": json.dumps({
+                "CROSS_001": "sha256:" + "b" * 64,
+            }),
+            "issuePromptHunkIds": json.dumps({
+                "CROSS_001": [first_hunk.id],
+            }),
+        },
+    )
+
+    assert apply_candidate_provenance_gate(
+        [issue],
+        _request(),
+        processed,
+        ledger,
+        review_units.units_by_hunk,
+    ) == []
+    ledger.assert_terminal()
+
+
+def test_stage_2_candidate_requires_issue_specific_hunk_provenance():
+    processed = DiffProcessor().process(RAW_DIFF)
+    issue = _issue().model_copy(update={"id": "CROSS_001"})
+
+    with pytest.raises(RuntimeError, match="issue-specific visible-hunk"):
+        _register_stage_2_candidates(
+            [issue],
+            _request(),
+            processed,
+            Stage1ReviewUnitState(
+                units_by_hunk={},
+                unit_owner={},
+                completed_unit_ids=set(),
+                registered=True,
+            ),
+            CandidateEvidenceLedger(),
+            {processed.files[0].hunks[0].id},
+            {},
+            {
+                "issuePromptDigests": json.dumps({
+                    "CROSS_001": "sha256:" + "c" * 64,
+                }),
+                "issuePromptHunkIds": "{}",
+            },
+        )
+
+
 def test_candidate_cannot_cite_evidence_visible_only_to_another_prompt():
     processed = DiffProcessor().process(RAW_DIFF)
     hunk_id = processed.files[0].hunks[0].id
@@ -260,8 +337,6 @@ def test_terminal_capture_accepts_deterministic_candidate_ledger():
         ),
         "retrieval": {
             "deterministicStates": ["complete"],
-            "semanticFailures": 0,
-            "semanticDisabled": False,
             "exactEvidenceIds": 0,
         },
         "revisionBinding": {

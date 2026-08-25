@@ -4,13 +4,13 @@ Tests for ReviewService helper methods.
 Covers: _build_jvm_props, _build_pr_metadata, _emit_event, _create_llm,
         _create_mcp_client
 """
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from service.review.review_service import (
-    ReviewService,
-    allow_unbound_global_rag_fallback,
-)
+from model.dtos import ReviewRequestDto
+from service.review.review_service import ReviewService
 
 
 @pytest.fixture
@@ -21,8 +21,7 @@ def service():
         "MAX_CONCURRENT_REVIEWS": "2",
     }):
         with patch("service.review.review_service.RagClient"):
-            with patch("service.review.review_service.get_rag_cache"):
-                svc = ReviewService()
+            svc = ReviewService()
     return svc
 
 
@@ -56,9 +55,17 @@ class TestBuildJvmProps:
             accessToken=None,
             maxAllowedTokens=100000,
             vcsProvider="bitbucket",
+            vcsBaseUrl=None,
+            localRepoPath="/tmp/review-snapshot",
+            localRepoTargetBranch="main",
+            localRepoRevision="abc123",
         )
-        result = service._build_jvm_props(request, None)
+        result = service._build_jvm_props(request)
         assert isinstance(result, dict)
+        assert result["max.allowed.tokens"] == "100000"
+        assert result["local.repo.path"] == "/tmp/review-snapshot"
+        assert result["local.repo.targetBranch"] == "main"
+        assert result["local.repo.revision"] == "abc123"
 
     def test_with_override_tokens(self, service):
         request = MagicMock(
@@ -71,8 +78,12 @@ class TestBuildJvmProps:
             accessToken=None,
             maxAllowedTokens=None,
             vcsProvider="github",
+            vcsBaseUrl=None,
+            localRepoPath=None,
+            localRepoTargetBranch=None,
+            localRepoRevision=None,
         )
-        result = service._build_jvm_props(request, 50000)
+        result = service._build_jvm_props(request)
         assert isinstance(result, dict)
 
 
@@ -146,58 +157,40 @@ class TestReviewServiceRequestRag:
 
         assert service._rag_client_for_request(request) is service.rag_client
 
-    def test_exact_pr_review_disables_unbound_global_fallback(self):
+    def test_exact_generation_binding_enables_rag_mcp(self, service):
         request = MagicMock(
-            pullRequestId=42,
-            baseCommitHash="a" * 40,
-            currentCommitHash="b" * 40,
-            commitHash=None,
-        )
-
-        assert allow_unbound_global_rag_fallback(request) is False
-
-    def test_non_pr_request_can_use_global_fallback(self):
-        request = MagicMock(
-            pullRequestId=None,
-            baseCommitHash=None,
-            currentCommitHash="b" * 40,
-            commitHash=None,
-        )
-
-        assert allow_unbound_global_rag_fallback(request) is True
-
-    @pytest.mark.asyncio(loop_scope="function")
-    async def test_failed_global_fallback_emits_reduced_context_status(
-        self,
-        service,
-    ):
-        service.rag_client = MagicMock(enabled=True)
-        service.rag_client.get_pr_context = AsyncMock(return_value={
-            "status": "error",
-            "status_code": 503,
-            "error": "RAG service unavailable",
-        })
-        service.rag_cache.get.return_value = None
-        request = MagicMock(
-            ragEnabled=True,
-            projectId=1,
-            pullRequestId=None,
-            projectWorkspace="ws",
+            projectWorkspace="tenant",
             projectNamespace="project",
-            changedFiles=["src/a.py"],
-            diffSnippets=[],
-            prTitle="Change A",
-            prDescription=None,
+            targetBranchName="main",
+            targetHeadCommitHash="target-head",
+            baseCommitHash="merge-base",
+            ragBaseGenerationManifestSha256="manifest",
+            ragCollectionTarget="collection",
         )
-        request.get_rag_branch.return_value = "main"
-        request.get_rag_base_branch.return_value = None
-        events = []
+        request.get_target_head_commit_hash.return_value = "target-head"
 
-        result = await service._fetch_rag_context(request, events.append)
+        assert service._build_rag_mcp_context(request, MagicMock()) == {
+            "workspace": "tenant",
+            "project": "project",
+            "branch": "main",
+            "revision": "target-head",
+            "manifest": "manifest",
+            "collection_target": "collection",
+        }
 
-        assert result is None
-        assert any(event.get("state") == "rag_skipped" for event in events)
+    def test_incomplete_generation_binding_skips_only_rag_mcp(self, service):
+        request = MagicMock(
+            projectWorkspace="tenant",
+            projectNamespace="project",
+            targetBranchName="main",
+            targetHeadCommitHash="target-head",
+            baseCommitHash="merge-base",
+            ragBaseGenerationManifestSha256=None,
+            ragCollectionTarget=None,
+        )
+        request.get_target_head_commit_hash.return_value = "target-head"
 
+        assert service._build_rag_mcp_context(request, MagicMock()) is None
 
 # ── _create_llm ──────────────────────────────────────────────────
 
@@ -207,12 +200,20 @@ class TestReviewServiceCreateLlm:
             aiModel="gpt-4",
             aiProvider="openai",
             aiApiKey="key",
+            aiBaseUrl=None,
+            aiCustomParameters=None,
             projectId=1,
         )
         with patch("service.review.review_service.LLMFactory") as mock_factory:
             mock_factory.create_llm.return_value = MagicMock()
             llm = service._create_llm(request)
-            mock_factory.create_llm.assert_called_once()
+            mock_factory.create_llm.assert_called_once_with(
+                "gpt-4",
+                "openai",
+                "key",
+                ai_base_url=None,
+                ai_custom_parameters=None,
+            )
 
     def test_failure(self, service):
         request = MagicMock(
@@ -240,3 +241,44 @@ class TestReviewServiceConstants:
     def test_review_timeout_is_int(self, service):
         assert isinstance(ReviewService.REVIEW_TIMEOUT_SECONDS, int)
         assert ReviewService.REVIEW_TIMEOUT_SECONDS > 0
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_cancellation_during_mcp_startup_closes_owned_client(service):
+    request = ReviewRequestDto(
+        projectId=1,
+        projectVcsWorkspace="ws",
+        projectVcsRepoSlug="repo",
+        projectWorkspace="tenant",
+        projectNamespace="project",
+        aiProvider="OPENAI",
+        aiModel="gpt-4",
+        aiApiKey="key",
+        ragEnabled=False,
+        useMcpTools=True,
+    )
+    client = MagicMock()
+    client.close_all_sessions = AsyncMock()
+    initialization_started = asyncio.Event()
+
+    class HangingAgentExecutionService:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def initialize(self, **_kwargs):
+            initialization_started.set()
+            await asyncio.Future()
+
+    with (
+        patch("service.review.review_service.os.path.exists", return_value=True),
+        patch.object(service, "_create_llm", return_value=object()),
+        patch.object(service, "_create_mcp_client", return_value=client),
+        patch("service.agent.AgentExecutionService", HangingAgentExecutionService),
+    ):
+        task = asyncio.create_task(service._process_review(request))
+        await asyncio.wait_for(initialization_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    client.close_all_sessions.assert_awaited_once()

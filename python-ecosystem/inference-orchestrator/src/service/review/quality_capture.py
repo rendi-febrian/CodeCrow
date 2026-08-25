@@ -199,7 +199,6 @@ def _classify_stage(schema: Any, rendered: str, tools: tuple[dict[str, Any], ...
         "DeduplicatedIssueList": "deduplication",
         "ReconciliationOutput": "branch_reconciliation",
         "CodeReviewOutput": "branch_analysis",
-        "RerankResponse": "rag_reranking",
     }
     schema_stage = by_schema.get(_schema_name(schema))
     if schema_stage:
@@ -849,24 +848,14 @@ def _terminal_pipeline_evidence(event: Any) -> Optional[dict[str, Any]]:
             "terminal pipeline evidence contains incomplete deterministic "
             "retrieval states: " + ", ".join(incomplete_retrieval)
         )
-    semantic_failures = retrieval.get("semanticFailures")
     exact_evidence_ids = retrieval.get("exactEvidenceIds")
-    for field, value in (
-        ("semanticFailures", semantic_failures),
-        ("exactEvidenceIds", exact_evidence_ids),
+    if (
+        not isinstance(exact_evidence_ids, int)
+        or isinstance(exact_evidence_ids, bool)
+        or exact_evidence_ids < 0
     ):
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ValueError(
-                f"terminal pipeline evidence has invalid retrieval.{field}"
-            )
-    if semantic_failures:
         raise ValueError(
-            "terminal pipeline evidence contains semantic retrieval failures"
-        )
-    semantic_disabled = retrieval.get("semanticDisabled")
-    if not isinstance(semantic_disabled, bool):
-        raise ValueError(
-            "terminal pipeline evidence has invalid retrieval.semanticDisabled"
+            "terminal pipeline evidence has invalid retrieval.exactEvidenceIds"
         )
 
     revision_binding = event.get("revisionBinding")
@@ -1025,8 +1014,6 @@ def _terminal_pipeline_evidence(event: Any) -> Optional[dict[str, Any]]:
         "hunkReceipts": normalized_hunk_receipts,
         "retrieval": {
             "deterministicStates": list(deterministic_states),
-            "semanticFailures": semantic_failures,
-            "semanticDisabled": semantic_disabled,
             "exactEvidenceIds": exact_evidence_ids,
         },
         "revisionBinding": {

@@ -17,7 +17,7 @@ class DiffFileInfo:
 
 
 class DiffParser:
-    """Parse unified diff format to extract relevant information for RAG queries."""
+    """Parse unified diff format into changed-file information."""
 
     # Patterns for detecting function/method signatures across languages
     FUNCTION_PATTERNS = [
@@ -126,7 +126,7 @@ class DiffParser:
         if not snippets:
             for line in lines:
                 if line and len(line.strip()) > 10:
-                    snippets.append(line.strip()[:200])  # Limit length
+                    snippets.append(line.strip()[:200])
                     if len(snippets) >= max_snippets:
                         break
 
@@ -136,46 +136,3 @@ class DiffParser:
     def get_changed_file_paths(diff_files: List[DiffFileInfo]) -> List[str]:
         """Extract list of changed file paths."""
         return [f.path for f in diff_files if f.change_type != 'deleted']
-
-    @staticmethod
-    def build_rag_query_from_diff(
-        diff_files: List[DiffFileInfo],
-        pr_description: str = None,
-        pr_title: str = None,
-        max_query_length: int = 500
-    ) -> str:
-        """
-        Build a rich query string for RAG semantic search.
-
-        Combines PR description, file paths, and code snippets intelligently.
-        """
-        query_parts = []
-
-        # 1. PR title and description (highest priority for semantic intent)
-        if pr_title:
-            query_parts.append(pr_title)
-        if pr_description:
-            # Truncate description to keep query manageable
-            desc = pr_description[:300] if len(pr_description) > 300 else pr_description
-            query_parts.append(desc)
-
-        # 2. Code snippets (function signatures, class names)
-        all_snippets = []
-        for diff_file in diff_files[:10]:  # Limit to first 10 files
-            all_snippets.extend(diff_file.code_snippets[:2])  # Top 2 per file
-
-        if all_snippets:
-            query_parts.append("Code changes: " + " | ".join(all_snippets[:8]))
-
-        # 3. File paths (for context)
-        file_paths = [f.path for f in diff_files[:15]]  # Limit to 15 files
-        if file_paths:
-            query_parts.append("Files: " + ", ".join(file_paths))
-
-        # Join and truncate to max length
-        query = " ".join(query_parts)
-        if len(query) > max_query_length:
-            query = query[:max_query_length] + "..."
-
-        return query
-

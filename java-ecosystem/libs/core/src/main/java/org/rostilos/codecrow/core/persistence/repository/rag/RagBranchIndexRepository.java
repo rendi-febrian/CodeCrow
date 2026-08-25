@@ -22,19 +22,6 @@ import java.util.Optional;
 @Repository
 public interface RagBranchIndexRepository extends JpaRepository<RagBranchIndex, Long> {
 
-    interface OperatorAliasCandidate {
-        Long getBranchIndexId();
-        Long getGenerationId();
-        Long getProjectId();
-        String getWorkspaceName();
-        String getProjectNamespace();
-        String getBranchName();
-        String getRevision();
-        String getCollectionName();
-        String getManifestDigest();
-        RagBranchIndexKind getIndexKind();
-    }
-
     /**
      * Immutable coordinates required to advance the currently published
      * generation. Keeping this boundary scalar prevents callers from carrying
@@ -45,6 +32,7 @@ public interface RagBranchIndexRepository extends JpaRepository<RagBranchIndex, 
         Long getGenerationId();
         String getRevision();
         String getCollectionName();
+        String getManifestDigest();
         String getRepresentationFingerprint();
         Integer getFileCount();
         Integer getChunkCount();
@@ -70,6 +58,7 @@ public interface RagBranchIndexRepository extends JpaRepository<RagBranchIndex, 
             SELECT g.id AS generationId,
                    g.revision AS revision,
                    g.collectionName AS collectionName,
+                   g.manifestDigest AS manifestDigest,
                    g.representationFingerprint AS representationFingerprint,
                    g.fileCount AS fileCount,
                    g.chunkCount AS chunkCount,
@@ -187,55 +176,15 @@ public interface RagBranchIndexRepository extends JpaRepository<RagBranchIndex, 
     @Query("SELECT b.branchName FROM RagBranchIndex b WHERE b.project.id = :projectId")
     List<String> findBranchNamesByProjectId(@Param("projectId") Long projectId);
 
-    /**
-     * Reads the immutable values needed by optional operator-alias repair.
-     * Returning a scalar projection lets the database transaction finish
-     * before the caller performs any potentially slow RAG/Qdrant request.
-     */
-    @Query("""
-            SELECT b.project.id AS projectId,
-                   b.id AS branchIndexId,
-                   b.activeGeneration.id AS generationId,
-                   b.project.workspace.name AS workspaceName,
-                   b.project.namespace AS projectNamespace,
-                   b.branchName AS branchName,
-                   b.activeGeneration.revision AS revision,
-                   b.activeGeneration.collectionName AS collectionName,
-                   b.activeGeneration.manifestDigest AS manifestDigest,
-                   b.indexKind AS indexKind
-            FROM RagBranchIndex b
-            WHERE b.activeGeneration IS NOT NULL
-              AND b.indexKind IN (
-                org.rostilos.codecrow.core.model.rag.RagBranchIndexKind.PRIMARY,
-                org.rostilos.codecrow.core.model.rag.RagBranchIndexKind.DURABLE
-              )
-            """)
-    List<OperatorAliasCandidate> findOperatorAliasCandidates();
+    @Query("SELECT b.branchName FROM RagBranchIndex b "
+            + "WHERE b.project.id = :projectId AND b.activeGeneration IS NOT NULL "
+            + "ORDER BY b.branchName")
+    List<String> findActiveBranchNamesByProjectId(@Param("projectId") Long projectId);
 
-    /**
-     * Re-reads one branch's current publication coordinates without retaining
-     * an entity or transaction across the remote alias request.
-     */
-    @Query("""
-            SELECT b.project.id AS projectId,
-                   b.id AS branchIndexId,
-                   b.activeGeneration.id AS generationId,
-                   b.project.workspace.name AS workspaceName,
-                   b.project.namespace AS projectNamespace,
-                   b.branchName AS branchName,
-                   b.activeGeneration.revision AS revision,
-                   b.activeGeneration.collectionName AS collectionName,
-                   b.activeGeneration.manifestDigest AS manifestDigest,
-                   b.indexKind AS indexKind
-            FROM RagBranchIndex b
-            WHERE b.id = :branchIndexId
-              AND b.activeGeneration IS NOT NULL
-              AND b.indexKind IN (
-                org.rostilos.codecrow.core.model.rag.RagBranchIndexKind.PRIMARY,
-                org.rostilos.codecrow.core.model.rag.RagBranchIndexKind.DURABLE
-              )
-            """)
-    Optional<OperatorAliasCandidate> findOperatorAliasCandidateById(
-            @Param("branchIndexId") Long branchIndexId);
+    @Query("SELECT b.branchName FROM RagBranchIndex b "
+            + "WHERE b.project.id = :projectId AND b.activeGeneration IS NOT NULL "
+            + "AND b.indexKind = org.rostilos.codecrow.core.model.rag.RagBranchIndexKind.PRIMARY")
+    Optional<String> findPrimaryActiveBranchNameByProjectId(
+            @Param("projectId") Long projectId);
 
 }

@@ -1,5 +1,4 @@
 from types import SimpleNamespace
-import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,7 +8,6 @@ from rag_pipeline.core.coordination import (
     MutationLease,
     MutationLeaseUnavailable,
     ProjectMutationCoordinator,
-    RedisPermitPool,
 )
 from rag_pipeline.core.index_manager.collection_manager import CollectionManager
 from rag_pipeline.core.index_manager.manager import RAGIndexManager
@@ -31,7 +29,10 @@ def test_project_mutation_lease_is_acquired_verified_and_released():
     coordinator._client.get.return_value = None
 
     with patch.object(MutationLease, "start_renewal"):
-        with coordinator.acquire("workspace", "project", "full-index") as lease:
+        with coordinator.acquire(
+            "workspace", "project", "full-index",
+            collection_target="generation",
+        ) as lease:
             coordinator._client.get.return_value = lease.token
             lease.assert_owned()
 
@@ -44,7 +45,10 @@ def test_project_mutation_lease_rejects_an_overlapping_job():
     coordinator._client.set.return_value = False
 
     with pytest.raises(MutationLeaseUnavailable, match="another RAG mutation"):
-        with coordinator.acquire("workspace", "project", "full-index"):
+        with coordinator.acquire(
+            "workspace", "project", "full-index",
+            collection_target="generation",
+        ):
             pass
 
 
@@ -116,60 +120,11 @@ def test_project_mutation_coordination_fails_closed_when_redis_is_unavailable():
     coordinator._client.set.side_effect = RuntimeError("redis unavailable")
 
     with pytest.raises(MutationCoordinationUnavailable, match="Redis is unavailable"):
-        with coordinator.acquire("workspace", "project", "full-index"):
+        with coordinator.acquire(
+            "workspace", "project", "full-index",
+            collection_target="generation",
+        ):
             pass
-
-
-def test_openrouter_capacity_limiter_falls_back_locally_when_redis_is_unavailable():
-    pool = RedisPermitPool(
-        "redis://unused",
-        2,
-        permit_seconds=60,
-        acquire_timeout_seconds=0.1,
-    )
-    pool._client = MagicMock()
-    pool._client.eval.side_effect = RuntimeError("redis unavailable")
-
-    with pool.permit():
-        pass
-
-    pool._client.eval.assert_called_once()
-    assert pool._local.acquire(blocking=False)
-    pool._local.release()
-
-
-def test_openrouter_capacity_outage_logs_only_transitions(caplog):
-    pool = RedisPermitPool(
-        "redis://unused",
-        2,
-        permit_seconds=60,
-        acquire_timeout_seconds=0.1,
-    )
-    pool._client = MagicMock()
-    pool._client.eval.side_effect = [
-        RuntimeError("redis unavailable"),
-        RuntimeError("redis unavailable"),
-        True,
-    ]
-
-    with caplog.at_level(logging.DEBUG):
-        pool._disabled_until = 0
-        with pool.permit():
-            pass
-        pool._disabled_until = 0
-        with pool.permit():
-            pass
-        pool._disabled_until = 0
-        with pool.permit():
-            pass
-
-    warnings = [
-        record for record in caplog.records
-        if record.levelno == logging.WARNING
-        and "capacity limit unavailable" in record.getMessage()
-    ]
-    assert len(warnings) == 1
-    assert "capacity limit recovered" in caplog.text
 
 
 def test_pending_janitor_keeps_live_and_aliased_collections_and_deletes_expired():
@@ -184,9 +139,9 @@ def test_pending_janitor_keeps_live_and_aliased_collections_and_deletes_expired(
         SimpleNamespace(name="base_pending_1000000000_aaaaaaaa_bbbbbbbb"),
         SimpleNamespace(name="base_pending_1000000000_cccccccc_dddddddd"),
         SimpleNamespace(name="base_pending_1000000000_eeeeeeee_ffffffff"),
-        SimpleNamespace(name="legacy_pending_unknown"),
+        SimpleNamespace(name="unrecognized_pending_name"),
     ]
-    manager = CollectionManager(client, 3)
+    manager = CollectionManager(client)
 
     with patch(
         "rag_pipeline.core.index_manager.collection_manager.time.time",
@@ -206,7 +161,7 @@ def test_pending_janitor_keeps_live_and_aliased_collections_and_deletes_expired(
 def test_pending_janitor_propagates_alias_read_failure_to_lifecycle_owner():
     client = MagicMock()
     client.get_aliases.side_effect = RuntimeError("qdrant unavailable")
-    manager = CollectionManager(client, 3)
+    manager = CollectionManager(client)
 
     with pytest.raises(RuntimeError, match="qdrant unavailable"):
         manager.cleanup_expired_pending_collections(

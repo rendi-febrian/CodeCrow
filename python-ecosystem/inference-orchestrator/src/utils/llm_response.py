@@ -7,9 +7,13 @@ from typing import Any
 
 def extract_llm_response_text(response: Any) -> str:
     """Extract text across plain, LangChain-style, and multipart responses."""
+    if response is None:
+        return ""
     if not hasattr(response, "content"):
         return str(response)
     content = response.content
+    if content is None:
+        return ""
     if not isinstance(content, list):
         return str(content)
 

@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
-from llama_index.core.schema import TextNode
-from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct
+from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+from .documents import TextNode
 
 
 GENERATION_MANIFEST_PAYLOAD_KEY = "repository_generation_manifest"
@@ -37,29 +37,6 @@ def _canonical_json(value: Any) -> str:
         ensure_ascii=False,
         allow_nan=False,
     )
-
-
-def _canonical_vector(value: Any) -> Any:
-    """Canonicalize cosine vectors as Qdrant stores them.
-
-    Qdrant normalizes cosine vectors and persists float32 values. Rounding the
-    normalized representation avoids treating harmless transport precision as
-    a generation-integrity failure while still binding every vector value.
-    """
-    if isinstance(value, Mapping):
-        return {
-            str(key): _canonical_vector(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        values = list(value)
-        if values and all(isinstance(item, (int, float)) for item in values):
-            norm = math.sqrt(sum(float(item) ** 2 for item in values))
-            if norm:
-                return [round(float(item) / norm, 7) for item in values]
-            return [0.0 for _ in values]
-        return [_canonical_vector(item) for item in values]
-    return value
 
 
 def canonical_index_selection_policy(
@@ -102,9 +79,8 @@ def compute_index_selection_policy_sha256(
 def compute_generation_member_digest(
     point_id: object,
     payload: Mapping[str, Any],
-    vector: object,
 ) -> str:
-    """Bind one persisted point's deterministic identity, payload and vector.
+    """Bind one persisted point's deterministic identity and complete payload.
 
     ``indexed_at`` is operational metadata, not representation content. It is
     excluded so rebuilding identical repository content can produce the same
@@ -122,7 +98,6 @@ def compute_generation_member_digest(
     encoded = _canonical_json({
         "id": str(point_id),
         "payload": content_payload,
-        "vector": _canonical_vector(vector),
     }).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -168,14 +143,18 @@ def verified_generation_member(point) -> tuple[object, str]:
     computed_digest = compute_generation_member_digest(
         point.id,
         payload,
-        point.vector,
     )
     if computed_digest != stored_digest:
         raise GenerationManifestError(
             "repository generation member content digest does not match its "
-            "persisted payload and vector"
+            "persisted payload"
         )
     return point.id, computed_digest
+
+
+def verify_generation_member_page(points: Sequence) -> list[tuple[object, str]]:
+    """Verify one bounded page directly from its persisted payloads."""
+    return [verified_generation_member(point) for point in points]
 
 
 def _generation_filter(branch: str, commit: str) -> Filter:
@@ -206,7 +185,7 @@ def collect_generation_members(
             limit=256,
             offset=offset,
             with_payload=True,
-            with_vectors=True,
+            with_vectors=False,
         )
         for point in points:
             payload = point.payload or {}
@@ -214,7 +193,7 @@ def collect_generation_members(
                 raise GenerationManifestError(
                     "pending repository generation already contains a manifest"
                 )
-            members.append(verified_generation_member(point))
+        members.extend(verify_generation_member_page(points))
         if offset is None:
             break
     return members
@@ -225,51 +204,44 @@ def seal_generation_members(
     collection_name: str,
     branch: str,
     commit: str,
-) -> int:
-    """Persist member digests against Qdrant's actual stored vectors.
-
-    Qdrant may normalize cosine vectors and reduce their precision.  A digest
-    made from the embedding request is therefore not necessarily a digest of
-    the representation which will later be verified.  Seal after every member
-    is stored, then collect/verify the same representation before publishing a
-    generation manifest.
-    """
+    *,
+    progress_callback: Callable[[int], None] | None = None,
+) -> list[tuple[object, str]]:
+    """Collect and verify acknowledged payload digests for one generation."""
     offset = None
-    sealed = 0
+    members: list[tuple[object, str]] = []
     while True:
         points, offset = client.scroll(
             collection_name=collection_name,
             scroll_filter=_generation_filter(branch, commit),
             limit=256,
             offset=offset,
-            with_payload=True,
-            with_vectors=True,
+            with_payload=[
+                GENERATION_MANIFEST_PAYLOAD_KEY,
+                GENERATION_MEMBER_DIGEST_PAYLOAD_KEY,
+            ],
+            with_vectors=False,
         )
-        replacements = []
         for point in points:
-            payload = dict(point.payload or {})
+            payload = point.payload or {}
             if payload.get(GENERATION_MANIFEST_PAYLOAD_KEY) is True:
                 raise GenerationManifestError(
                     "pending repository generation already contains a manifest"
                 )
-            payload[GENERATION_MEMBER_DIGEST_PAYLOAD_KEY] = (
-                compute_generation_member_digest(point.id, payload, point.vector)
-            )
-            replacements.append(PointStruct(
-                id=point.id,
-                vector=point.vector,
-                payload=payload,
-            ))
-        if replacements:
-            client.upsert(
-                collection_name=collection_name,
-                points=replacements,
-                wait=True,
-            )
-            sealed += len(replacements)
+            stored_digest = payload.get(GENERATION_MEMBER_DIGEST_PAYLOAD_KEY)
+            if not is_sha256_hex(stored_digest):
+                raise GenerationManifestError(
+                    "repository generation member is missing a valid content "
+                    "digest"
+                )
+            else:
+                digest = stored_digest
+            members.append((point.id, digest))
+        if progress_callback is not None:
+            progress_callback(len(members))
         if offset is None:
             break
-    return sealed
+    return members
 
 
 def generation_manifest_content(
@@ -317,7 +289,7 @@ def build_generation_manifest_node(
     index_exclude_patterns: Sequence[str],
     identity_metadata: Mapping[str, Any],
 ) -> TextNode:
-    """Build the single zero-vector state node that seals a generation."""
+    """Build the single payload state node that seals a generation."""
     if member_count < 1:
         raise GenerationManifestError(
             "repository generation cannot be sealed without members"

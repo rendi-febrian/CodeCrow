@@ -1,12 +1,6 @@
-"""
-Unit tests for service.review.orchestrator.context_helpers —
-extract_symbols_from_diff, extract_diff_snippets, get_diff_snippets_for_batch, format_rag_context.
-"""
+"""Unit tests for deterministic repository-context formatting."""
 import pytest
 from service.review.orchestrator.context_helpers import (
-    extract_symbols_from_diff,
-    extract_diff_snippets,
-    get_diff_snippets_for_batch,
     format_rag_context,
     rag_evidence_id,
 )
@@ -28,76 +22,14 @@ diff --git a/src/OrderService.java b/src/OrderService.java
 
 # ── extract_symbols_from_diff ────────────────────────────────────
 
-class TestExtractSymbolsFromDiff:
-
-    def test_extracts_camel_case(self):
-        symbols = extract_symbols_from_diff(SAMPLE_DIFF)
-        assert any("OrderService" in s or "OrderValidator" in s or "CreateOrderRequest" in s for s in symbols)
-
-    def test_extracts_snake_case(self):
-        diff = "+    user_name = get_user_name(request)"
-        symbols = extract_symbols_from_diff(diff)
-        assert any("user_name" in s or "get_user_name" in s for s in symbols)
-
-    def test_preserves_keywords_as_neutral_tokens(self):
-        symbols = extract_symbols_from_diff(SAMPLE_DIFF)
-        assert "public" in symbols
-        assert "return" in symbols
-
-    def test_empty(self):
-        assert extract_symbols_from_diff("") == []
-        assert extract_symbols_from_diff(None) == []
-
-    def test_limit_20(self):
-        # Generate diff with many symbols
-        big_diff = "\n".join(f"+    {chr(65+i)}Symbol{i*100}Name = 1" for i in range(26))
-        symbols = extract_symbols_from_diff(big_diff)
-        assert len(symbols) <= 20
 
 
 # ── extract_diff_snippets ────────────────────────────────────────
 
-class TestExtractDiffSnippets:
-
-    def test_extracts_added_lines(self):
-        snippets = extract_diff_snippets(SAMPLE_DIFF)
-        assert len(snippets) > 0
-        # Should contain meaningful code from added lines
-        combined = " ".join(snippets)
-        assert "createOrder" in combined or "OrderValidator" in combined or "orderRepository" in combined
-
-    def test_preserves_comments_and_trivial_added_lines(self):
-        diff = "+// comment\n+#\n+{\n+}\n+\n+   real_code = True"
-        snippets = extract_diff_snippets(diff)
-        combined = "\n".join(snippets)
-        assert "// comment" in combined
-        assert "#" in combined
-        assert "{" in combined
-        assert "}" in combined
-
-    def test_empty(self):
-        assert extract_diff_snippets("") == []
-        assert extract_diff_snippets(None) == []
-
-    def test_limit_10(self):
-        big = "\n".join(f"+    statement_{i} = very_long_code_expression_{i}()" for i in range(50))
-        snippets = extract_diff_snippets(big)
-        assert len(snippets) <= 10
 
 
 # ── get_diff_snippets_for_batch ──────────────────────────────────
 
-class TestGetDiffSnippetsForBatch:
-
-    def test_returns_all_snippets(self):
-        """Since Java snippets are clean code without file paths, all are returned."""
-        all_snippets = ["def foo():", "class Bar:", "import os"]
-        batch_files = ["src/app.py"]
-        result = get_diff_snippets_for_batch(all_snippets, batch_files)
-        assert result == all_snippets
-
-    def test_empty(self):
-        assert get_diff_snippets_for_batch([], ["a.py"]) == []
 
 
 # ── format_rag_context ───────────────────────────────────────────
@@ -114,9 +46,8 @@ class TestFormatRagContext:
             "relevant_code": [
                 {
                     "text": "def process(): pass",
-                    "score": 0.90,
                     "metadata": {"path": "src/proc.py", "content_type": "functions_classes"},
-                    "_source": "semantic",
+                    "_match_type": "definition",
                 }
             ]
         }
@@ -142,12 +73,11 @@ class TestFormatRagContext:
         assert first.startswith("RAG-")
         assert f"Evidence ID: {first}" in result
 
-    def test_prompt_visible_semantic_chunk_is_available_as_citation(self):
+    def test_prompt_visible_exact_chunk_is_available_as_citation(self):
         chunk = {
             "text": "def process(): pass",
-            "score": 0.90,
             "metadata": {"path": "src/proc.py"},
-            "_source": "semantic",
+            "_match_type": "definition",
         }
         visible = {}
 
@@ -160,7 +90,7 @@ class TestFormatRagContext:
         assert f"Evidence ID: {evidence_id}" in result
         assert visible == {evidence_id: ()}
 
-    def test_prompt_visible_semantic_graph_fact_is_available_to_validation(self):
+    def test_prompt_visible_graph_fact_is_available_to_validation(self):
         fact = {
             "kind": "java-type",
             "source": "com.example.App",
@@ -174,12 +104,11 @@ class TestFormatRagContext:
                 "[java-type] com.example.App declares App\n"
                 "public class App {}"
             ),
-            "score": 0.95,
             "metadata": {
                 "path": "src/App.java",
                 "plugin_graph_facts": [fact],
             },
-            "_source": "semantic",
+            "_match_type": "architecture_relation",
         }
         visible = {}
 
@@ -190,59 +119,6 @@ class TestFormatRagContext:
 
         assert "[java-type]" in result
         assert visible == {rag_evidence_id(chunk): (fact,)}
-
-    def test_repeated_file_fact_prefix_is_rendered_once_without_losing_source(self):
-        fact = {
-            "kind": "java-type",
-            "source": "com.example.App",
-            "relation": "declares",
-            "target": "App",
-            "path": "src/App.java",
-            "line": 1,
-        }
-        fact_line = "[java-type] com.example.App declares App"
-        first = {
-            "text": (
-                "Plugin graph facts:\n"
-                f"{fact_line}\n\n"
-                "public class App {"
-            ),
-            "score": 0.95,
-            "metadata": {
-                "path": "src/App.java",
-                "plugin_graph_facts": [fact],
-            },
-            "_match_type": "definition",
-            "_source": "deterministic",
-        }
-        second = {
-            "text": (
-                "Plugin graph facts:\n"
-                f"{fact_line}\n\n"
-                "void execute() {}"
-            ),
-            "score": 0.94,
-            "metadata": {
-                "path": "src/App.java",
-                "plugin_graph_facts": [fact],
-            },
-            "_match_type": "definition",
-            "_source": "deterministic",
-        }
-        visible = {}
-
-        result = format_rag_context(
-            {"relevant_code": [first, second]},
-            visible_evidence_by_id=visible,
-        )
-
-        assert result.count(fact_line) == 1
-        assert "public class App {" in result
-        assert "void execute() {}" in result
-        assert visible == {
-            rag_evidence_id(first): (fact,),
-            rag_evidence_id(second): (),
-        }
 
     def test_metadata_facts_are_rendered_once_without_mutating_stored_source(self):
         fact = {
@@ -256,7 +132,6 @@ class TestFormatRagContext:
         fact_line = "[python-call] service.review calls validate"
         first = {
             "text": "def review():\n    validate()",
-            "score": 0.95,
             "metadata": {
                 "path": "src/service.py",
                 "plugin_graph_facts": [fact],
@@ -266,7 +141,6 @@ class TestFormatRagContext:
         }
         second = {
             "text": "def validate():\n    return True",
-            "score": 0.94,
             "metadata": {
                 "path": "src/service.py",
                 "plugin_graph_facts": [fact],
@@ -288,57 +162,6 @@ class TestFormatRagContext:
             rag_evidence_id(first): (),
             rag_evidence_id(second): (fact,),
         }
-
-    def test_omitted_fact_prefix_does_not_hide_later_visible_copy(self):
-        fact = {
-            "kind": "java-type",
-            "source": "com.example.App",
-            "relation": "declares",
-            "target": "App",
-            "path": "src/App.java",
-            "line": 1,
-        }
-        fact_line = "[java-type] com.example.App declares App"
-        oversized = {
-            "text": (
-                "Plugin graph facts:\n"
-                + ("[java-call] com.example.App calls helper\n" * 30)
-                + f"{fact_line}\n\n"
-                + ("x" * 1_000)
-            ),
-            "score": 0.95,
-            "metadata": {
-                "path": "src/App.java",
-                "plugin_graph_facts": [fact],
-            },
-            "_match_type": "definition",
-            "_source": "deterministic",
-        }
-        later = {
-            "text": (
-                "Plugin graph facts:\n"
-                f"{fact_line}\n\n"
-                "public class App {}"
-            ),
-            "score": 0.94,
-            "metadata": {
-                "path": "src/App.java",
-                "plugin_graph_facts": [fact],
-            },
-            "_match_type": "definition",
-            "_source": "deterministic",
-        }
-        visible = {}
-
-        result = format_rag_context(
-            {"relevant_code": [oversized, later]},
-            max_chars=2_400,
-            max_chunk_chars=1_300,
-            visible_evidence_by_id=visible,
-        )
-
-        assert fact_line in result
-        assert visible[rag_evidence_id(later)] == (fact,)
 
     def test_metadata_fact_hidden_by_chunk_truncation_cannot_validate(self):
         visible_fact = {
@@ -365,7 +188,6 @@ class TestFormatRagContext:
                 + "\n[magento-webapi-route] POST /V1/cart invokes "
                 "Acme\\Api\\CartInterface::save"
             ),
-            "score": 1.0,
             "metadata": {
                 "path": "__analysis_architecture__/magento/routes.context",
                 "plugin_graph_facts": [visible_fact, hidden_fact],
@@ -376,26 +198,23 @@ class TestFormatRagContext:
 
         format_rag_context(
             {"relevant_code": [chunk]},
-            max_chunk_chars=512,
             visible_evidence_by_id=visible,
         )
 
-        assert visible[rag_evidence_id(chunk)] == (visible_fact,)
+        assert visible[rag_evidence_id(chunk)] == (visible_fact, hidden_fact)
 
     def test_filters_deleted_files(self):
         rag = {
             "relevant_code": [
                 {
                     "text": "old code",
-                    "score": 0.90,
                     "metadata": {"path": "deleted.py"},
-                    "_source": "semantic",
+                    "_match_type": "definition",
                 },
                 {
                     "text": "kept code",
-                    "score": 0.90,
                     "metadata": {"path": "kept.py"},
-                    "_source": "semantic",
+                    "_match_type": "definition",
                 },
             ]
         }
@@ -408,7 +227,6 @@ class TestFormatRagContext:
         chunks = [
             {
                 "text": f"class Base{i}: pass",
-                "score": 0.95,
                 "metadata": {"path": f"src/base{i}.py", "content_type": "functions_classes"},
                 "_match_type": "definition",
                 "_source": "deterministic",
@@ -420,12 +238,23 @@ class TestFormatRagContext:
         count = sum(1 for i in range(12) if f"src/base{i}.py" in result)
         assert count == 12
 
+    def test_untyped_context_is_not_rendered(self):
+        result = format_rag_context({
+            "relevant_code": [{
+                "text": "unrelated sibling implementation",
+                "metadata": {"path": "src/same_package/sibling.py"},
+                "_match_type": "unproved_context",
+                "_source": "deterministic",
+            }],
+        })
+
+        assert result == ""
+
     def test_focused_architecture_relations_are_not_cut_at_eight(self):
         rag = {
             "relevant_code": [
                 {
                     "text": f"[graph-fact] Source{index} resolves-to Target{index}",
-                    "score": 0.95,
                     "metadata": {
                         "path": f"__analysis_architecture__/packet-{index}.context",
                         "architecture_kind": f"kind-{index % 4}",
@@ -452,7 +281,6 @@ class TestFormatRagContext:
                     "text": (
                         f"[graph-fact] Source{index} resolves-to Target{index}"
                     ),
-                    "score": 0.95,
                     "metadata": {
                         "path": (
                             "__analysis_architecture__/"
@@ -474,45 +302,36 @@ class TestFormatRagContext:
             f"Source{index} resolves-to Target{index}" in result
             for index in range(65)
         ) == 65
-        assert len(result) <= 32_000
 
-    def test_character_budget_keeps_structural_context_first(self):
+    def test_complete_structural_context_is_preserved(self):
         rag = {
             "relevant_code": [
                 {
                     "text": "class RequiredBase:\n" + ("x = 1\n" * 500),
-                    "score": 1.0,
                     "metadata": {"path": "src/RequiredBase.py"},
                     "_match_type": "definition",
                     "_source": "deterministic",
                 },
                 {
                     "text": "def merely_similar():\n" + ("return 1\n" * 500),
-                    "score": 0.99,
                     "metadata": {"path": "src/Similar.py"},
-                    "_source": "semantic",
                 },
             ]
         }
 
-        result = format_rag_context(
-            rag,
-            max_chars=1_600,
-            max_chunk_chars=1_200,
-        )
+        result = format_rag_context(rag)
 
-        assert len(result) <= 1_600
         assert "src/RequiredBase.py" in result
         assert "src/Similar.py" not in result
-        assert "Context chunk truncated by deterministic prompt budget" in result
+        assert result.count("x = 1") == 500
+        assert "Context chunk truncated" not in result
         assert result.count("```") == 2
 
-    def test_character_budget_caps_multiple_large_chunks(self):
+    def test_multiple_large_structural_chunks_are_bounded(self):
         rag = {
             "relevant_code": [
                 {
                     "text": f"class Base{index}:\n" + (f"value_{index} = 1\n" * 600),
-                    "score": 1.0,
                     "metadata": {"path": f"src/Base{index}.py"},
                     "_match_type": "definition",
                     "_source": "deterministic",
@@ -521,15 +340,12 @@ class TestFormatRagContext:
             ]
         }
 
-        result = format_rag_context(
-            rag,
-            max_chars=5_000,
-            max_chunk_chars=2_000,
-        )
+        result = format_rag_context(rag)
 
-        assert len(result) <= 5_000
         assert "src/Base0.py" in result
         assert "src/Base7.py" not in result
+        assert "Context chunk truncated by deterministic prompt budget" in result
+        assert len(result) <= 32_000
         assert result.count("```") % 2 == 0
 
     def test_complete_current_file_chunk_is_removed_but_related_file_remains(self):
@@ -537,14 +353,12 @@ class TestFormatRagContext:
             "relevant_code": [
                 {
                     "text": "class Reviewed:\n    pass",
-                    "score": 1.0,
                     "metadata": {"path": "src/Reviewed.py"},
                     "_match_type": "changed_file",
                     "_source": "pr_indexed",
                 },
                 {
                     "text": "class Dependency:\n    pass",
-                    "score": 0.95,
                     "metadata": {"path": "src/Dependency.py"},
                     "_match_type": "definition",
                     "_source": "deterministic",
@@ -577,7 +391,6 @@ class TestFormatRagContext:
                         "[python-call] src.reviewed calls dependency\n"
                         "implementation details"
                     ),
-                    "score": 1.0,
                     "metadata": {
                         "path": "src/Reviewed.py",
                         "architecture_key": "python-file:src/Reviewed.py",
@@ -605,7 +418,6 @@ class TestFormatRagContext:
             "relevant_code": [
                 {
                     "text": "middle_of_large_file()",
-                    "score": 1.0,
                     "metadata": {"path": "src/Large.py"},
                     "_match_type": "changed_file",
                     "_source": "pr_indexed",
@@ -621,54 +433,135 @@ class TestFormatRagContext:
         assert "src/Large.py" in result
         assert "middle_of_large_file()" in result
 
-    def test_low_score_documentation_chunk_preserved(self):
+    def test_untyped_documentation_chunk_is_not_structural_context(self):
         rag = {
             "relevant_code": [
                 {
                     "text": "readme content",
-                    "score": 0.50,
                     "metadata": {"path": "README.md", "content_type": "documentation"},
-                    "_source": "semantic",
                 },
             ]
         }
         result = format_rag_context(rag)
-        assert "README.md" in result
-        assert "readme content" in result
+        assert result == ""
 
-    def test_deduplication(self):
+    def test_exact_evidence_deduplication(self):
         """Repeated retrieval of the same full evidence identity is deduplicated."""
         rag = {
             "relevant_code": [
                 {
                     "text": "same content here",
-                    "score": 0.90,
-                    "metadata": {"path": "src/a/util.py"},
-                    "_source": "semantic",
+                    "metadata": {
+                        "path": "src/a/util.py",
+                        "start_line": 4,
+                        "end_line": 4,
+                    },
+                    "_match_type": "definition",
                 },
                 {
                     "text": "same content here",
-                    "score": 0.88,
-                    "metadata": {"path": "src/a/util.py"},
-                    "_source": "semantic",
+                    "metadata": {
+                        "path": "src/a/util.py",
+                        "start_line": 4,
+                        "end_line": 4,
+                    },
+                    "_match_type": "definition",
                 },
             ]
         }
         result = format_rag_context(rag)
         assert result.count("same content here") == 1
 
+    def test_unlocated_exact_duplicate_is_collapsed_by_path_and_text(self):
+        chunk = {
+            "text": "legacy equal text",
+            "metadata": {"path": "src/legacy.py"},
+            "_match_type": "definition",
+        }
+
+        result = format_rag_context({
+            "relevant_code": [chunk, dict(chunk)],
+        })
+
+        assert result.count("legacy equal text") == 1
+
+    def test_repeated_point_id_is_deduplicated_before_range_fallback(self):
+        text = "def приветствие(): return '👋'"
+        rag = {
+            "relevant_code": [
+                {
+                    "id": "qdrant-point-α",
+                    "text": text,
+                    "metadata": {
+                        "path": "src/привет.py",
+                        "start_line": 10,
+                        "end_line": 10,
+                    },
+                    "_match_type": "definition",
+                },
+                {
+                    "id": "qdrant-point-α",
+                    "text": text,
+                    "metadata": {
+                        "path": "src/привет.py",
+                        "start_line": 30,
+                        "end_line": 30,
+                    },
+                    "_match_type": "definition",
+                },
+            ]
+        }
+
+        result = format_rag_context(rag)
+
+        assert result.count(text) == 1
+
+    @pytest.mark.parametrize(
+        ("first_locator", "second_locator"),
+        [
+            (
+                {"start_line": 10, "end_line": 10},
+                {"start_line": 30, "end_line": 30},
+            ),
+            ({"chunk_index": 0}, {"chunk_index": 1}),
+        ],
+    )
+    def test_equal_unicode_text_at_distinct_occurrences_is_not_deduplicated(
+        self,
+        first_locator,
+        second_locator,
+    ):
+        text = "value = 'однаковий текст 🐦'"
+        first = {
+            "text": text,
+            "metadata": {"path": "src/птах.py", **first_locator},
+            "_match_type": "definition",
+        }
+        second = {
+            "text": text,
+            "metadata": {"path": "src/птах.py", **second_locator},
+            "_match_type": "definition",
+        }
+
+        result = format_rag_context({"relevant_code": [first, second]})
+
+        assert result.count(text) == 2
+        assert rag_evidence_id(first) != rag_evidence_id(second)
+        assert f"Evidence ID: {rag_evidence_id(first)}" in result
+        assert f"Evidence ID: {rag_evidence_id(second)}" in result
+
     def test_same_basename_and_content_in_distinct_paths_are_not_deduplicated(self):
         rag = {
             "relevant_code": [
                 {
                     "text": "same content here",
-                    "score": 0.90,
                     "metadata": {"path": "src/a/util.py"},
+                    "_match_type": "definition",
                 },
                 {
                     "text": "same content here",
-                    "score": 0.88,
                     "metadata": {"path": "src/b/util.py"},
+                    "_match_type": "definition",
                 },
             ]
         }
@@ -685,7 +578,6 @@ class TestFormatRagContext:
             "relevant_code": [
                 {
                     "text": shared_prefix + "<preference for='Cart' type='CartImpl'/></config>",
-                    "score": 1.0,
                     "metadata": {
                         "path": "app/code/Acme/Cart/etc/di.xml",
                         "architecture_key": "Acme_Cart:global",
@@ -694,7 +586,6 @@ class TestFormatRagContext:
                 },
                 {
                     "text": shared_prefix + "<type name='Checkout'><plugin name='tax'/></type></config>",
-                    "score": 1.0,
                     "metadata": {
                         "path": "app/code/Acme/Checkout/etc/di.xml",
                         "architecture_key": "Acme_Checkout:global",
@@ -711,14 +602,12 @@ class TestFormatRagContext:
         assert "CartImpl" in result
         assert "name='tax'" in result
 
-    def test_stale_chunk_from_modified_file_low_score(self):
+    def test_stale_base_chunk_from_modified_file(self):
         rag = {
             "relevant_code": [
                 {
                     "text": "stale code",
-                    "score": 0.50,
                     "metadata": {"path": "modified.py"},
-                    "_source": "semantic",
                 },
             ]
         }
@@ -731,9 +620,9 @@ class TestFormatRagContext:
             "relevant_code": [
                 {
                     "text": "fresh indexed code",
-                    "score": 0.80,
                     "metadata": {"path": "modified.py"},
                     "_source": "pr_indexed",
+                    "_match_type": "changed_file",
                 },
             ]
         }
@@ -744,7 +633,6 @@ class TestFormatRagContext:
         rag = {
             "relevant_code": [{
                 "text": "old effective DI relation",
-                "score": 1.0,
                 "metadata": {
                     "path": "__analysis_architecture__/magento/packet.context",
                     "architecture_context": True,
@@ -769,7 +657,6 @@ class TestFormatRagContext:
         rag = {
             "relevant_code": [{
                 "text": "new DI relation",
-                "score": 1.0,
                 "metadata": {
                     "path": "__analysis_architecture__/magento/packet.context",
                     "architecture_context": True,

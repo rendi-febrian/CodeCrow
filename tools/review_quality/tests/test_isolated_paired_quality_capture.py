@@ -234,7 +234,7 @@ def test_rag_fallback_command_uses_empty_plugin_root_and_no_web_config_poll(
         lambda *_args, **_kwargs: None,
     )
     env_file = tmp_path / "rag.env"
-    env_file.write_text("EMBEDDING_PROVIDER=openrouter\n", encoding="utf-8")
+    env_file.write_text("RAG_ENABLED=true\n", encoding="utf-8")
     empty = tmp_path / "empty"
     empty.mkdir()
 

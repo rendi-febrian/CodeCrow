@@ -1,211 +1,138 @@
-"""
-Tests for rag_pipeline.api.routers — system, parse, index, query, pr.
-Tests individual route handlers and helper functions.
-"""
+"""Focused unit coverage for production API routers."""
+
 import asyncio
-
-import pytest
-from unittest.mock import patch, MagicMock
-from fastapi.testclient import TestClient
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 
-# ─────────────────────────────────────────────────────────────
-# System router
-# ─────────────────────────────────────────────────────────────
 class TestSystemRouter:
-
     def test_root(self):
         from rag_pipeline.api.routers.system import root
-        result = root()
-        assert "message" in result
-        assert "version" not in result
+
+        assert root()["message"] == "CodeCrow Repository Index API"
 
     def test_health(self):
         from rag_pipeline.api.routers.system import health
-        result = asyncio.run(health())
-        assert result["status"] == "healthy"
 
-    @patch("rag_pipeline.api.routers.system.gc")
-    def test_force_gc(self, mock_gc):
-        from rag_pipeline.api.routers.system import force_garbage_collection
-        mock_gc.collect.return_value = 42
-
-        # psutil might not be available — mock the import
-        with patch("rag_pipeline.api.routers.system.psutil", create=True) as mock_psutil:
-            mock_process = MagicMock()
-            mock_process.memory_info.return_value.rss = 100 * 1024 * 1024
-            mock_psutil.Process.return_value = mock_process
-            try:
-                result = force_garbage_collection()
-                assert result["objects_collected"] == 42
-            except Exception:
-                # If psutil import fails, the function handles it
-                pass
+        assert asyncio.run(health())["status"] == "healthy"
 
 
-# ─────────────────────────────────────────────────────────────
-# Parse router
-# ─────────────────────────────────────────────────────────────
 class TestParseRouter:
-
-    def test_parse_file_returns_metadata(self):
-        from rag_pipeline.api.routers.parse import parse_file
+    @patch("rag_pipeline.core.splitter.ASTCodeSplitter")
+    def test_parse_file_projects_ast_chunk_metadata(self, splitter_class):
         from rag_pipeline.api.models import ParseFileRequest
+        from rag_pipeline.api.routers.parse import parse_file
 
-        request = ParseFileRequest(
+        splitter_class.return_value.split_documents.return_value = [
+            SimpleNamespace(metadata={
+                "imports": ["os"],
+                "symbol_names": ["hello"],
+                "calls": ["print"],
+            })
+        ]
+
+        result = parse_file(ParseFileRequest(
             path="test.py",
-            content="def hello():\n    pass\n",
+            content="import os\ndef hello():\n    pass\n",
             language="python",
-        )
-
-        result = parse_file(request)
+        ))
         assert result.path == "test.py"
         assert result.success is True
-
-    def test_parse_file_invalid_content(self):
-        from rag_pipeline.api.routers.parse import parse_file
-        from rag_pipeline.api.models import ParseFileRequest
-
-        request = ParseFileRequest(
-            path="test.xyz",
-            content="some content",
+        assert result.language == "python"
+        assert result.imports == ["os"]
+        assert result.symbol_names == ["hello"]
+        assert result.calls == ["print"]
+        parsed_documents = (
+            splitter_class.return_value.split_documents.call_args.args[0]
         )
-
-        result = parse_file(request)
-        # Should return result (may have success True or False)
-        assert result.path == "test.xyz"
+        assert parsed_documents[0].metadata == {"path": "test.py"}
 
 
-# ─────────────────────────────────────────────────────────────
-# Index router helpers
-# ─────────────────────────────────────────────────────────────
 class TestIndexRouter:
-
     @patch("rag_pipeline.api.routers.index._get_singletons")
     def test_get_limits(self, mock_singletons):
         from rag_pipeline.api.routers.index import get_limits
 
-        mock_config = MagicMock()
-        mock_config.max_chunks_per_index = 50000
-        mock_config.max_files_per_index = 5000
-        mock_config.max_file_size_bytes = 1_000_000
-        mock_config.chunk_size = 1500
-        mock_config.chunk_overlap = 200
-        mock_singletons.return_value = (mock_config, MagicMock())
-
-        result = get_limits()
-        assert result["max_chunks_per_index"] == 50000
-        assert result["chunk_size"] == 1500
-
-
-# ─────────────────────────────────────────────────────────────
-# Query router helpers
-# ─────────────────────────────────────────────────────────────
-class TestQueryRouterHelpers:
-
-    def test_normalize_changed_file_candidates(self):
-        from rag_pipeline.api.routers.query import _normalize_changed_file_candidates
-
-        result = _normalize_changed_file_candidates(["src/main.py", "/src/main.py"])
-        assert "src/main.py" in result
-
-    def test_normalize_empty_list(self):
-        from rag_pipeline.api.routers.query import _normalize_changed_file_candidates
-
-        result = _normalize_changed_file_candidates([])
-        assert result == []
-
-    def test_normalize_none(self):
-        from rag_pipeline.api.routers.query import _normalize_changed_file_candidates
-
-        result = _normalize_changed_file_candidates(None)
-        assert result == []
-
-    def test_format_pr_results(self):
-        from rag_pipeline.api.routers.query import _format_pr_results
-
-        mock_point = MagicMock()
-        mock_point.payload = {
-            "path": "src/main.py",
-            "text": "def hello(): pass",
-            "semantic_name": "hello",
-            "semantic_type": "function",
-            "pr_branch": "feature/test",
+        config = MagicMock(
+            max_file_size_bytes=512 * 1024,
+            max_files_per_index=5000,
+            max_chunks_per_index=1_000_000,
+            chunk_size=8000,
+            chunk_overlap=200,
+        )
+        mock_singletons.return_value = (config, MagicMock())
+        assert get_limits() == {
+            "max_chunks_per_index": 1_000_000,
+            "max_file_size_bytes": 512 * 1024,
+            "max_files_per_index": 5000,
+            "chunk_size": 8000,
+            "chunk_overlap": 200,
         }
-        mock_point.score = 0.95
-
-        results = _format_pr_results([mock_point])
-        assert len(results) == 1
-        assert results[0]["path"] == "src/main.py"
-        assert results[0]["text"] == "def hello(): pass"
-
-    def test_format_pr_results_skips_empty(self):
-        from rag_pipeline.api.routers.query import _format_pr_results
-
-        mock_point = MagicMock()
-        mock_point.payload = {"path": "", "text": ""}
-        mock_point.score = 0.5
-
-        results = _format_pr_results([mock_point])
-        assert len(results) == 0
-
-    def test_format_pr_results_forced_score(self):
-        from rag_pipeline.api.routers.query import _format_pr_results
-
-        mock_point = MagicMock()
-        mock_point.payload = {
-            "path": "a.py",
-            "text": "code",
-            "semantic_name": "",
-            "semantic_type": "",
-            "pr_branch": "main",
-        }
-        mock_point.score = 0.5
-
-        results = _format_pr_results([mock_point], forced_score=1.0)
-        assert results[0]["score"] == 1.0
 
 
-# ─────────────────────────────────────────────────────────────
-# Query router — semantic_search endpoint
-# ─────────────────────────────────────────────────────────────
-class TestQueryRouterEndpoints:
-
+class TestQueryRouter:
     @patch("rag_pipeline.api.routers.query._get_singletons")
-    def test_semantic_search(self, mock_singletons):
-        from rag_pipeline.api.routers.query import semantic_search
-        from rag_pipeline.api.models import QueryRequest
+    def test_code_search_is_revision_bound(self, mock_singletons):
+        from rag_pipeline.api.models import CodeSearchRequest
+        from rag_pipeline.api.routers.query import code_search
 
-        mock_query_service = MagicMock()
-        mock_query_service.semantic_search.return_value = [
-            {"text": "result", "score": 0.9, "metadata": {}}
-        ]
-        mock_singletons.return_value = (MagicMock(), mock_query_service)
+        manager = MagicMock()
+        manager._get_project_collection_name.return_value = "index"
+        manager._collection_manager.require_structural_collection.return_value = (
+            "index-generation"
+        )
+        manager.get_revision_preflight.return_value = {
+            "generation_manifest_sha256": "a" * 64,
+        }
+        service = MagicMock()
+        service.search_code.return_value = [{
+            "path": "src/main.py",
+            "match_reasons": ["exact indexed token: main"],
+        }]
+        mock_singletons.return_value = (manager, service)
 
-        request = QueryRequest(
-            query="find function",
+        result = code_search(CodeSearchRequest(
+            query="main",
             workspace="ws",
             project="proj",
             branch="main",
+            repository_revision="abc123",
+            repository_generation_manifest_sha256="a" * 64,
+            collection_target="generation-target",
+        ))
+
+        assert result["results"][0]["match_reasons"] == [
+            "exact indexed token: main"
+        ]
+        assert service.search_code.call_args.kwargs["collection_target"] == (
+            "index-generation"
         )
-        result = semantic_search(request)
-        assert "results" in result
-        assert len(result["results"]) == 1
 
     @patch("rag_pipeline.api.routers.query._get_singletons")
     def test_deterministic_context(self, mock_singletons):
-        from rag_pipeline.api.routers.query import get_deterministic_context
         from rag_pipeline.api.models import DeterministicContextRequest
+        from rag_pipeline.api.routers.query import get_deterministic_context
 
-        mock_query_service = MagicMock()
-        mock_query_service.get_deterministic_context.return_value = {"chunks": []}
-        mock_singletons.return_value = (MagicMock(), mock_query_service)
-
-        request = DeterministicContextRequest(
+        manager = MagicMock()
+        manager._collection_manager.require_structural_collection.return_value = (
+            "index-generation"
+        )
+        manager.get_revision_preflight.return_value = {
+            "generation_manifest_sha256": "a" * 64,
+        }
+        service = MagicMock()
+        service.get_deterministic_context.return_value = {"chunks": []}
+        mock_singletons.return_value = (manager, service)
+        result = get_deterministic_context(DeterministicContextRequest(
             workspace="ws",
             project="proj",
             branches=["main"],
             file_paths=["src/main.py"],
-        )
-        result = get_deterministic_context(request)
-        assert "context" in result
+            base_revision="abc123",
+            base_generation_manifest_sha256="a" * 64,
+            collection_target="generation-target",
+        ))
+        assert result == {"context": {"chunks": []}}
+        assert service.get_deterministic_context.call_args.kwargs[
+            "limit_per_file"
+        ] is None

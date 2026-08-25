@@ -1,4 +1,4 @@
-"""Vector storage inspection endpoints.
+"""Structural repository-index inspection endpoints.
 
 These endpoints are intentionally bounded and service-internal. They expose
 small graph slices and point neighborhoods for the Java web server to proxy
@@ -13,7 +13,12 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from fastapi import APIRouter, HTTPException, Query
 from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
 
-from ..models import VectorGraphRequest, VectorInspectFilters, VectorNodeRequest
+from ...core.exact_index import ExactIndexPreconditionError
+from ..models import (
+    RepositoryIndexFilters,
+    RepositoryIndexGraphRequest,
+    RepositoryIndexNodeRequest,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["inspect"])
@@ -22,10 +27,13 @@ PAYLOAD_FIELDS = [
     "workspace", "project", "branch", "path", "commit", "language", "filetype",
     "pr", "pr_number", "pr_branch", "change_type", "content_type", "node_type",
     "start_line", "end_line", "chunk_index", "sub_chunk_index",
-    "semantic_names", "primary_name", "parent_class", "full_path", "namespace",
+    "symbol_names", "primary_name", "parent_class", "full_path", "namespace",
     "extends", "implements", "imports", "calls", "referenced_types", "signature",
     "methods", "properties", "parameters", "return_type", "decorators", "modifiers",
     "variables", "constants", "type_parameters",
+    "structural_record_type", "symbol_definition", "symbol_qualified_name",
+    "symbol_kind", "symbol_parents", "symbol_methods",
+    "symbol_constructor_types", "symbol_attributes",
     "architecture_context", "architecture_source", "architecture_plugin",
     "architecture_kind", "architecture_source_path", "architecture_group",
     "architecture_key", "architecture_keys", "architecture_paths",
@@ -137,12 +145,10 @@ def _get_index_manager():
     return index_manager
 
 
-def _collection_name(index_manager, workspace: str, project: str) -> str:
-    return index_manager._get_project_collection_name(workspace, project)
-
-
-def _collection_exists(index_manager, collection_name: str) -> bool:
-    return index_manager._collection_manager.collection_exists(collection_name)
+def _exact_collection(index_manager, collection_target: str) -> str:
+    return index_manager._collection_manager.require_structural_collection(
+        collection_target
+    )
 
 
 def _as_list(value: Any) -> List[Any]:
@@ -209,7 +215,7 @@ def _node_title(payload: Dict[str, Any]) -> str:
             f"{payload.get('snapshot_plugin') or 'plugin'}: "
             f"{payload.get('snapshot_kind') or 'repository snapshot'}"
         )
-    primary = _first_string(payload.get("primary_name")) or _first_string(payload.get("semantic_names"))
+    primary = _first_string(payload.get("primary_name")) or _first_string(payload.get("symbol_names"))
     if primary:
         return primary
     path = payload.get("path")
@@ -217,7 +223,7 @@ def _node_title(payload: Dict[str, Any]) -> str:
         return PurePosixPath(path).name or path
     if payload.get("pr_number"):
         return f"PR #{payload.get('pr_number')}"
-    return "Vector point"
+    return "Stored record"
 
 
 def _node_kind(payload: Dict[str, Any]) -> str:
@@ -337,7 +343,7 @@ def _to_graph_node(point: Any, detail: bool = False) -> Dict[str, Any]:
         "chunkIndex": payload.get("chunk_index"),
         "subChunkIndex": payload.get("sub_chunk_index"),
         "primaryName": payload.get("primary_name"),
-        "semanticNames": _as_list(payload.get("semantic_names")),
+        "symbolNames": _as_list(payload.get("symbol_names")),
         "parentClass": payload.get("parent_class"),
         "fullPath": payload.get("full_path"),
         "namespace": payload.get("namespace"),
@@ -359,8 +365,15 @@ def _to_graph_node(point: Any, detail: bool = False) -> Dict[str, Any]:
     return node
 
 
-def _build_qdrant_filter(filters: VectorInspectFilters) -> Optional[Filter]:
-    must = []
+def _build_qdrant_filter(
+    filters: RepositoryIndexFilters,
+    workspace: str,
+    project: str,
+) -> Filter:
+    must = [
+        FieldCondition(key="workspace", match=MatchValue(value=workspace)),
+        FieldCondition(key="project", match=MatchValue(value=project)),
+    ]
     must_not = []
 
     if filters.branches:
@@ -384,8 +397,6 @@ def _build_qdrant_filter(filters: VectorInspectFilters) -> Optional[Filter]:
     if not filters.include_pr:
         must_not.append(FieldCondition(key="pr", match=MatchValue(value=True)))
 
-    if not must and not must_not:
-        return None
     kwargs = {}
     if must:
         kwargs["must"] = must
@@ -394,24 +405,31 @@ def _build_qdrant_filter(filters: VectorInspectFilters) -> Optional[Filter]:
     return Filter(**kwargs)
 
 
-def _matches_post_filter(payload: Dict[str, Any], filters: VectorInspectFilters) -> bool:
+def _matches_post_filter(payload: Dict[str, Any], filters: RepositoryIndexFilters) -> bool:
     path = str(payload.get("path") or "")
     if filters.file_query and filters.file_query.lower() not in path.lower():
         return False
 
-    if filters.semantic_query:
-        query = filters.semantic_query.lower()
+    if filters.text_query:
+        query = filters.text_query.casefold()
         searchable: List[str] = [
             path,
+            str(payload.get("text") or ""),
             str(payload.get("primary_name") or ""),
             str(payload.get("parent_class") or ""),
             str(payload.get("namespace") or ""),
             str(payload.get("signature") or ""),
             str(payload.get("node_type") or ""),
+            str(payload.get("symbol_qualified_name") or ""),
+            str(payload.get("symbol_kind") or ""),
         ]
-        for key in ("semantic_names", "extends", "implements", "imports", "calls", "referenced_types"):
+        for key in (
+            "symbol_names", "extends", "implements", "imports", "calls",
+            "referenced_types", "architecture_identifiers", "symbol_parents",
+            "symbol_methods", "symbol_constructor_types", "symbol_attributes",
+        ):
             searchable.extend(str(item) for item in _as_list(payload.get(key)))
-        if query not in " ".join(searchable).lower():
+        if not any(query in value.casefold() for value in searchable):
             return False
 
     return True
@@ -420,13 +438,15 @@ def _matches_post_filter(payload: Dict[str, Any], filters: VectorInspectFilters)
 def _scroll_points(
     index_manager,
     collection_name: str,
-    filters: VectorInspectFilters,
+    filters: RepositoryIndexFilters,
+    workspace: str,
+    project: str,
     limit: int,
     scan_limit: int,
     cursor: Optional[str] = None,
     payload_fields: Optional[List[str]] = None,
 ) -> Tuple[List[Any], Optional[str], int]:
-    qdrant_filter = _build_qdrant_filter(filters)
+    qdrant_filter = _build_qdrant_filter(filters, workspace, project)
     offset = cursor or None
     points: List[Any] = []
     scanned = 0
@@ -545,7 +565,7 @@ def _architecture_lookup_paths(
 
 def _dependency_neighbor_filters(
     nodes: List[Dict[str, Any]],
-    filters: VectorInspectFilters,
+    filters: RepositoryIndexFilters,
 ) -> Iterable[Filter]:
     """Build bounded filters that fetch likely dependency targets for graph edges."""
     def scoped_conditions(branch: str) -> Tuple[List[FieldCondition], List[FieldCondition]]:
@@ -604,7 +624,7 @@ def _dependency_neighbor_filters(
             batch = names[start:start + 60]
             for key, values in (
                 ("primary_name", batch),
-                ("semantic_names", batch),
+                ("symbol_names", batch),
                 ("methods", batch[:40]),
             ):
                 yield Filter(
@@ -620,7 +640,9 @@ def _hydrate_dependency_neighbors(
     index_manager,
     collection_name: str,
     nodes: List[Dict[str, Any]],
-    filters: VectorInspectFilters,
+    filters: RepositoryIndexFilters,
+    workspace: str,
+    project: str,
     existing_ids: Set[str],
     limit: int,
 ) -> List[Any]:
@@ -636,6 +658,8 @@ def _hydrate_dependency_neighbors(
             collection_name,
             neighbor_filter,
             per_query_limit,
+            workspace,
+            project,
         ):
             candidate_id = str(getattr(candidate, "id", ""))
             if not candidate_id or candidate_id in existing_ids or candidate_id in neighbors:
@@ -704,7 +728,7 @@ def _node_type_values(node: Dict[str, Any]) -> List[Any]:
     values: List[Any] = [
         node.get("primaryName"),
         node.get("fullPath"),
-        *node.get("semanticNames", []),
+        *node.get("symbolNames", []),
     ]
     namespace = node.get("namespace")
     primary = node.get("primaryName")
@@ -971,7 +995,7 @@ def _build_graph(
         if path:
             by_file[(branch, path)].append(node)
 
-        names = [node.get("primaryName"), *node.get("semanticNames", [])]
+        names = [node.get("primaryName"), *node.get("symbolNames", [])]
         for raw_name in names:
             name = _normalize_token(raw_name)
             if name:
@@ -1176,22 +1200,23 @@ def _top(counter: Counter, limit: int) -> List[Dict[str, Any]]:
     return [{"value": key, "count": count} for key, count in counter.most_common(limit) if key]
 
 
-@router.get("/inspect/{workspace}/{project}/overview")
-def vector_overview(
+@router.get("/repository-index/{workspace}/{project}/overview")
+def repository_index_overview(
     workspace: str,
     project: str,
+    collection_target: str = Query(min_length=1),
     sample_limit: int = Query(default=10000, ge=100, le=MAX_OVERVIEW_SCAN),
 ):
-    """Return a bounded overview of indexed vector metadata for one project."""
+    """Return a bounded overview of structural metadata for one project."""
     index_manager = _get_index_manager()
-    collection_name = _collection_name(index_manager, workspace, project)
-
-    if not _collection_exists(index_manager, collection_name):
+    try:
+        collection_name = _exact_collection(index_manager, collection_target)
+    except ExactIndexPreconditionError:
         return {
             "available": False,
             "workspace": workspace,
             "project": project,
-            "collection": collection_name,
+            "collection": collection_target,
             "totalPoints": 0,
             "sampledPoints": 0,
             "sampled": False,
@@ -1199,21 +1224,23 @@ def vector_overview(
             "languages": [],
             "files": [],
             "prNumbers": [],
-            "semanticNames": [],
+            "symbolNames": [],
         }
 
     try:
         total_points = getattr(index_manager.qdrant_client.get_collection(collection_name), "points_count", 0) or 0
-        filters = VectorInspectFilters()
+        filters = RepositoryIndexFilters()
         points, _, scanned = _scroll_points(
             index_manager=index_manager,
             collection_name=collection_name,
             filters=filters,
+            workspace=workspace,
+            project=project,
             limit=sample_limit,
             scan_limit=sample_limit,
             payload_fields=[
                 "branch", "path", "language", "filetype", "pr_number",
-                "primary_name", "semantic_names", "node_type", "content_type",
+                "primary_name", "symbol_names", "node_type", "content_type",
             ],
         )
 
@@ -1221,7 +1248,7 @@ def vector_overview(
         language_counts: Counter = Counter()
         file_counts: Counter = Counter()
         pr_numbers: Counter = Counter()
-        semantic_counts: Counter = Counter()
+        symbol_counts: Counter = Counter()
 
         for point in points:
             payload = getattr(point, "payload", None) or {}
@@ -1231,9 +1258,9 @@ def vector_overview(
             if payload.get("pr_number"):
                 pr_numbers.update([payload.get("pr_number")])
             if payload.get("primary_name"):
-                semantic_counts.update([payload.get("primary_name")])
-            for name in _as_list(payload.get("semantic_names"))[:5]:
-                semantic_counts.update([name])
+                symbol_counts.update([payload.get("primary_name")])
+            for name in _as_list(payload.get("symbol_names"))[:5]:
+                symbol_counts.update([name])
 
         return {
             "available": True,
@@ -1248,20 +1275,26 @@ def vector_overview(
             "languages": _top(language_counts, 40),
             "files": _top(file_counts, 120),
             "prNumbers": _top(pr_numbers, 80),
-            "semanticNames": _top(semantic_counts, 120),
+            "symbolNames": _top(symbol_counts, 120),
         }
     except Exception as e:
-        logger.error("Error building vector overview for %s/%s: %s", workspace, project, e)
-        raise HTTPException(status_code=500, detail="Vector overview failed")
+        logger.error("Error building repository index overview for %s/%s: %s", workspace, project, e)
+        raise HTTPException(status_code=500, detail="Repository index overview failed")
 
 
-@router.post("/inspect/{workspace}/{project}/graph")
-def vector_graph(workspace: str, project: str, request: VectorGraphRequest):
-    """Return a bounded graph slice for one project collection."""
+@router.post("/repository-index/{workspace}/{project}/graph")
+def repository_index_graph(
+    workspace: str,
+    project: str,
+    request: RepositoryIndexGraphRequest,
+):
+    """Return a bounded graph slice for one exact repository generation."""
     index_manager = _get_index_manager()
-    collection_name = _collection_name(index_manager, workspace, project)
-
-    if not _collection_exists(index_manager, collection_name):
+    try:
+        collection_name = _exact_collection(
+            index_manager, request.collection_target
+        )
+    except ExactIndexPreconditionError:
         return {
             "available": False,
             "nodes": [],
@@ -1276,6 +1309,8 @@ def vector_graph(workspace: str, project: str, request: VectorGraphRequest):
             index_manager=index_manager,
             collection_name=collection_name,
             filters=request.filters,
+            workspace=workspace,
+            project=project,
             limit=request.limit,
             scan_limit=request.scan_limit,
             cursor=request.cursor,
@@ -1287,6 +1322,8 @@ def vector_graph(workspace: str, project: str, request: VectorGraphRequest):
             collection_name=collection_name,
             nodes=point_nodes,
             filters=request.filters,
+            workspace=workspace,
+            project=project,
             existing_ids=existing_ids,
             limit=min(1200, max(120, request.limit // 4)),
         )
@@ -1305,8 +1342,8 @@ def vector_graph(workspace: str, project: str, request: VectorGraphRequest):
             "limit": request.limit,
         }
     except Exception as e:
-        logger.error("Error building vector graph for %s/%s: %s", workspace, project, e)
-        raise HTTPException(status_code=500, detail="Vector graph failed")
+        logger.error("Error building repository index graph for %s/%s: %s", workspace, project, e)
+        raise HTTPException(status_code=500, detail="Repository index graph failed")
 
 
 def _scroll_neighbor_candidates(
@@ -1314,11 +1351,18 @@ def _scroll_neighbor_candidates(
     collection_name: str,
     scroll_filter: Optional[Filter],
     limit: int,
+    workspace: str,
+    project: str,
 ) -> List[Any]:
+    tenant_filter = Filter(must=[
+        FieldCondition(key="workspace", match=MatchValue(value=workspace)),
+        FieldCondition(key="project", match=MatchValue(value=project)),
+        *([scroll_filter] if scroll_filter is not None else []),
+    ])
     points, _ = index_manager.qdrant_client.scroll(
         collection_name=collection_name,
         limit=limit,
-        scroll_filter=scroll_filter,
+        scroll_filter=tenant_filter,
         with_payload=PAYLOAD_FIELDS,
         with_vectors=False,
     )
@@ -1348,7 +1392,7 @@ def _neighbor_filters_for(payload: Dict[str, Any]) -> Iterable[Optional[Filter]]
     names = []
     if payload.get("primary_name"):
         names.append(payload["primary_name"])
-    names.extend(_as_list(payload.get("semantic_names")))
+    names.extend(_as_list(payload.get("symbol_names")))
     names = [str(name) for name in names if name]
     if names:
         yield Filter(must=[*base_must, FieldCondition(key="primary_name", match=MatchAny(any=names[:20]))])
@@ -1372,18 +1416,25 @@ def _neighbor_filters_for(payload: Dict[str, Any]) -> Iterable[Optional[Filter]]
     if relation_names:
         relation_names = relation_names[:60]
         yield Filter(must=[*base_must, FieldCondition(key="primary_name", match=MatchAny(any=relation_names))])
-        yield Filter(must=[*base_must, FieldCondition(key="semantic_names", match=MatchAny(any=relation_names))])
+        yield Filter(must=[*base_must, FieldCondition(key="symbol_names", match=MatchAny(any=relation_names))])
         yield Filter(must=[*base_must, FieldCondition(key="methods", match=MatchAny(any=relation_names[:40]))])
 
 
-@router.post("/inspect/{workspace}/{project}/points/{point_id}")
-def vector_point(workspace: str, project: str, point_id: str, request: VectorNodeRequest):
+@router.post("/repository-index/{workspace}/{project}/points/{point_id}")
+def repository_index_point(
+    workspace: str,
+    project: str,
+    point_id: str,
+    request: RepositoryIndexNodeRequest,
+):
     """Return one point plus a bounded metadata-derived neighborhood."""
     index_manager = _get_index_manager()
-    collection_name = _collection_name(index_manager, workspace, project)
-
-    if not _collection_exists(index_manager, collection_name):
-        raise HTTPException(status_code=404, detail="Vector collection not found")
+    try:
+        collection_name = _exact_collection(
+            index_manager, request.collection_target
+        )
+    except ExactIndexPreconditionError:
+        raise HTTPException(status_code=404, detail="Repository index not found")
 
     try:
         points = index_manager.qdrant_client.retrieve(
@@ -1393,16 +1444,28 @@ def vector_point(workspace: str, project: str, point_id: str, request: VectorNod
             with_vectors=False,
         )
         if not points:
-            raise HTTPException(status_code=404, detail="Vector point not found")
+            raise HTTPException(status_code=404, detail="Repository record not found")
 
         point = points[0]
         payload = getattr(point, "payload", None) or {}
+        if (
+            payload.get("workspace") != workspace
+            or payload.get("project") != project
+        ):
+            raise HTTPException(status_code=404, detail="Repository record not found")
         node = _to_graph_node(point, detail=True)
 
         neighbor_by_id: Dict[str, Any] = {}
         per_query_limit = max(20, min(request.neighbor_limit, 80))
         for neighbor_filter in _neighbor_filters_for(payload):
-            for candidate in _scroll_neighbor_candidates(index_manager, collection_name, neighbor_filter, per_query_limit):
+            for candidate in _scroll_neighbor_candidates(
+                index_manager,
+                collection_name,
+                neighbor_filter,
+                per_query_limit,
+                workspace,
+                project,
+            ):
                 candidate_id = str(getattr(candidate, "id", ""))
                 if candidate_id and candidate_id != point_id:
                     candidate_payload = getattr(candidate, "payload", None) or {}
@@ -1429,5 +1492,5 @@ def vector_point(workspace: str, project: str, point_id: str, request: VectorNod
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Error loading vector point %s for %s/%s: %s", point_id, workspace, project, e)
-        raise HTTPException(status_code=500, detail="Vector point lookup failed")
+        logger.error("Error loading repository index point %s for %s/%s: %s", point_id, workspace, project, e)
+        raise HTTPException(status_code=500, detail="Repository record lookup failed")

@@ -78,40 +78,20 @@ def _all_added_diff(artifacts: Mapping[str, str]) -> str:
     return "\n".join(sections) + ("\n" if sections else "")
 
 
-def _facts_text(
-    kind: str,
-    source_path: str,
-    payloads: Sequence[Mapping[str, Any]],
-) -> str:
-    lines = [
-        "Deterministic repository architecture context",
-        (
-            "Plugin: hyva"
-            if kind.startswith("hyva-")
-            else (
-                "Plugin: magento"
-                if kind.startswith("magento-")
-                else "Plugin: php"
-            )
-        ),
-        f"Kind: {kind}",
-        f"Source: {source_path}",
-        "Facts:",
-    ]
-    for payload in payloads:
-        attributes = payload.get("attributes")
-        attribute_text = ""
-        if isinstance(attributes, Mapping) and attributes:
-            attribute_text = " {" + ", ".join(
-                f"{key}={attributes[key]}" for key in sorted(attributes)
-            ) + "}"
-        lines.append(
-            f"- [{payload['kind']}] {payload['source']} "
-            f"{payload['relation']} {payload['target']} "
-            f"({payload['path']}:{payload.get('line', 1)})"
-            f"{attribute_text}"
-        )
-    return "\n".join(lines)
+def _fact_text(payload: Mapping[str, Any]) -> str:
+    """Mirror the concise canonical relation rendering used in production."""
+    attributes = payload.get("attributes")
+    attribute_text = ""
+    if isinstance(attributes, Mapping) and attributes:
+        attribute_text = " {" + ", ".join(
+            f"{key}={attributes[key]}" for key in sorted(attributes)
+        ) + "}"
+    return (
+        f"- [{payload['kind']}] {payload['source']} "
+        f"{payload['relation']} {payload['target']} "
+        f"({payload['path']}:{payload.get('line', 1)})"
+        f"{attribute_text}"
+    )
 
 
 class FixtureGraphRagClient:
@@ -166,39 +146,60 @@ class FixtureGraphRagClient:
                     item[0]["line"],
                 ),
             )
-            # Match the production architecture-node packing boundary.
-            for offset in range(0, len(ordered), 25):
-                segment = ordered[offset:offset + 25]
-                payloads = [payload for payload, _ in segment]
-                architecture_paths = sorted({
-                    path
-                    for _, fact_paths in segment
-                    for path in fact_paths
-                })
-                identity = (
-                    f"{kind}\0{source_path}\0{offset // 25}"
+            for payload, fact_paths in ordered:
+                architecture_paths = sorted(fact_paths)
+                identity = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
                 )
+                relation_key = "fixture-relation:" + hashlib.sha256(
+                    identity.encode("utf-8")
+                ).hexdigest()
+                raw_attributes = payload.get("attributes")
+                attribute_values = (
+                    dict(raw_attributes)
+                    if isinstance(raw_attributes, Mapping)
+                    else {}
+                )
+                attribute_values["fact_kind"] = payload["kind"]
+                attributes = [
+                    {"name": str(name), "value": str(attribute_values[name])}
+                    for name in sorted(attribute_values)
+                ]
+                relation = {
+                    "key": relation_key,
+                    "kind": payload["relation"],
+                    "source": payload["source"],
+                    "source_key": None,
+                    "target": payload["target"],
+                    "target_key": None,
+                    "path": payload["path"],
+                    "span": {
+                        "start_line": payload.get("line", 1),
+                        "end_line": payload.get("line", 1),
+                    },
+                    "evidence": "",
+                    "related_paths": architecture_paths,
+                    "attributes": attributes,
+                    "captures": [],
+                }
                 chunks.append({
-                    "text": _facts_text(kind, source_path, payloads),
-                    "score": 0.95,
+                    "text": _fact_text(payload),
                     "_source": "pr_indexed",
                     "_match_type": "architecture_relation",
                     "metadata": {
-                        "path": (
-                            "__analysis_architecture__/fixture/"
-                            + hashlib.sha256(
-                                identity.encode("utf-8")
-                            ).hexdigest()
-                            + ".context"
-                        ),
+                        "path": payload["path"],
                         "pr": True,
-                        "architecture_key": "fixture:" + identity,
+                        "structural_record_type": "structural_relation",
+                        "structural_relation": relation,
+                        "architecture_key": relation_key,
                         "architecture_kind": kind,
                         "architecture_paths": architecture_paths,
-                        "plugin_graph_facts": payloads,
                     },
                 })
-                self.returned_fact_count += len(payloads)
+                self.returned_fact_count += 1
         return {
             "context": {
                 "chunks": chunks,

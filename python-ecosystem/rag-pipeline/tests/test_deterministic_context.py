@@ -2,20 +2,19 @@
 Tests for rag_pipeline.services.deterministic_context — DeterministicContextMixin.
 
 Covers:
-- get_deterministic_context full workflow (Steps 1-4)
+- get_deterministic_context full workflow
 - _apply_branch_priority
 - _query_changed_file
 - _query_definitions
 - _query_transitive_parents
-- _query_class_context
-- _query_namespace_context
 - Edge cases: collection not found, errors in queries, deduplication
 """
 import pytest
 from unittest.mock import patch, MagicMock, PropertyMock
 from types import SimpleNamespace
 from qdrant_client.http.models import FieldCondition, MatchValue
-
+from qdrant_client.models import Distance, VectorParams
+from rag_pipeline.services import deterministic_context as deterministic_context_module
 
 # ── Helper factories ──
 
@@ -24,17 +23,7 @@ def _mock_config(**overrides):
     cfg.qdrant_url = "http://localhost:6333"
     cfg.qdrant_api_key = None
     cfg.qdrant_collection_prefix = "rag"
-    cfg.embedding_provider = "ollama"
-    cfg.embedding_dim = 768
-    cfg.embedding_supports_instructions = False
-    cfg.ollama_model = "nomic-embed-text"
-    cfg.ollama_base_url = "http://localhost:11434"
-    cfg.openrouter_api_key = "sk-test"
-    cfg.openrouter_model = "openai/text-embedding-3-small"
-    cfg.openrouter_base_url = "https://openrouter.ai/api/v1"
     cfg.max_identifiers_per_query = 100
-    cfg.max_parent_classes_per_query = 20
-    cfg.max_namespaces_per_query = 10
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg
@@ -42,11 +31,63 @@ def _mock_config(**overrides):
 
 def _make_point(payload, point_id="p1"):
     """Create a mock Qdrant point with the given payload."""
+    payload = dict(payload)
+    payload.setdefault(
+        "structural_record_type",
+        (
+            "architecture_fact"
+            if payload.get("architecture_key")
+            or str(payload.get("path", "")).startswith(
+                "__analysis_architecture__/"
+            )
+            else "symbol_definition"
+            if payload.get("symbol_definition")
+            else "source_chunk"
+        ),
+    )
     p = SimpleNamespace()
     p.id = point_id
     p.payload = payload
     p.vector = [0.0] * 10
     return p
+
+
+def _architecture_payload(
+    *,
+    key,
+    path,
+    related_paths=(),
+    source="Source",
+    kind="relates-to",
+    target="Target",
+    line=1,
+    branch="main",
+    **metadata,
+):
+    """Build one production-shaped packed plugin graph node."""
+    paths = sorted({path, *related_paths})
+    return {
+        "text": f"{source} {kind} {target}",
+        "path": path,
+        "branch": branch,
+        "structural_record_type": "architecture_fact",
+        "architecture_context": True,
+        "architecture_key": key,
+        "architecture_paths": paths,
+        "architecture_identifiers": sorted({source, target}),
+        "plugin_graph_facts": [{
+            "kind": "fixture-relation",
+            "source": source,
+            "relation": kind,
+            "target": target,
+            "path": path,
+            "line": line,
+            "related_paths": paths,
+            "attributes": {},
+            "packetKey": key,
+        }],
+        **metadata,
+    }
 
 
 def _branch_filter(branch="main"):
@@ -56,12 +97,7 @@ def _branch_filter(branch="main"):
 
 def _build_service(plugin_catalog=None):
     """Build a DeterministicContextMixin-bearing service with all deps mocked."""
-    with patch("rag_pipeline.services.base.create_embedding_model") as mock_create, \
-         patch("rag_pipeline.services.base.get_embedding_model_info") as mock_info, \
-         patch("rag_pipeline.services.base.QdrantClient") as MockQdrant:
-
-        mock_info.return_value = {"provider": "ollama", "type": "local"}
-        mock_create.return_value = MagicMock()
+    with patch("rag_pipeline.services.base.QdrantClient"):
 
         from rag_pipeline.services.base import RAGQueryBase
         from rag_pipeline.services.deterministic_context import DeterministicContextMixin
@@ -71,6 +107,14 @@ def _build_service(plugin_catalog=None):
 
         config = _mock_config()
         service = TestService(config, plugin_catalog=plugin_catalog)
+        service.qdrant_client.get_aliases.return_value = SimpleNamespace(
+            aliases=[]
+        )
+        service.qdrant_client.get_collection.return_value = SimpleNamespace(
+            config=SimpleNamespace(params=SimpleNamespace(
+                vectors=VectorParams(size=1, distance=Distance.DOT)
+            ))
+        )
         service._observe_branches = MagicMock()
         return service
 
@@ -166,7 +210,6 @@ class TestApplyBranchPriority:
 # _query_changed_file
 # ─────────────────────────────────────────────────────────────
 class TestQueryChangedFile:
-
     def test_exact_path_match(self):
         svc = _build_service()
 
@@ -179,9 +222,13 @@ class TestQueryChangedFile:
             "imports": ["com.util.Helper"],
             "extends": ["BaseClass"],
             "implements": ["Runnable"],
-            "referenced_types": ["Worker", "Request"],
+            "referenced_types": [
+                "Worker",
+                "Request",
+                *[f"ReferencedType{index}" for index in range(75)],
+            ],
             "calls": ["load", "get", "format"],
-            "semantic_names": ["Foo"],
+            "symbol_names": ["Foo"],
             "primary_name": "Foo",
         }
         pt = _make_point(payload, "p1")
@@ -189,9 +236,6 @@ class TestQueryChangedFile:
 
         branch_filter = _branch_filter()
         all_chunks = []
-        identifiers = set()
-        parent_classes = set()
-        namespaces = set()
         imports_raw = set()
         extends_raw = set()
         seen_texts = set()
@@ -201,22 +245,20 @@ class TestQueryChangedFile:
         result = svc._query_changed_file(
             "coll", branch_filter, "src/Foo.java", 10,
             ["main"], "main", seen_texts, target_branch_paths,
-            changed_file_paths, identifiers, parent_classes,
-            namespaces, imports_raw, extends_raw, all_chunks
+            changed_file_paths, imports_raw, extends_raw, all_chunks
         )
 
         assert len(result) == 1
         assert result[0]["_match_type"] == "changed_file"
-        assert "BaseClass" in parent_classes
-        assert "com.example" in namespaces
         assert "Helper" in imports_raw
         assert "BaseClass" in extends_raw
         assert "Runnable" in extends_raw
         assert "Worker" in extends_raw
         assert "Request" in extends_raw
-        assert "load" in identifiers
-        assert "format" in identifiers
-        assert "get" not in identifiers
+        assert "ReferencedType74" in extends_raw
+        assert {
+            f"ReferencedType{index}" for index in range(75)
+        }.issubset(extends_raw)
         assert "src/Foo.java" in changed_file_paths
         assert "main" == "main" and "src/Foo.java" in target_branch_paths
 
@@ -229,7 +271,7 @@ class TestQueryChangedFile:
             "branch": "main",
         }
         pt = _make_point(payload, "p2")
-        # First scroll returns empty (exact path miss), second returns the point
+        # Exact path misses, then the safe multi-segment suffix resolves it.
         svc.qdrant_client.scroll.side_effect = [
             ([], None),
             ([pt], None),
@@ -239,7 +281,7 @@ class TestQueryChangedFile:
         result = svc._query_changed_file(
             "coll", _branch_filter(), "checkout/src/Bar.java", 10,
             ["main"], "main", set(), set(),
-            set(), set(), set(), set(), set(), set(), all_chunks
+            set(), set(), set(), all_chunks
         )
         assert len(result) == 1
         assert svc.qdrant_client.scroll.call_count == 2
@@ -268,9 +310,6 @@ class TestQueryChangedFile:
             set(),
             set(),
             set(),
-            set(),
-            set(),
-            set(),
             [],
         )
 
@@ -288,7 +327,7 @@ class TestQueryChangedFile:
         result = svc._query_changed_file(
             "coll", _branch_filter(), "x.java", 10,
             ["main"], "main", seen, set(),
-            set(), set(), set(), set(), set(), set(), all_chunks
+            set(), set(), set(), all_chunks
         )
         assert len(result) == 0
 
@@ -303,7 +342,7 @@ class TestQueryChangedFile:
         result = svc._query_changed_file(
             "coll", _branch_filter("feat"), "a.java", 10,
             ["feat", "main"], "feat", set(), set(),
-            set(), set(), set(), set(), set(), set(), all_chunks
+            set(), set(), set(), all_chunks
         )
         assert len(result) == 1
         assert result[0]["text"] == "target"
@@ -324,30 +363,125 @@ class TestQueryChangedFile:
         svc._query_changed_file(
             "coll", _branch_filter(), "x.java", 10,
             ["main"], "main", set(), set(),
-            set(), set(), set(), set(), imports_raw, set(), []
+            set(), imports_raw, set(), []
         )
         assert "Helper" in imports_raw
         assert "Bar" in imports_raw
+
+    def test_default_changed_file_retrieval_returns_more_than_ten_chunks(self):
+        svc = _build_service()
+        points = [
+            _make_point({
+                "text": f"changed fragment {index}",
+                "path": "src/Large.java",
+                "branch": "main",
+                "start_line": index + 1,
+                "end_line": index + 1,
+            }, f"changed-{index}")
+            for index in range(15)
+        ]
+        svc.qdrant_client.scroll.return_value = (points, None)
+        diagnostic = {}
+
+        result = svc._query_changed_file(
+            "coll", _branch_filter(), "src/Large.java", None,
+            ["main"], "main", set(), set(),
+            set(), set(), set(), [], diagnostic,
+        )
+
+        assert [chunk["text"] for chunk in result] == [
+            f"changed fragment {index}" for index in range(15)
+        ]
+        assert diagnostic["matching_points"] == 15
+        assert diagnostic["chunks_returned"] == 15
+        assert diagnostic["global_matching_point_limit"] == (
+            deterministic_context_module.DETERMINISTIC_MAX_MATCHING_POINTS
+        )
+        assert diagnostic["explicit_limit_per_file"] is None
+        assert diagnostic["explicit_limit_applied"] is False
+        assert diagnostic["scan_truncated"] is False
+        assert diagnostic["truncated"] is False
+        assert diagnostic["retrieval_state"] == "complete"
+        assert diagnostic["retrieval_scope"] == "exhaustive"
+        assert diagnostic["coverage_state"] == "complete"
+        assert diagnostic["context_usable"] is True
+        assert diagnostic["partial_reasons"] == []
+        assert diagnostic["bound_reasons"] == []
+
+    def test_explicit_per_file_limit_is_a_successful_bounded_result(self):
+        svc = _build_service()
+        points = [
+            _make_point({
+                "text": f"changed fragment {index}",
+                "path": "src/Large.java",
+                "branch": "main",
+                "start_line": index + 1,
+                "end_line": index + 1,
+            }, f"bounded-changed-{index}")
+            for index in range(15)
+        ]
+        svc.qdrant_client.scroll.return_value = (points, None)
+        diagnostic = {}
+
+        result = svc._query_changed_file(
+            "coll", _branch_filter(), "src/Large.java", 10,
+            ["main"], "main", set(), set(),
+            set(), set(), set(), [], diagnostic,
+        )
+
+        assert len(result) == 10
+        # Keep the legacy aggregate truncation flag for old clients, but do not
+        # misreport a fulfilled request bound as a failed/incomplete scan.
+        assert diagnostic["truncated"] is True
+        assert diagnostic["scan_truncated"] is False
+        assert diagnostic["explicit_limit_applied"] is True
+        assert diagnostic["retrieval_state"] == "complete"
+        assert diagnostic["retrieval_scope"] == "bounded"
+        assert diagnostic["coverage_state"] == "bounded_complete"
+        assert diagnostic["context_usable"] is True
+        assert diagnostic["partial_reasons"] == []
+        assert diagnostic["bound_reasons"] == ["explicit_limit_per_file"]
+
+    def test_equal_text_from_distinct_indexed_chunks_is_not_collapsed(self):
+        svc = _build_service()
+        points = [
+            _make_point({
+                "text": "same source text",
+                "path": "src/Duplicate.java",
+                "branch": "main",
+                "start_line": index + 1,
+                "end_line": index + 1,
+            }, f"distinct-point-{index}")
+            for index in range(2)
+        ]
+        svc.qdrant_client.scroll.return_value = (points, None)
+
+        result = svc._query_changed_file(
+            "coll", _branch_filter(), "src/Duplicate.java", None,
+            ["main"], "main", set(), set(),
+            set(), set(), set(), [],
+        )
+
+        assert len(result) == 2
+        assert [chunk["metadata"]["start_line"] for chunk in result] == [1, 2]
 
 
 class TestArchitectureContext:
 
     def test_exact_architecture_packet_expands_to_concrete_related_file(self):
         svc = _build_service()
-        packet = _make_point({
-            "text": "[magento-di-effective-plugin] CartInterface intercepted-by CartAudit",
-            "path": "__analysis_architecture__/magento/packet.context",
-            "branch": "main",
-            "architecture_key": "global:CartInterface:cart_audit",
-            "architecture_paths": [
-                "app/code/Acme/Checkout/etc/di.xml",
+        packet = _make_point(_architecture_payload(
+            key="global:CartInterface:cart_audit",
+            path="app/code/Acme/Checkout/etc/di.xml",
+            related_paths=(
                 "app/code/Acme/Checkout/Plugin/CartAudit.php",
-            ],
-            "architecture_identifiers": [
-                "Acme\\Checkout\\Api\\CartInterface",
-                "Acme\\Checkout\\Plugin\\CartAudit",
-            ],
-        }, "architecture")
+            ),
+            source="Acme\\Checkout\\Api\\CartInterface",
+            kind="intercepted-by",
+            target="Acme\\Checkout\\Plugin\\CartAudit",
+            architecture_plugin="magento",
+            architecture_kind="magento-interception",
+        ), "architecture")
         related = _make_point({
             "text": "class CartAudit { public function aroundSave() {} }",
             "path": "app/code/Acme/Checkout/Plugin/CartAudit.php",
@@ -361,8 +495,6 @@ class TestArchitectureContext:
         all_chunks = []
         architecture = {}
         related_files = {}
-        identifiers = set()
-
         svc._query_architecture_context(
             "coll",
             _branch_filter(),
@@ -376,7 +508,6 @@ class TestArchitectureContext:
             all_chunks,
             architecture,
             related_files,
-            identifiers,
         )
 
         assert [chunk["_match_type"] for chunk in all_chunks] == [
@@ -385,7 +516,39 @@ class TestArchitectureContext:
         ]
         assert "global:CartInterface:cart_audit" in architecture
         assert "app/code/Acme/Checkout/Plugin/CartAudit.php" in related_files
-        assert {"CartInterface", "CartAudit"} <= identifiers
+
+    def test_architecture_related_path_returns_more_than_ten_source_chunks(self):
+        svc = _build_service()
+        requested_path = "src/config.xml"
+        related_path = "src/Related.java"
+        packet = _make_point(_architecture_payload(
+            key="large-relation",
+            path=requested_path,
+            related_paths=(related_path,),
+        ), "architecture")
+        related_points = [
+            _make_point({
+                "text": f"related fragment {index}",
+                "path": related_path,
+                "branch": "main",
+                "start_line": index + 1,
+                "end_line": index + 1,
+            }, f"related-{index}")
+            for index in range(15)
+        ]
+        svc.qdrant_client.scroll.side_effect = [
+            ([packet], None),
+            (related_points, None),
+        ]
+        related_files = {}
+
+        stats = svc._query_architecture_context(
+            "coll", _branch_filter(), [requested_path], 10,
+            ["main"], "main", set(), set(), set(), [], {}, related_files,
+        )
+
+        assert len(related_files[related_path]) == 15
+        assert stats["related_chunks"] == 15
 
     def test_compacted_packet_is_focused_to_facts_touching_batch_path(self):
         svc = _build_service()
@@ -442,12 +605,10 @@ class TestArchitectureContext:
         chunks = []
         architecture = {}
         related_files = {}
-        identifiers = set()
-
         stats = svc._query_architecture_context(
             "coll", _branch_filter(), [changed_path], 5,
             ["main"], "main", set(), set(), set(), chunks,
-            architecture, related_files, identifiers,
+            architecture, related_files,
         )
 
         relation = chunks[0]
@@ -457,13 +618,138 @@ class TestArchitectureContext:
             changed_path,
             selected_related,
         ]
-        assert len(relation["metadata"]["plugin_graph_facts"]) == 1
+        assert relation["metadata"]["plugin_graph_facts"][0]["target"] == (
+            "CartAudit"
+        )
         assert set(related_files) == {selected_related}
         assert unrelated_related not in related_files
-        assert {"CartInterface", "CartAudit"} <= identifiers
-        assert "Noise" not in identifiers
         assert stats["packet_chunks"] == 1
         assert stats["related_chunks"] == 1
+
+    def test_exact_fact_line_selects_the_matching_bounded_source_chunk(self):
+        svc = _build_service()
+        changed_path = "src/Consumer.php"
+        target_path = "etc/routes.xml"
+        packet = _make_point({
+            "text": "stored architecture packet",
+            "path": "__analysis_architecture__/generic/routes.context",
+            "branch": "main",
+            "architecture_plugin": "generic",
+            "architecture_kind": "route-relation",
+            "architecture_key": "route-relation:routes.xml:0",
+            "architecture_paths": [changed_path, target_path],
+            "plugin_graph_facts": [{
+                "kind": "route-relation",
+                "source": "ConsumerType",
+                "relation": "configured-by",
+                "target": "RouteTarget",
+                "path": target_path,
+                "line": 6_500,
+                "related_paths": [changed_path],
+                "attributes": {},
+                "packetKey": "route:checkout",
+            }],
+        }, "architecture")
+        source_points = [
+            _make_point({
+                "text": "<route id=\"unrelated\"/>",
+                "path": target_path,
+                "branch": "main",
+                "start_line": 1,
+                "end_line": 20,
+            }, "unrelated-route"),
+            _make_point({
+                "text": "<route id=\"checkout\" frontName=\"checkout\"/>",
+                "path": target_path,
+                "branch": "main",
+                "start_line": 6_490,
+                "end_line": 6_510,
+            }, "checkout-route"),
+        ]
+        svc.qdrant_client.scroll.side_effect = [
+            ([packet], None),
+            (source_points, None),
+        ]
+        related_files = {}
+
+        svc._query_architecture_context(
+            "coll", _branch_filter(), [changed_path], 1,
+            ["main"], "main", set(), set(), set(), [],
+            {}, related_files,
+        )
+
+        source_chunk = related_files[target_path][0]
+        assert source_chunk["text"] == (
+            "<route id=\"checkout\" frontName=\"checkout\"/>"
+        )
+        assert source_chunk["metadata"]["start_line"] == 6_490
+        assert source_chunk["metadata"]["end_line"] == 6_510
+        assert "source_complete_in_index" not in source_chunk["metadata"]
+
+    def test_retrieval_identifier_selects_the_matching_bounded_source_chunk(self):
+        svc = _build_service()
+        changed_path = "src/Consumer.php"
+        target_path = "etc/services.xml"
+        packet = _make_point({
+            "text": "stored architecture packet",
+            "path": "__analysis_architecture__/generic/services.context",
+            "branch": "main",
+            "architecture_plugin": "generic",
+            "architecture_kind": "service-relation",
+            "architecture_key": "service-relation:services.xml:0",
+            "architecture_paths": [changed_path, target_path],
+            "plugin_graph_facts": [{
+                "kind": "service-relation",
+                "source": "ConsumerType",
+                "relation": "resolves-to",
+                "target": "ServiceContract",
+                "path": changed_path,
+                "line": 18,
+                "related_paths": [target_path],
+                "attributes": {
+                    "retrievalIdentifier:target": "LateMutationHandler",
+                },
+                "packetKey": "service:mutation",
+            }],
+        }, "architecture")
+        source_points = [
+            _make_point({
+                "text": "<service id=\"UnrelatedHandler\"/>",
+                "path": target_path,
+                "branch": "main",
+                "primary_name": "UnrelatedHandler",
+                "start_line": 10,
+                "end_line": 10,
+            }, "unrelated-handler"),
+            _make_point({
+                "text": "<service id=\"LateMutationHandler\"/>",
+                "path": target_path,
+                "branch": "main",
+                "primary_name": "LateMutationHandler",
+                "start_line": 6_500,
+                "end_line": 6_500,
+            }, "late-handler"),
+        ]
+        svc.qdrant_client.scroll.side_effect = [
+            ([packet], None),
+            (source_points, None),
+        ]
+        related_files = {}
+
+        svc._query_architecture_context(
+            "coll", _branch_filter(), [changed_path], 1,
+            ["main"], "main", set(), set(), set(), [],
+            {}, related_files,
+        )
+
+        source_chunk = related_files[target_path][0]
+        assert source_chunk["text"] == (
+            "<service id=\"LateMutationHandler\"/>"
+        )
+        assert source_chunk["metadata"]["primary_name"] == (
+            "LateMutationHandler"
+        )
+        assert "source_complete_in_index" not in source_chunk["metadata"]
 
     def test_plugin_retrieval_identifier_prioritizes_exact_related_method(self):
         svc = _build_service()
@@ -511,19 +797,30 @@ class TestArchitectureContext:
             "branch": "main",
             "primary_name": "getList",
             "start_line": 100,
+            "end_line": 104,
         }, "get-list")
+        symbol_stub = _make_point({
+            "text": "method Acme\\Model\\BannerRepository::getList",
+            "path": target_path,
+            "branch": "main",
+            "primary_name": "getList",
+            "symbol_definition": True,
+            "symbol_qualified_name": (
+                "Acme\\Model\\BannerRepository::getList"
+            ),
+            "start_line": 100,
+            "end_line": 100,
+        }, "get-list-symbol")
         svc.qdrant_client.scroll.side_effect = [
             ([packet], None),
-            ([*unrelated, exact_method], None),
+            ([symbol_stub, *unrelated, exact_method], None),
         ]
         chunks = []
         related_files = {}
-        identifiers = set()
-
         svc._query_architecture_context(
             "coll", _branch_filter(), [changed_path], 2,
             ["main"], "main", set(), set(), set(), chunks,
-            {}, related_files, identifiers,
+            {}, related_files,
         )
 
         assert related_files[target_path][0]["text"].startswith(
@@ -536,8 +833,9 @@ class TestArchitectureContext:
             ]
             == "array"
         )
-        assert len(related_files[target_path]) == 2
-        assert "getList" in identifiers
+        assert [chunk["text"] for chunk in related_files[target_path]] == [
+            "function getList(): array { return $this->items; }"
+        ]
 
     def test_magento_template_global_fact_retrieves_helper_contract(self):
         svc = _build_service()
@@ -596,7 +894,7 @@ class TestArchitectureContext:
         svc._query_architecture_context(
             "coll", _branch_filter(), [caller_path], 1,
             ["main"], "main", set(), set(), set(), chunks,
-            {}, related_files, set(),
+            {}, related_files,
         )
 
         assert (
@@ -705,7 +1003,7 @@ class TestArchitectureContext:
         svc._query_architecture_context(
             "coll", _branch_filter(), [consumer_path], 1,
             ["main"], "main", set(), set(), set(), chunks,
-            {}, related_files, set(),
+            {}, related_files,
         )
 
         assert (
@@ -722,20 +1020,18 @@ class TestArchitectureContext:
     def test_architecture_query_paginates_exact_matches(self):
         svc = _build_service()
         requested_path = "app/code/Acme/Checkout/etc/di.xml"
-        first = _make_point({
-            "text": "first relation",
-            "path": "__analysis_architecture__/magento/first.context",
-            "branch": "main",
-            "architecture_key": "first",
-            "architecture_paths": [requested_path],
-        }, "first")
-        second = _make_point({
-            "text": "second relation",
-            "path": "__analysis_architecture__/magento/second.context",
-            "branch": "main",
-            "architecture_key": "second",
-            "architecture_paths": [requested_path],
-        }, "second")
+        first = _make_point(_architecture_payload(
+            key="first",
+            path=requested_path,
+            source="First",
+            target="Relation",
+        ), "first")
+        second = _make_point(_architecture_payload(
+            key="second",
+            path=requested_path,
+            source="Second",
+            target="Relation",
+        ), "second")
         svc.qdrant_client.scroll.side_effect = [
             ([first], "next-page"),
             ([second], None),
@@ -745,12 +1041,12 @@ class TestArchitectureContext:
         stats = svc._query_architecture_context(
             "coll", _branch_filter(), [requested_path], 5,
             ["main"], "main", set(), set(), set(), chunks,
-            {}, {}, set(),
+            {}, {},
         )
 
-        assert [chunk["text"] for chunk in chunks] == [
-            "first relation",
-            "second relation",
+        assert [chunk["metadata"]["architecture_key"] for chunk in chunks] == [
+            "first",
+            "second",
         ]
         assert svc.qdrant_client.scroll.call_args_list[1].kwargs["offset"] == "next-page"
         assert stats["packet_candidates"] == 2
@@ -758,13 +1054,13 @@ class TestArchitectureContext:
 
     def test_stale_branch_packet_is_rejected_when_pr_changed_its_source(self):
         svc = _build_service()
-        packet = _make_point({
-            "text": "old effective relation",
-            "path": "__analysis_architecture__/magento/packet.context",
-            "branch": "main",
-            "architecture_key": "global:preference:CartInterface",
-            "architecture_paths": ["app/code/Acme/Checkout/etc/di.xml"],
-        }, "architecture")
+        packet = _make_point(_architecture_payload(
+            key="global:preference:CartInterface",
+            path="app/code/Acme/Checkout/etc/di.xml",
+            source="CartInterface",
+            kind="resolves-to",
+            target="Cart",
+        ), "architecture")
         svc.qdrant_client.scroll.return_value = ([packet], None)
         all_chunks = []
 
@@ -773,29 +1069,30 @@ class TestArchitectureContext:
             ["app/code/Acme/Checkout/etc/di.xml"], 10,
             ["main"], "main", set(),
             {"app/code/Acme/Checkout/etc/di.xml"}, set(), all_chunks,
-            {}, {}, set(),
+            {}, {},
         )
 
         assert all_chunks == []
 
     def test_pr_packet_replaces_stale_branch_packet(self):
         svc = _build_service()
-        branch_packet = _make_point({
-            "text": "old effective relation",
-            "path": "__analysis_architecture__/magento/packet.context",
-            "branch": "main",
-            "architecture_key": "global:preference:CartInterface",
-            "architecture_paths": ["app/code/Acme/Checkout/etc/di.xml"],
-        }, "branch")
-        pr_packet = _make_point({
-            "text": "new effective relation",
-            "path": "__analysis_architecture__/magento/packet.context",
-            "branch": "feature",
-            "pr": True,
-            "pr_number": 42,
-            "architecture_key": "global:preference:CartInterface",
-            "architecture_paths": ["app/code/Acme/Checkout/etc/di.xml"],
-        }, "pr")
+        branch_packet = _make_point(_architecture_payload(
+            key="global:preference:CartInterface",
+            path="app/code/Acme/Checkout/etc/di.xml",
+            source="CartInterface",
+            kind="resolves-to",
+            target="OldCart",
+        ), "branch")
+        pr_packet = _make_point(_architecture_payload(
+            key="global:preference:CartInterface",
+            path="app/code/Acme/Checkout/etc/di.xml",
+            source="CartInterface",
+            kind="resolves-to",
+            target="NewCart",
+            branch="feature",
+            pr=True,
+            pr_number=42,
+        ), "pr")
         svc.qdrant_client.scroll.return_value = ([branch_packet, pr_packet], None)
         all_chunks = []
 
@@ -804,16 +1101,76 @@ class TestArchitectureContext:
             ["app/code/Acme/Checkout/etc/di.xml"], 10,
             ["feature", "main"], "feature", set(),
             {"app/code/Acme/Checkout/etc/di.xml"}, set(), all_chunks,
-            {}, {}, set(),
+            {}, {},
         )
 
-        assert [chunk["text"] for chunk in all_chunks] == ["new effective relation"]
+        assert len(all_chunks) == 1
+        assert (
+            all_chunks[0]["metadata"]["plugin_graph_facts"][0]["target"]
+            == "NewCart"
+        )
 
 
 # ─────────────────────────────────────────────────────────────
 # _query_definitions (Step 2)
 # ─────────────────────────────────────────────────────────────
 class TestQueryDefinitions:
+
+    def test_definition_query_processes_every_identifier_in_bounded_batches(self):
+        svc = _build_service()
+        svc.config.max_identifiers_per_query = 2
+        identifiers = {"Alpha", "Beta", "Delta", "Gamma", "Omega"}
+
+        def scroll(**kwargs):
+            condition = next(
+                item
+                for item in kwargs["scroll_filter"].must
+                if getattr(item, "key", None) == "primary_name"
+            )
+            return ([
+                _make_point({
+                    "text": f"class {name} {{}}",
+                    "path": f"src/{name}.java",
+                    "branch": "main",
+                    "primary_name": name,
+                }, f"definition-{name}")
+                for name in condition.match.any
+            ], None)
+
+        svc.qdrant_client.scroll.side_effect = scroll
+        all_chunks = []
+        related_definitions = {}
+
+        svc._query_definitions(
+            "coll", _branch_filter(), identifiers,
+            ["main"], "main", set(), set(), set(), all_chunks,
+            related_definitions,
+        )
+
+        requested = []
+        for call in svc.qdrant_client.scroll.call_args_list:
+            primary_name_condition = next(
+                condition
+                for condition in call.kwargs["scroll_filter"].must
+                if getattr(condition, "key", None) == "primary_name"
+            )
+            requested.extend(primary_name_condition.match.any)
+        assert requested == ["Alpha", "Beta", "Delta", "Gamma", "Omega"]
+        assert len(requested) == len(set(requested))
+        assert svc.qdrant_client.scroll.call_count == 3
+        assert set(related_definitions) == identifiers
+        assert len(all_chunks) == len(identifiers)
+        assert len({chunk["_matched_on"] for chunk in all_chunks}) == len(
+            identifiers
+        )
+        assert all(
+            len(next(
+                condition
+                for condition in call.kwargs["scroll_filter"].must
+                if getattr(condition, "key", None) == "primary_name"
+            ).match.any) <= 2
+            for call in svc.qdrant_client.scroll.call_args_list
+        )
 
     def test_finds_definitions_by_primary_name(self):
         svc = _build_service()
@@ -840,6 +1197,105 @@ class TestQueryDefinitions:
         assert len(related_defs["Helper"]) == 1
         assert related_defs["Helper"][0]["_match_type"] == "definition"
 
+    def test_symbol_record_resolves_path_but_only_body_enters_context(self):
+        svc = _build_service()
+        path = "src/Service.java"
+        symbol_stub = _make_point({
+            "text": "method com.example.Service::execute",
+            "path": path,
+            "branch": "main",
+            "primary_name": "execute",
+            "symbol_definition": True,
+            "symbol_qualified_name": "com.example.Service::execute",
+            "start_line": 40,
+            "end_line": 40,
+        }, "symbol")
+        helper_body = _make_point({
+            "text": "private void helper() {}",
+            "path": path,
+            "branch": "main",
+            "start_line": 10,
+            "end_line": 12,
+        }, "helper")
+        implementation_body = _make_point({
+            "text": "public void execute() { helper(); }",
+            "path": path,
+            "branch": "main",
+            "start_line": 40,
+            "end_line": 44,
+        }, "implementation")
+        svc.qdrant_client.scroll.side_effect = [
+            ([symbol_stub], None),
+            ([symbol_stub, helper_body, implementation_body], None),
+        ]
+        all_chunks = []
+        related_defs = {}
+
+        svc._query_definitions(
+            "coll", _branch_filter(), {"execute"},
+            ["main"], "main", set(), set(), set(), all_chunks, related_defs,
+        )
+
+        assert [chunk["text"] for chunk in related_defs["execute"]] == [
+            "public void execute() { helper(); }"
+        ]
+        hydration_filter = (
+            svc.qdrant_client.scroll.call_args_list[1]
+            .kwargs["scroll_filter"]
+        )
+        assert any(
+            condition.key == "structural_record_type"
+            for condition in hydration_filter.must
+            if isinstance(condition, FieldCondition)
+        )
+
+    def test_pr_symbol_stub_does_not_mask_base_branch_implementation(self):
+        svc = _build_service()
+        path = "src/Service.java"
+        pr_symbol_stub = _make_point({
+            "text": "method com.example.Service::execute",
+            "path": path,
+            "branch": "feature",
+            "pr": True,
+            "primary_name": "execute",
+            "symbol_definition": True,
+            "symbol_qualified_name": "com.example.Service::execute",
+            "start_line": 40,
+            "end_line": 40,
+        }, "pr-symbol")
+        base_implementation = _make_point({
+            "text": "public void execute() { persist(); }",
+            "path": path,
+            "branch": "main",
+            "primary_name": "execute",
+            "start_line": 40,
+            "end_line": 44,
+        }, "base-implementation")
+        # The first lookup demonstrates the masking condition: branch priority
+        # sees the PR resolver record at this unchanged path and selects it over
+        # the target-branch source record. Source hydration must therefore run
+        # independently and recover the exact implementation body.
+        svc.qdrant_client.scroll.side_effect = [
+            ([base_implementation, pr_symbol_stub], None),
+            ([base_implementation], None),
+        ]
+        all_chunks = []
+        related_defs = {}
+
+        svc._query_definitions(
+            "coll", _branch_filter(), {"execute"},
+            ["feature", "main"], "feature", set(),
+            set(), set(), all_chunks, related_defs,
+        )
+
+        assert [chunk["text"] for chunk in related_defs["execute"]] == [
+            "public void execute() { persist(); }"
+        ]
+        assert all(
+            chunk["text"] != "method com.example.Service::execute"
+            for chunk in all_chunks
+        )
+
     def test_skips_changed_files(self):
         svc = _build_service()
 
@@ -864,6 +1320,62 @@ class TestQueryDefinitions:
 
         assert len(related_defs) == 0
 
+    def test_changed_candidate_does_not_make_another_path_look_unique(self):
+        svc = _build_service()
+        changed = _make_point({
+            "text": "class Helper {}",
+            "path": "src/changed/Helper.java",
+            "branch": "main",
+            "primary_name": "Helper",
+        }, "changed")
+        unrelated = _make_point({
+            "text": "class Helper {}",
+            "path": "src/unrelated/Helper.java",
+            "branch": "main",
+            "primary_name": "Helper",
+        }, "unrelated")
+        svc.qdrant_client.scroll.return_value = ([changed, unrelated], None)
+        related_defs = {}
+
+        svc._query_definitions(
+            "coll", _branch_filter(), {"Helper"},
+            ["main"], "main", set(),
+            {"src/changed/Helper.java"}, set(), [], related_defs,
+        )
+
+        assert related_defs == {}
+
+    def test_definition_uniqueness_is_checked_across_all_pages(self):
+        svc = _build_service()
+        first = _make_point({
+            "text": "class Service {}",
+            "path": "src/one/Service.java",
+            "branch": "main",
+            "primary_name": "Service",
+        }, "first")
+        second = _make_point({
+            "text": "class Service {}",
+            "path": "src/two/Service.java",
+            "branch": "main",
+            "primary_name": "Service",
+        }, "second")
+        svc.qdrant_client.scroll.side_effect = [
+            ([first], "next-page"),
+            ([second], None),
+        ]
+        related_defs = {}
+
+        svc._query_definitions(
+            "coll", _branch_filter(), {"Service"},
+            ["main"], "main", set(), set(), set(), [], related_defs,
+        )
+
+        assert related_defs == {}
+        assert (
+            svc.qdrant_client.scroll.call_args_list[1].kwargs["offset"]
+            == "next-page"
+        )
+
     def test_handles_exception(self):
         svc = _build_service()
         svc.qdrant_client.scroll.side_effect = Exception("network error")
@@ -884,6 +1396,62 @@ class TestQueryDefinitions:
 # _query_transitive_parents (Step 2b)
 # ─────────────────────────────────────────────────────────────
 class TestQueryTransitiveParents:
+
+    def test_parent_query_processes_every_parent_in_bounded_batches(self):
+        svc = _build_service()
+        svc.config.max_identifiers_per_query = 20
+        parents = {f"Parent{index:03d}" for index in range(55)}
+
+        def scroll(**kwargs):
+            condition = next(
+                item
+                for item in kwargs["scroll_filter"].must
+                if getattr(item, "key", None) == "primary_name"
+            )
+            return ([
+                _make_point({
+                    "text": f"class {name} {{}}",
+                    "path": f"src/{name}.java",
+                    "branch": "main",
+                    "primary_name": name,
+                }, f"parent-{name}")
+                for name in condition.match.any
+            ], None)
+
+        svc.qdrant_client.scroll.side_effect = scroll
+        all_chunks = []
+        related_definitions = {}
+
+        svc._query_transitive_parents(
+            "coll", _branch_filter(), parents,
+            ["main"], "main", set(), set(), set(), all_chunks,
+            related_definitions,
+        )
+
+        requested = []
+        for call in svc.qdrant_client.scroll.call_args_list:
+            primary_name_condition = next(
+                condition
+                for condition in call.kwargs["scroll_filter"].must
+                if getattr(condition, "key", None) == "primary_name"
+            )
+            requested.extend(primary_name_condition.match.any)
+        assert requested == sorted(parents)
+        assert len(requested) == len(set(requested))
+        assert svc.qdrant_client.scroll.call_count == 3
+        assert set(related_definitions) == parents
+        assert len(all_chunks) == len(parents)
+        assert len({chunk["_matched_on"] for chunk in all_chunks}) == len(
+            parents
+        )
+        assert all(
+            len(next(
+                condition
+                for condition in call.kwargs["scroll_filter"].must
+                if getattr(condition, "key", None) == "primary_name"
+            ).match.any) <= 20
+            for call in svc.qdrant_client.scroll.call_args_list
+        )
 
     def test_finds_transitive_parents(self):
         svc = _build_service()
@@ -944,108 +1512,6 @@ class TestQueryTransitiveParents:
 
 
 # ─────────────────────────────────────────────────────────────
-# _query_class_context (Step 3)
-# ─────────────────────────────────────────────────────────────
-class TestQueryClassContext:
-
-    def test_finds_class_context(self):
-        svc = _build_service()
-
-        payload = {
-            "text": "public void otherMethod() {}",
-            "path": "src/MyClass.java",
-            "branch": "main",
-            "parent_class": "MyClass",
-        }
-        pt = _make_point(payload, "cc1")
-        svc.qdrant_client.scroll.return_value = ([pt], None)
-
-        all_chunks = []
-        class_ctx = {}
-
-        svc._query_class_context(
-            "coll", _branch_filter(), {"MyClass"},
-            ["main"], "main", set(),
-            set(), set(), all_chunks, class_ctx
-        )
-
-        assert "MyClass" in class_ctx
-        assert class_ctx["MyClass"][0]["_match_type"] == "class_context"
-
-    def test_skips_changed_files(self):
-        svc = _build_service()
-
-        payload = {
-            "text": "void m() {}",
-            "path": "src/Changed.java",
-            "branch": "main",
-            "parent_class": "Changed",
-        }
-        pt = _make_point(payload, "cc2")
-        svc.qdrant_client.scroll.return_value = ([pt], None)
-
-        class_ctx = {}
-        svc._query_class_context(
-            "coll", _branch_filter(), {"Changed"},
-            ["main"], "main", set(),
-            {"src/Changed.java"}, set(), [], class_ctx
-        )
-        assert len(class_ctx) == 0
-
-    def test_handles_exception(self):
-        svc = _build_service()
-        svc.qdrant_client.scroll.side_effect = Exception("err")
-
-        with pytest.raises(Exception, match="err"):
-            svc._query_class_context(
-                "coll", _branch_filter(), {"X"},
-                ["main"], "main", set(),
-                set(), set(), [], {}
-            )
-
-
-# ─────────────────────────────────────────────────────────────
-# _query_namespace_context (Step 4)
-# ─────────────────────────────────────────────────────────────
-class TestQueryNamespaceContext:
-
-    def test_finds_namespace_context(self):
-        svc = _build_service()
-
-        payload = {
-            "text": "class Related {}",
-            "path": "src/Related.java",
-            "branch": "main",
-            "namespace": "com.example",
-        }
-        pt = _make_point(payload, "ns1")
-        svc.qdrant_client.scroll.return_value = ([pt], None)
-
-        all_chunks = []
-        ns_ctx = {}
-
-        svc._query_namespace_context(
-            "coll", _branch_filter(), {"com.example"},
-            ["main"], "main", set(),
-            set(), set(), all_chunks, ns_ctx
-        )
-
-        assert "com.example" in ns_ctx
-        assert ns_ctx["com.example"][0]["_match_type"] == "namespace_context"
-
-    def test_handles_exception(self):
-        svc = _build_service()
-        svc.qdrant_client.scroll.side_effect = Exception("err")
-
-        with pytest.raises(Exception, match="err"):
-            svc._query_namespace_context(
-                "coll", _branch_filter(), {"ns"},
-                ["main"], "main", set(),
-                set(), set(), [], {}
-            )
-
-
-# ─────────────────────────────────────────────────────────────
 # get_deterministic_context (full orchestration)
 # ─────────────────────────────────────────────────────────────
 class TestGetDeterministicContext:
@@ -1060,6 +1526,7 @@ class TestGetDeterministicContext:
             project="proj",
             branches=["main"],
             file_paths=["src/Foo.java"],
+            collection_target="rag_ws__proj",
         )
         assert result["_metadata"]["error"] == "collection_not_found"
         assert result["_metadata"]["retrieval_state"] == "unavailable"
@@ -1083,7 +1550,7 @@ class TestGetDeterministicContext:
             "namespace": "com.app",
             "imports": ["com.util.Helper"],
             "extends": ["Bar"],
-            "semantic_names": ["Foo"],
+            "symbol_names": ["Foo"],
             "primary_name": "Foo",
         }, "c1")
 
@@ -1125,12 +1592,56 @@ class TestGetDeterministicContext:
             project="proj",
             branches=["main"],
             file_paths=["src/Foo.java"],
+            collection_target="rag_ws__proj",
         )
 
         assert len(result["chunks"]) >= 1
         assert "src/Foo.java" in result["changed_files"]
         assert result["_metadata"]["branches_searched"] == ["main"]
         assert result["_metadata"]["retrieval_state"] == "complete"
+
+    def test_bounded_changed_file_context_does_not_mark_response_partial(self):
+        svc = _build_service()
+        mock_coll = MagicMock()
+        mock_coll.name = "rag_ws__proj"
+        svc.qdrant_client.get_collections.return_value.collections = [mock_coll]
+        svc.qdrant_client.get_aliases.return_value.aliases = []
+        points = [
+            _make_point({
+                "text": f"fragment {index}",
+                "path": "src/Large.java",
+                "branch": "main",
+                "start_line": index + 1,
+                "end_line": index + 1,
+            }, f"bounded-flow-{index}")
+            for index in range(15)
+        ]
+        svc.qdrant_client.scroll.return_value = (points, None)
+
+        with patch.object(
+            svc,
+            "_query_architecture_context",
+            return_value={"truncated": False, "partial_reasons": []},
+        ):
+            result = svc.get_deterministic_context(
+                workspace="ws",
+                project="proj",
+                branches=["main"],
+                file_paths=["src/Large.java"],
+                collection_target="rag_ws__proj",
+                limit_per_file=10,
+            )
+
+        metadata = result["_metadata"]
+        assert len(result["chunks"]) == 10
+        assert metadata["retrieval_state"] == "complete"
+        assert metadata["retrieval_scope"] == "bounded"
+        assert metadata["coverage_state"] == "bounded_complete"
+        assert metadata["context_usable"] is True
+        assert metadata["bounded_files"] == ["src/Large.java"]
+        assert metadata["partial_reasons"] == []
+        assert metadata["failures"] == []
+        assert metadata["file_status"] == {"src/Large.java": "hit"}
 
     def test_with_pr_number(self):
         svc = _build_service()
@@ -1155,6 +1666,7 @@ class TestGetDeterministicContext:
             project="proj",
             branches=["feat", "main"],
             file_paths=["src/Pr.java"],
+            collection_target="rag_ws__proj",
             pr_number=42,
         )
         assert len(result["chunks"]) >= 1
@@ -1174,12 +1686,62 @@ class TestGetDeterministicContext:
             project="proj",
             branches=["main"],
             file_paths=["src/X.java"],
+            collection_target="rag_ws__proj",
             additional_identifiers=["ExtraType", "HelperFunc", "x"],
         )
         # "x" is only 1 char, should be filtered out; other 2 should be in metadata
         ids_extracted = result["_metadata"]["identifiers_extracted"]
         assert "ExtraType" in ids_extracted
         assert "HelperFunc" in ids_extracted
+
+    def test_metadata_inventories_preserve_every_extracted_identifier(self):
+        svc = _build_service()
+        mock_coll = MagicMock()
+        mock_coll.name = "rag_ws__proj"
+        svc.qdrant_client.get_collections.return_value.collections = [mock_coll]
+        svc.qdrant_client.get_aliases.return_value.aliases = []
+        imports = [f"package.Import{index:03d}" for index in range(35)]
+        parents = [f"Parent{index:03d}" for index in range(25)]
+        additional = [f"Additional{index:03d}" for index in range(40)]
+        changed = _make_point({
+            "text": "class LargeDependencySurface {}",
+            "path": "src/Large.java",
+            "branch": "main",
+            "imports": imports,
+            "extends": parents,
+        }, "large")
+        svc.qdrant_client.scroll.return_value = ([changed], None)
+
+        with (
+            patch.object(
+                svc,
+                "_query_architecture_context",
+                return_value={"truncated": False},
+            ),
+            patch.object(svc, "_query_definitions") as query_definitions,
+        ):
+            result = svc.get_deterministic_context(
+                workspace="ws",
+                project="proj",
+                branches=["main"],
+                file_paths=["src/Large.java"],
+                collection_target="rag_ws__proj",
+                additional_identifiers=additional,
+            )
+
+        metadata = result["_metadata"]
+        assert metadata["identifiers_extracted"] == additional
+        assert metadata["imports_extracted"] == [
+            f"Import{index:03d}" for index in range(35)
+        ]
+        assert metadata["extends_extracted"] == parents
+        expected_queries = sorted({
+            *additional,
+            *(f"Import{index:03d}" for index in range(35)),
+            *parents,
+        })
+        assert metadata["definition_identifiers_queried"] == expected_queries
+        assert query_definitions.call_args.args[2] == set(expected_queries)
 
     def test_query_error_does_not_break_flow(self):
         svc = _build_service()
@@ -1196,6 +1758,7 @@ class TestGetDeterministicContext:
             project="proj",
             branches=["main"],
             file_paths=["src/Err.java"],
+            collection_target="rag_ws__proj",
         )
         assert result["chunks"] == []
         assert result["_metadata"]["retrieval_state"] == "failed"
@@ -1218,18 +1781,90 @@ class TestGetDeterministicContext:
         with patch.object(
             svc,
             "_query_architecture_context",
-            return_value={"truncated": True, "packet_candidates": 5000},
+            return_value={
+                "truncated": True,
+                "packet_candidates": 5000,
+                "partial_reasons": ["global_matching_point_limit"],
+            },
         ):
             result = svc.get_deterministic_context(
                 workspace="ws",
                 project="proj",
                 branches=["main"],
                 file_paths=["src/Checkout.php"],
+                collection_target="rag_ws__proj",
             )
 
         assert result["_metadata"]["retrieval_state"] == "partial"
+        assert result["_metadata"]["coverage_state"] == "partial"
+        assert result["_metadata"]["context_usable"] is True
+        assert result["_metadata"]["partial_reasons"] == [
+            "global_matching_point_limit"
+        ]
         assert result["_metadata"]["architecture_retrieval"]["truncated"] is True
         assert any(
             failure["error_type"] == "ResultLimit"
+            for failure in result["_metadata"]["failures"]
+        )
+
+    def test_changed_file_safety_cap_marks_context_partial(self):
+        svc = _build_service()
+        mock_coll = MagicMock()
+        mock_coll.name = "rag_ws__proj"
+        svc.qdrant_client.get_collections.return_value.collections = [mock_coll]
+        svc.qdrant_client.get_aliases.return_value.aliases = []
+        points = [
+            _make_point({
+                "text": f"fragment {index}",
+                "path": "src/Large.java",
+                "branch": "main",
+            }, f"fragment-{index}")
+            for index in range(3)
+        ]
+        svc.qdrant_client.scroll.return_value = (points, "more-results")
+
+        with (
+            patch.object(
+                deterministic_context_module,
+                "DETERMINISTIC_MAX_MATCHING_POINTS",
+                3,
+            ),
+            patch.object(
+                svc,
+                "_query_architecture_context",
+                return_value={"truncated": False},
+            ),
+        ):
+            result = svc.get_deterministic_context(
+                workspace="ws",
+                project="proj",
+                branches=["main"],
+                file_paths=["src/Large.java"],
+                collection_target="rag_ws__proj",
+            )
+
+        assert result["_metadata"]["retrieval_state"] == "partial"
+        assert result["_metadata"]["coverage_state"] == "partial"
+        assert result["_metadata"]["context_usable"] is True
+        assert result["_metadata"]["partial_reasons"] == [
+            "global_matching_point_limit"
+        ]
+        assert result["_metadata"]["file_status"] == {
+            "src/Large.java": "partial"
+        }
+        diagnostic = result["_metadata"]["changed_file_retrieval"][
+            "src/Large.java"
+        ]
+        assert diagnostic["truncated"] is True
+        assert diagnostic["scan_truncated"] is True
+        assert diagnostic["explicit_limit_applied"] is False
+        assert diagnostic["retrieval_state"] == "partial"
+        assert diagnostic["partial_reasons"] == [
+            "global_matching_point_limit"
+        ]
+        assert any(
+            failure["stage"] == "changed_file"
+            and failure["reason"] == "global_matching_point_limit"
+            and failure["error_type"] == "ResultLimit"
             for failure in result["_metadata"]["failures"]
         )

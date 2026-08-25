@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.rostilos.codecrow.analysisengine.dto.request.ai.AiAnalysisRequest;
 import org.rostilos.codecrow.analysisengine.dto.request.ai.AiAnalysisRequestImpl;
+import org.rostilos.codecrow.analysisengine.dto.request.ai.LocalRepositorySnapshot;
 import org.rostilos.codecrow.analysisengine.util.PromptDryRunMode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -111,6 +112,14 @@ public class AiAnalysisClient {
     public Map<String, Object> performAnalysis(AiAnalysisRequest request,
             java.util.function.Consumer<Map<String, Object>> eventHandler)
             throws IOException, GeneralSecurityException {
+        return performAnalysis(request, null, eventHandler);
+    }
+
+    public Map<String, Object> performAnalysis(
+            AiAnalysisRequest request,
+            LocalRepositorySnapshot localRepositorySnapshot,
+            java.util.function.Consumer<Map<String, Object>> eventHandler)
+            throws IOException, GeneralSecurityException {
 
         String jobId = UUID.randomUUID().toString();
         String eventQueueKey = "codecrow:analysis:events:" + jobId;
@@ -127,7 +136,9 @@ public class AiAnalysisClient {
 
             // Wrap the request with the jobId
             boolean promptDryRun = PromptDryRunMode.isEnabledForProject(request.getProjectId());
-            Map<String, Object> requestPayload = buildSerializableRequestPayload(request);
+            Map<String, Object> requestPayload = buildSerializableRequestPayload(
+                    request,
+                    localRepositorySnapshot);
             requestPayload.put("promptDryRun", promptDryRun);
             if (promptDryRun) {
                 requestPayload.put("promptDryRunId", jobId);
@@ -320,7 +331,9 @@ public class AiAnalysisClient {
         return result != null && Boolean.TRUE.equals(result.get("dryRun"));
     }
 
-    private Map<String, Object> buildSerializableRequestPayload(AiAnalysisRequest request) {
+    private Map<String, Object> buildSerializableRequestPayload(
+            AiAnalysisRequest request,
+            LocalRepositorySnapshot localRepositorySnapshot) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("projectId", request.getProjectId());
         payload.put("projectWorkspace", request.getProjectWorkspace());
@@ -339,6 +352,11 @@ public class AiAnalysisClient {
         payload.put("maxAllowedTokens", request.getMaxAllowedTokens());
         payload.put("useLocalMcp", request.getUseLocalMcp());
         payload.put("useMcpTools", request.getUseMcpTools());
+        if (localRepositorySnapshot != null) {
+            payload.put("localRepoPath", localRepositorySnapshot.path());
+            payload.put("localRepoTargetBranch", localRepositorySnapshot.targetBranch());
+            payload.put("localRepoRevision", localRepositorySnapshot.revision());
+        }
         payload.put("ragEnabled", request.getRagEnabled());
         payload.put("analysisType", request.getAnalysisType());
         payload.put("vcsProvider", request.getVcsProvider());
@@ -357,20 +375,22 @@ public class AiAnalysisClient {
         payload.put("deltaDiff", request.getDeltaDiff());
         payload.put("previousCommitHash", request.getPreviousCommitHash());
         payload.put("currentCommitHash", request.getCurrentCommitHash());
+        String targetHeadCommitHash = request.getTargetHeadCommitHash();
+        payload.put("targetHeadCommitHash", targetHeadCommitHash);
         payload.put("baseCommitHash", request.getBaseCommitHash());
         if (request.getRagEnabled()
                 && branchGenerationRepository != null
                 && branchIndexRepository != null
                 && request.getProjectId() != null
                 && request.getTargetBranchName() != null
-                && request.getBaseCommitHash() != null) {
+                && targetHeadCommitHash != null) {
             int accessed = branchIndexRepository.markAccessedIfUnclaimed(
                     request.getProjectId(), request.getTargetBranchName(), OffsetDateTime.now());
             if (accessed > 0) {
                 branchGenerationRepository.findAvailableExactGeneration(
                             request.getProjectId(),
                             request.getTargetBranchName(),
-                            request.getBaseCommitHash(),
+                            targetHeadCommitHash,
                             List.of(
                                     RagBranchIndexGenerationStatus.ACTIVE,
                                     RagBranchIndexGenerationStatus.SUPERSEDED))

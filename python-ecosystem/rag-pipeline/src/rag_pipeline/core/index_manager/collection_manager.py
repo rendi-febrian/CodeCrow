@@ -23,50 +23,56 @@ from qdrant_client.models import (
     PayloadSchemaType, TextIndexParams, TokenizerType
 )
 
+from ..exact_index import ExactIndexPreconditionError
+
 logger = logging.getLogger(__name__)
 
 
 class CollectionManager:
-    """Manages Qdrant collections and aliases."""
+    """Manages structural payload collections and aliases in Qdrant."""
 
-    def __init__(self, client: QdrantClient, embedding_dim: int):
+    def __init__(self, client: QdrantClient):
         self.client = client
-        self.embedding_dim = embedding_dim
-        self.vectors_on_disk = os.environ.get("QDRANT_VECTORS_ON_DISK", "true").lower() == "true"
         self._payload_indexes_ensured: set[str] = set()
         self._payload_indexes_in_progress: set[str] = set()
         self._payload_index_condition = threading.Condition()
     
-    def ensure_collection_exists(self, collection_name: str) -> None:
-        """Ensure Qdrant collection exists with proper configuration.
-        
-        If the collection_name is actually an alias, use the aliased collection instead.
-        """
-        if self.alias_exists(collection_name):
-            logger.info(f"Collection name {collection_name} is an alias, using existing aliased collection")
-            physical = self.resolve_collection_target(collection_name)
-            if physical is not None:
-                self.ensure_payload_indexes(physical)
-            return
-        
-        collections = self.client.get_collections().collections
-        collection_names = [c.name for c in collections]
-        logger.debug(f"Existing collections: {collection_names}")
+    @staticmethod
+    def _has_storage_marker_schema(collection_info) -> bool:
+        vectors = collection_info.config.params.vectors
+        if isinstance(vectors, Mapping):
+            return False
+        distance = getattr(vectors, "distance", None)
+        distance_value = getattr(distance, "value", distance)
+        return (
+            getattr(vectors, "size", None) == 1
+            and str(distance_value).casefold() == "dot"
+        )
 
-        if collection_name not in collection_names:
-            logger.info(f"Creating Qdrant collection: {collection_name} (vectors_on_disk={self.vectors_on_disk})")
-            created = self._create_collection(collection_name)
-            if created:
-                logger.info(f"Created collection {collection_name}")
-            else:
-                logger.info(
-                    "Collection %s was created concurrently; using it",
-                    collection_name,
-                )
-            self.ensure_payload_indexes(collection_name)
-        else:
-            logger.info(f"Collection {collection_name} already exists")
-            self.ensure_payload_indexes(collection_name)
+    def is_structural_collection(self, collection_name: str) -> bool:
+        """Return whether a collection/alias has the fixed marker schema."""
+        physical = self.resolve_collection_target(collection_name)
+        if physical is None:
+            return False
+        return self._has_storage_marker_schema(
+            self.client.get_collection(physical)
+        )
+
+    def require_structural_collection(self, collection_name: str) -> str:
+        """Reject mutations of pre-structural or otherwise incompatible data."""
+        physical = self.resolve_collection_target(collection_name)
+        if physical is None:
+            raise ExactIndexPreconditionError(
+                "structural repository collection is unavailable"
+            )
+        if not self._has_storage_marker_schema(
+            self.client.get_collection(physical)
+        ):
+            raise ExactIndexPreconditionError(
+                "repository collection predates structural payload storage; "
+                "run a full repository index to publish a replacement generation"
+            )
+        return physical
 
     def create_pending_collection(
         self,
@@ -108,22 +114,22 @@ class CollectionManager:
             self.client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(
-                    size=self.embedding_dim,
-                    distance=Distance.COSINE,
-                    on_disk=self.vectors_on_disk,
+                    size=1,
+                    distance=Distance.DOT,
+                    on_disk=True,
                 ),
-                on_disk_payload=self.vectors_on_disk,
+                on_disk_payload=True,
             )
             return True
         except UnexpectedResponse as exception:
             if (
                 exception.status_code == 409
-                and self._physical_collection_exists(collection_name)
+                and self.physical_collection_exists(collection_name)
             ):
                 return False
             raise
 
-    def _physical_collection_exists(self, collection_name: str) -> bool:
+    def physical_collection_exists(self, collection_name: str) -> bool:
         """Check a physical collection name without treating aliases as matches."""
         collections = self.client.get_collections().collections
         return any(collection.name == collection_name for collection in collections)
@@ -137,6 +143,9 @@ class CollectionManager:
             ("workspace", PayloadSchemaType.KEYWORD),
             ("project", PayloadSchemaType.KEYWORD),
             ("commit", PayloadSchemaType.KEYWORD),
+            ("primary_name", PayloadSchemaType.KEYWORD),
+            ("search_terms", PayloadSchemaType.KEYWORD),
+            ("structural_record_type", PayloadSchemaType.KEYWORD),
             ("architecture_paths", PayloadSchemaType.KEYWORD),
             ("architecture_group", PayloadSchemaType.KEYWORD),
             ("snapshot_plugin", PayloadSchemaType.KEYWORD),
@@ -251,9 +260,9 @@ class CollectionManager:
         """Delete a collection."""
         try:
             self.client.delete_collection(collection_name)
-            # A direct/legacy name can be recreated in the same process. Wait
-            # for a concurrent repair to finish, then invalidate its receipt
-            # so the replacement collection receives every required index.
+            # A direct target can be recreated in the same process. Wait for
+            # concurrent repair, then invalidate its receipt so the replacement
+            # receives every required payload index.
             with self._payload_index_condition:
                 while collection_name in self._payload_indexes_in_progress:
                     self._payload_index_condition.wait()
@@ -264,14 +273,6 @@ class CollectionManager:
             logger.warning(f"Failed to delete collection {collection_name}: {e}")
             return False
     
-    def collection_exists(self, collection_name: str) -> bool:
-        """Check if a collection or alias exists."""
-        if self.alias_exists(collection_name):
-            return True
-
-        collections = self.client.get_collections().collections
-        return collection_name in [c.name for c in collections]
-    
     def get_collection_names(self) -> List[str]:
         """Get all collection names."""
         collections = self.client.get_collections().collections
@@ -279,28 +280,6 @@ class CollectionManager:
     
     # Alias operations
     
-    def alias_exists(self, alias_name: str) -> bool:
-        """Check if an alias exists."""
-        try:
-            aliases = self.client.get_aliases()
-            exists = any(a.alias_name == alias_name for a in aliases.aliases)
-            logger.debug(f"Checking if alias '{alias_name}' exists: {exists}")
-            return exists
-        except Exception as e:
-            logger.warning(f"Error checking alias {alias_name}: {e}")
-            return False
-    
-    def resolve_alias(self, alias_name: str) -> Optional[str]:
-        """Resolve an alias to its underlying collection name."""
-        try:
-            aliases = self.client.get_aliases()
-            for alias in aliases.aliases:
-                if alias.alias_name == alias_name:
-                    return alias.collection_name
-        except Exception as e:
-            logger.debug(f"Error resolving alias {alias_name}: {e}")
-        return None
-
     def resolve_collection_target(self, collection_name: str) -> Optional[str]:
         """Resolve an alias or direct collection without hiding backend errors.
 
@@ -325,32 +304,6 @@ class CollectionManager:
             return collection_name
         return None
     
-    def atomic_alias_swap(
-        self,
-        alias_name: str,
-        new_collection: str,
-        old_alias_exists: bool
-    ) -> None:
-        """Perform atomic alias swap for zero-downtime reindexing."""
-        alias_operations = []
-
-        if old_alias_exists:
-            alias_operations.append(
-                DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=alias_name))
-            )
-
-        alias_operations.append(
-            CreateAliasOperation(create_alias=CreateAlias(
-                alias_name=alias_name,
-                collection_name=new_collection
-            ))
-        )
-
-        self.client.update_collection_aliases(
-            change_aliases_operations=alias_operations
-        )
-        logger.info(f"Alias swap completed: {alias_name} -> {new_collection}")
-
     def read_alias_targets(self, alias_names: List[str]) -> dict[str, Optional[str]]:
         """Read several alias targets from one consistent Qdrant response."""
         requested = list(dict.fromkeys(name for name in alias_names if name))
@@ -366,10 +319,7 @@ class CollectionManager:
     ) -> None:
         """Atomically point a set of aliases at already-validated collections.
 
-        An immutable generation alias and its human-facing aliases must move in
-        the same Qdrant transaction.  Reads that bind analysis to a historical
-        generation keep using the immutable alias; readable aliases are solely
-        the current branch and legacy-project pointers.
+        Exact generation target mappings move in one Qdrant transaction.
         """
         desired = {
             alias_name: collection_name
@@ -418,26 +368,6 @@ class CollectionManager:
             logger.warning(f"Failed to delete alias {alias_name}: {e}")
             return False
     
-    def cleanup_orphaned_pending_collections(
-        self,
-        base_name: str,
-        current_target: Optional[str] = None,
-        exclude_name: Optional[str] = None
-    ) -> int:
-        """Deprecated safe wrapper retained for internal compatibility.
-
-        Ownership-less cleanup used to delete every sibling pending collection
-        at the start of a job. That could destroy a live build in another
-        worker, so lifecycle cleanup now belongs to the expiry-aware janitor.
-        """
-        logger.debug(
-            "Skipping ownership-less pending cleanup for %s (target=%s exclude=%s)",
-            base_name,
-            current_target,
-            exclude_name,
-        )
-        return 0
-
     def cleanup_expired_pending_collections(
         self,
         *,

@@ -27,7 +27,7 @@ import static org.mockito.Mockito.*;
 class BranchIndexMaintenanceServiceTest {
 
     @Test
-    void unsetOptionalPatternsUseEmptyFiltersForInitialSnapshot() throws Exception {
+    void omittedBranchUsesPrimaryWithEmptyOptionalFilters() throws Exception {
         RagOperationsService ragOperations = mock(RagOperationsService.class);
         VcsClientProvider vcsClients = mock(VcsClientProvider.class);
         BranchIndexGenerationBuildService builds = mock(
@@ -76,7 +76,7 @@ class BranchIndexMaintenanceServiceTest {
                 .thenReturn(Map.of("document_count", 12, "chunk_count", 34));
 
         Map<String, Object> outcome = service.rebuild(
-                project, "main", false, ignored -> { });
+                project, null, false, ignored -> { });
 
         assertThat(outcome.get("branches")).isEqualTo(List.of("main"));
         assertThat(outcome.get("failedBranches")).isEqualTo(Map.of());

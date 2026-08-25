@@ -682,11 +682,8 @@ class BranchAnalysisProcessorTest {
                             && !diff.contains("src/Unrelated.java")), eq(false));
             verify(branchIssueReconciliationService, never()).sweepDeterministicResolutions(
                     anySet(), any(), any(), any(), anyMap());
-            verify(ragOperationsService).triggerIncrementalUpdate(
-                    eq(project), eq("feature-x"), eq("new-commit"),
-                    argThat(diff -> diff.contains("src/Issue.java")
-                            && !diff.contains("src/Unrelated.java")), any());
-            verify(ragOperationsService, never()).updateBranchIndex(any(), any(), any());
+            verify(ragOperationsService).refreshBranchGeneration(
+                    eq(project), eq("feature-x"), eq("new-commit"), any());
         }
 
         @Test
@@ -792,8 +789,8 @@ class BranchAnalysisProcessorTest {
             when(ragOperationsService.isRagIndexReady(project)).thenReturn(true);
             when(ragOperationsService.getBaseBranch(project)).thenReturn("main");
             when(ragOperationsService.isRagPipelineHealthy()).thenReturn(true);
-            when(ragOperationsService.triggerIncrementalUpdate(
-                    eq(project), eq("main"), eq("new-commit"), eq(rawDiff), any()))
+            when(ragOperationsService.refreshBranchGeneration(
+                    eq(project), eq("main"), eq("new-commit"), any()))
                     .thenReturn(true);
 
             // Final markHealthy
@@ -803,16 +800,16 @@ class BranchAnalysisProcessorTest {
 
             processor.process(request, consumer);
 
-            verify(ragOperationsService).triggerIncrementalUpdate(eq(project), eq("main"), eq("new-commit"), eq(rawDiff), any());
+            verify(ragOperationsService).refreshBranchGeneration(
+                    eq(project), eq("main"), eq("new-commit"), any());
         }
 
         @Test
-        @DisplayName("should not emit RAG success after an incremental failure")
-        void shouldNotEmitRagSuccessAfterIncrementalFailure() {
+        @DisplayName("should not emit repository-index success after a generation failure")
+        void shouldNotEmitRagSuccessAfterGenerationFailure() {
             BranchProcessRequest request = createRequest();
             request.commitHash = "failed-commit";
             request.targetBranchName = "main";
-            String rawDiff = "diff --git a/f.java b/f.java\n+x\n";
             List<Map<String, Object>> events = new ArrayList<>();
 
             when(project.getId()).thenReturn(1L);
@@ -820,18 +817,16 @@ class BranchAnalysisProcessorTest {
             when(ragOperationsService.isRagIndexReady(project)).thenReturn(true);
             when(ragOperationsService.isRagPipelineHealthy()).thenReturn(true);
             when(ragOperationsService.getBaseBranch(project)).thenReturn("main");
-            when(ragOperationsService.triggerIncrementalUpdate(
-                    eq(project), eq("main"), eq("failed-commit"), eq(rawDiff), any()))
+            when(ragOperationsService.refreshBranchGeneration(
+                    eq(project), eq("main"), eq("failed-commit"), any()))
                     .thenReturn(false);
 
             ReflectionTestUtils.invokeMethod(
                     processor,
-                    "performIncrementalRagUpdate",
+                    "performRagGenerationRefresh",
                     request,
                     project,
-                    rawDiff,
-                    (Consumer<Map<String, Object>>) events::add,
-                    false);
+                    (Consumer<Map<String, Object>>) events::add);
 
             assertThat(events)
                     .noneSatisfy(event ->
@@ -844,7 +839,6 @@ class BranchAnalysisProcessorTest {
             BranchProcessRequest request = createRequest();
             request.commitHash = "current-commit";
             request.targetBranchName = "main";
-            String rawDiff = "diff --git a/f.java b/f.java\n+x\n";
             List<Map<String, Object>> events = new ArrayList<>();
 
             when(project.getId()).thenReturn(1L);
@@ -852,18 +846,16 @@ class BranchAnalysisProcessorTest {
             when(ragOperationsService.isRagIndexReady(project)).thenReturn(true);
             when(ragOperationsService.isRagPipelineHealthy()).thenReturn(true);
             when(ragOperationsService.getBaseBranch(project)).thenReturn("main");
-            when(ragOperationsService.triggerIncrementalUpdate(
-                    eq(project), eq("main"), eq("current-commit"), eq(rawDiff), any()))
+            when(ragOperationsService.refreshBranchGeneration(
+                    eq(project), eq("main"), eq("current-commit"), any()))
                     .thenReturn(true);
 
             ReflectionTestUtils.invokeMethod(
                     processor,
-                    "performIncrementalRagUpdate",
+                    "performRagGenerationRefresh",
                     request,
                     project,
-                    rawDiff,
-                    (Consumer<Map<String, Object>>) events::add,
-                    false);
+                    (Consumer<Map<String, Object>>) events::add);
 
             assertThat(events)
                     .noneSatisfy(event ->
@@ -882,26 +874,24 @@ class BranchAnalysisProcessorTest {
             when(ragOperationsService.isRagIndexReady(project)).thenReturn(true);
             when(ragOperationsService.isRagPipelineHealthy()).thenReturn(true);
             when(ragOperationsService.getBaseBranch(project)).thenReturn("main");
-            when(ragOperationsService.triggerIncrementalUpdate(
-                    eq(project), eq("main"), eq("empty-range-commit"), eq(""), any()))
+            when(ragOperationsService.refreshBranchGeneration(
+                    eq(project), eq("main"), eq("empty-range-commit"), any()))
                     .thenReturn(true);
 
             ReflectionTestUtils.invokeMethod(
                     processor,
-                    "performIncrementalRagUpdate",
+                    "performRagGenerationRefresh",
                     request,
                     project,
-                    "",
-                    (Consumer<Map<String, Object>>) ignored -> { },
-                    false);
+                    (Consumer<Map<String, Object>>) ignored -> { });
 
-            verify(ragOperationsService).triggerIncrementalUpdate(
-                    eq(project), eq("main"), eq("empty-range-commit"), eq(""), any());
+            verify(ragOperationsService).refreshBranchGeneration(
+                    eq(project), eq("main"), eq("empty-range-commit"), any());
         }
 
         @Test
-        @DisplayName("should call updateBranchIndex for non-main branch RAG update")
-        void shouldCallUpdateBranchIndexForNonMainBranch() throws Exception {
+        @DisplayName("should refresh an exact generation for a retained non-main branch")
+        void shouldRefreshExactGenerationForNonMainBranch() throws Exception {
             BranchProcessRequest request = createRequest();
             request.targetBranchName = "feature-x";
             request.commitHash = "new-commit";
@@ -956,8 +946,8 @@ class BranchAnalysisProcessorTest {
 
             processor.process(request, consumer);
 
-            verify(ragOperationsService).updateBranchIndex(eq(project), eq("feature-x"), any());
-            verify(ragOperationsService, never()).triggerIncrementalUpdate(any(), any(), any(), any(), any());
+            verify(ragOperationsService).refreshBranchGeneration(
+                    eq(project), eq("feature-x"), eq("new-commit"), any());
         }
 
         @Test
@@ -976,16 +966,14 @@ class BranchAnalysisProcessorTest {
 
             ReflectionTestUtils.invokeMethod(
                     processor,
-                    "performIncrementalRagUpdate",
+                    "performRagGenerationRefresh",
                     request,
                     project,
-                    "diff --git a/f.java b/f.java\n+x\n",
-                    (Consumer<Map<String, Object>>) events::add,
-                    false);
+                    (Consumer<Map<String, Object>>) events::add);
 
             verify(ragOperationsService, never()).isRagPipelineHealthy();
-            verify(ragOperationsService, never()).updateBranchIndex(any(), any(), any());
-            verify(ragOperationsService, never()).triggerIncrementalUpdate(any(), any(), any(), any(), any());
+            verify(ragOperationsService, never()).refreshBranchGeneration(
+                    any(), any(), any(), any());
             assertThat(events).anySatisfy(event ->
                     assertThat(event).containsEntry("state", "rag_skipped"));
         }
@@ -1130,7 +1118,7 @@ class BranchAnalysisProcessorTest {
     }
 
     @Nested
-    @DisplayName("performIncrementalRagUpdate()")
+    @DisplayName("performRagGenerationRefresh()")
     class RagUpdateTests {
         // These are tested through process() behavior since the method is private.
         // The key scenarios: ragOperationsService null, rag not enabled, rag index not ready,

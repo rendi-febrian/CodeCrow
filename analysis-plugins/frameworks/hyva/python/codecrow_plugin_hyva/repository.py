@@ -11,6 +11,7 @@ from codecrow_plugins import (
     ArchitecturePacket,
     FileArtifact,
     GraphFact,
+    PluginDiagnostic,
     PluginOutcome,
     RepositoryAnalysis,
     RepositorySnapshot,
@@ -517,6 +518,7 @@ class HyvaRepositorySession:
         self.plugin_id = plugin_id
         self.revision = revision
         self.templates = dict(templates or {})
+        self._diagnostics: list[PluginDiagnostic] = []
 
     @classmethod
     def restore(
@@ -915,6 +917,20 @@ class HyvaRepositorySession:
                 identifiers.add(attributes["callerMethod"])
                 identifiers.add(target_method)
                 pending.append((fact.target, target_method))
+        if pending and not any(
+            diagnostic.code == "hyva-call-graph-state-limit"
+            for diagnostic in self._diagnostics
+        ):
+            self._diagnostics.append(PluginDiagnostic(
+                code="hyva-call-graph-state-limit",
+                message=(
+                    f"Hyva call-graph traversal admitted "
+                    f"{self.MAX_CALL_GRAPH_STATES} states; repository "
+                    "architecture context is partial"
+                ),
+                plugin_id=self.plugin_id,
+                recoverable=True,
+            ))
         return paths, identifiers
 
     @staticmethod
@@ -1235,4 +1251,5 @@ class HyvaRepositorySession:
         return PluginOutcome.handled(RepositoryAnalysis(
             packets=self._packets(dependencies),
             snapshots=(self._snapshot(),),
+            diagnostics=tuple(self._diagnostics),
         ))

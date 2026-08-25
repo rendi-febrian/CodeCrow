@@ -51,8 +51,12 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Create non-root user and set permissions
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+# Shared repository snapshots are created by Pipeline Agent as UID/GID 1001.
+# Use the same numeric identity so the request-bound MCP process can read them
+# and lifecycle cleanup does not depend on recursively changing shared-volume permissions.
+RUN groupadd --gid 1001 appuser && \
+    useradd --uid 1001 --gid appuser --no-create-home \
+        --shell /usr/sbin/nologin appuser
 RUN mkdir -p /app/logs/prompt-dry-runs && chown -R appuser:appuser /app
 
 WORKDIR /app

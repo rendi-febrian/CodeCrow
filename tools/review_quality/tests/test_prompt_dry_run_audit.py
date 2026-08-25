@@ -34,7 +34,6 @@ def _artifact() -> dict:
         "dryRun": True,
         "providerCalls": 0,
         "providerCallsScope": "review-llm-only",
-        "embeddingProviderCallsMeasured": False,
         "providerConstructionGuard": {
             "enabled": True,
             "boundary": "LLMFactory.create_llm",
@@ -123,8 +122,6 @@ def _artifact() -> dict:
                 }],
                 "retrieval": {
                     "deterministicStates": ["complete"],
-                    "semanticFailures": 0,
-                    "semanticDisabled": False,
                     "exactEvidenceIds": 1,
                 },
             },

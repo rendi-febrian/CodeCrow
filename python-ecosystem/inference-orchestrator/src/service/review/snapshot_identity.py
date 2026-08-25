@@ -21,7 +21,13 @@ class ReviewSnapshotIdentity:
     target_branch: str
     head_revision: str
     source_branch: Optional[str] = None
-    base_revision: Optional[str] = None
+    target_head_revision: Optional[str] = None
+    merge_base_revision: Optional[str] = None
+
+    @property
+    def base_revision(self) -> Optional[str]:
+        """Compatibility name for the target generation's base revision."""
+        return self.target_head_revision
 
 
 def _required_exact_text(value: Optional[str], field_name: str) -> str:
@@ -70,14 +76,16 @@ def validate_review_snapshot_identity(
     )
 
     source_branch: Optional[str] = None
-    base_revision: Optional[str] = None
+    target_head_revision: Optional[str] = None
+    merge_base_revision: Optional[str] = None
     if request.pullRequestId:
         source_branch = (
             request.sourceBranchName.strip()
             if request.sourceBranchName and request.sourceBranchName.strip()
             else None
         )
-        base_revision = (
+        target_head_revision = request.get_target_head_commit_hash()
+        merge_base_revision = (
             request.baseCommitHash.strip()
             if request.baseCommitHash and request.baseCommitHash.strip()
             else None
@@ -87,5 +95,6 @@ def validate_review_snapshot_identity(
         target_branch=target_branch,
         head_revision=head_revision,
         source_branch=source_branch,
-        base_revision=base_revision,
+        target_head_revision=target_head_revision,
+        merge_base_revision=merge_base_revision,
     )

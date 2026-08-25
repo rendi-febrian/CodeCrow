@@ -1,11 +1,4 @@
-"""
-CodeCrow RAG Pipeline
-
-A RAG (Retrieval-Augmented Generation) pipeline for code repositories.
-Provides indexing and querying capabilities for code using LlamaIndex, Tree-sitter and Qdrant.
-"""
-
-__version__ = "1.0.0"
+"""CodeCrow structural repository indexing and retrieval."""
 
 from .models.config import RAGConfig, IndexStats
 from .core.index_manager import RAGIndexManager
@@ -24,4 +17,3 @@ __all__ = [
     "make_namespace",
     "detect_language_from_path",
 ]
-

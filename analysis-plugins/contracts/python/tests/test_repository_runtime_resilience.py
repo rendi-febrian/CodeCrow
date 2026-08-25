@@ -2,10 +2,13 @@ from types import SimpleNamespace
 import time
 
 from codecrow_plugins import (
+    ArchitecturePacket,
     FileArtifact,
+    GraphFact,
     PluginDiagnostic,
     PluginOutcome,
     RepositoryAnalysis,
+    SymbolDefinition,
 )
 from codecrow_plugins.runtime import RepositoryAnalysisHandle
 
@@ -113,6 +116,77 @@ def test_repository_runtime_reports_timeout_as_recoverable_and_stops():
     ]
     assert [event["status"] for event in events] == ["started", "timed_out"]
     assert later.ingested == []
+
+
+class _StaticRepositorySession:
+    def __init__(self, analysis: RepositoryAnalysis):
+        self.analysis = analysis
+        self.finished = False
+
+    def finish(self, _dependencies):
+        self.finished = True
+        return PluginOutcome.handled(self.analysis)
+
+
+def _symbol(name: str) -> SymbolDefinition:
+    return SymbolDefinition(name, "class", f"src/{name}.py")
+
+
+def _packet(key: str) -> ArchitecturePacket:
+    path = f"src/{key}.py"
+    return ArchitecturePacket(
+        "test-plugin",
+        "test-architecture",
+        key,
+        (path,),
+        (GraphFact("test-fact", key, "declares", key, path),),
+    )
+
+
+def test_repository_symbol_overflow_is_fatal_and_does_not_publish_a_slice():
+    first = _StaticRepositorySession(RepositoryAnalysis(symbols=(_symbol("First"),)))
+    overflow = _StaticRepositorySession(RepositoryAnalysis(symbols=(_symbol("Second"),)))
+    later = _StaticRepositorySession(RepositoryAnalysis(symbols=(_symbol("Third"),)))
+    runtime = SimpleNamespace(
+        MAX_REPOSITORY_SYMBOLS=1,
+        MAX_ARCHITECTURE_PACKETS=10,
+    )
+    handle = RepositoryAnalysisHandle(
+        runtime,
+        [("first-plugin", first), ("overflow-plugin", overflow), ("later-plugin", later)],
+        [],
+    )
+
+    analysis, diagnostics = handle.finish()
+
+    assert analysis.symbols == (_symbol("First"),)
+    assert [(item.code, item.recoverable) for item in diagnostics] == [
+        ("plugin-repository-symbol-limit", False),
+    ]
+    assert later.finished is False
+
+
+def test_repository_packet_overflow_is_fatal_and_does_not_publish_a_slice():
+    first = _StaticRepositorySession(RepositoryAnalysis(packets=(_packet("first"),)))
+    overflow = _StaticRepositorySession(RepositoryAnalysis(packets=(_packet("second"),)))
+    later = _StaticRepositorySession(RepositoryAnalysis(packets=(_packet("third"),)))
+    runtime = SimpleNamespace(
+        MAX_REPOSITORY_SYMBOLS=10,
+        MAX_ARCHITECTURE_PACKETS=1,
+    )
+    handle = RepositoryAnalysisHandle(
+        runtime,
+        [("first-plugin", first), ("overflow-plugin", overflow), ("later-plugin", later)],
+        [],
+    )
+
+    analysis, diagnostics = handle.finish()
+
+    assert analysis.packets == (_packet("first"),)
+    assert [(item.code, item.recoverable) for item in diagnostics] == [
+        ("plugin-repository-packet-limit", False),
+    ]
+    assert later.finished is False
 
 
 def test_repository_runtime_discards_result_that_returns_after_deadline(

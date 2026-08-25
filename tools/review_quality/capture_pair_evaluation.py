@@ -516,16 +516,11 @@ def _capture_hunk_counts(
         raise ValueError(f"{path}: deterministic retrieval evidence is missing")
     if any(state != "complete" for state in deterministic_states):
         raise ValueError(f"{path}: deterministic retrieval evidence is incomplete")
-    semantic_failures = retrieval.get("semanticFailures")
     exact_evidence_ids = retrieval.get("exactEvidenceIds")
     if (
-        not isinstance(semantic_failures, int)
-        or isinstance(semantic_failures, bool)
-        or semantic_failures != 0
-        or not isinstance(exact_evidence_ids, int)
+        not isinstance(exact_evidence_ids, int)
         or isinstance(exact_evidence_ids, bool)
         or exact_evidence_ids < 0
-        or not isinstance(retrieval.get("semanticDisabled"), bool)
     ):
         raise ValueError(f"{path}: terminal retrieval evidence is degraded")
 

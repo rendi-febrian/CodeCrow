@@ -189,38 +189,23 @@ public class JobService {
         return job;
     }
 
-    /**
-     * Create a new job for RAG indexing.
-     */
+    /** Create a durable repository-index job bound to the branch revision it builds. */
     @Transactional
-    public Job createRagIndexJob(
+    public Job createRepositoryIndexBuildJob(
             Project project,
-            boolean isInitial,
-            JobTriggerSource triggerSource,
-            User triggeredBy
-    ) {
-        return createRagIndexJob(
-                project, isInitial, triggerSource, triggeredBy, null, null);
-    }
-
-    /** Create a durable RAG job bound to the branch revision it builds. */
-    @Transactional
-    public Job createRagIndexJob(
-            Project project,
-            boolean isInitial,
             JobTriggerSource triggerSource,
             User triggeredBy,
             String branchName,
-            String commitHash
+            String revision
     ) {
         Job job = new Job();
         job.setProject(project);
-        job.setJobType(isInitial ? JobType.RAG_INITIAL_INDEX : JobType.RAG_INCREMENTAL_INDEX);
+        job.setJobType(JobType.REPOSITORY_INDEX_BUILD);
         job.setTriggerSource(triggerSource);
         job.setTriggeredBy(triggeredBy);
         job.setBranchName(branchName);
-        job.setCommitHash(commitHash);
-        String operation = isInitial ? "Initial RAG Indexing" : "Incremental RAG Update";
+        job.setCommitHash(revision);
+        String operation = "Repository Index Build";
         job.setTitle(branchName == null || branchName.isBlank()
                 ? operation
                 : operation + ": " + branchName);
@@ -229,8 +214,8 @@ public class JobService {
         job = jobRepository.save(job);
         addLog(job, JobLogLevel.INFO, "init",
                 branchName == null || branchName.isBlank()
-                        ? "RAG indexing job created"
-                        : "RAG indexing job created for branch: " + branchName);
+                        ? "Repository index build job created"
+                        : "Repository index build job created for branch: " + branchName);
 
         return job;
     }
@@ -799,41 +784,6 @@ public class JobService {
     public boolean claimAbandonedRunningWebhookJob(Long jobId, OffsetDateTime threshold) {
         return jobRepository.claimAbandonedRunningWebhookJob(
                 jobId, threshold, OffsetDateTime.now()) == 1;
-    }
-
-    /** Renew the database-backed lease for one live legacy RAG producer. */
-    @Transactional
-    public boolean renewLegacyRagJobLease(
-            Long jobId,
-            OffsetDateTime validAfter,
-            OffsetDateTime renewedAt) {
-        return jobRepository.renewLegacyRagJobLease(
-                jobId, validAfter, renewedAt) == 1;
-    }
-
-    public List<JobRepository.LegacyRagJobRecoveryCoordinates>
-            findAbandonedLegacyRagJobs(OffsetDateTime threshold, int limit) {
-        return jobRepository.findAbandonedLegacyRagJobs(
-                threshold, PageRequest.of(0, Math.max(1, limit)));
-    }
-
-    /**
-     * Atomically terminalize an abandoned legacy RAG job only while its lease
-     * is still stale and no exact-generation operation owns it.
-     */
-    @Transactional
-    public boolean failAbandonedLegacyRagJob(
-            Long jobId,
-            OffsetDateTime threshold,
-            String diagnostic) {
-        return jobRepository.failAbandonedLegacyRagJob(
-                jobId, threshold, OffsetDateTime.now(), diagnostic) == 1;
-    }
-
-    public List<JobRepository.LegacyRagJobRecoveryCoordinates>
-            findFailedLegacyRagJobsWithActiveStatus(int limit) {
-        return jobRepository.findFailedLegacyRagJobsWithActiveStatus(
-                PageRequest.of(0, Math.max(1, limit)));
     }
 
     private void touchJobActivity(Job job) {

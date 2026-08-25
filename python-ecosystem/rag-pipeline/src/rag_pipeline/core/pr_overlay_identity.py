@@ -49,7 +49,7 @@ def pr_overlay_generation_fingerprint(
     snapshots: Iterable[object],
     base_generation_manifest_sha256: str = "",
 ) -> str:
-    """Hash every input that can change persisted semantic or plugin context."""
+    """Hash every input that can change persisted structural context."""
     digest = hashlib.sha256()
     _write_field(digest, "domain", "codecrow-pr-overlay")
     for name, value in (
@@ -111,19 +111,3 @@ def pr_overlay_generation_fingerprint(
         _write_field(digest, "snapshot_content_sha256", content_digest)
 
     return "sha256:" + digest.hexdigest()
-
-
-def is_complete_reusable_generation(
-    points: Sequence[object],
-    expected_fingerprint: str,
-) -> bool:
-    """Accept only a non-empty generation whose every point has one identity."""
-    if not points or not expected_fingerprint:
-        return False
-    return all(
-        (getattr(point, "payload", None) or {}).get(
-            "pr_generation_fingerprint"
-        )
-        == expected_fingerprint
-        for point in points
-    )

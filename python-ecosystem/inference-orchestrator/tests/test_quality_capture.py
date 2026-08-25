@@ -202,8 +202,6 @@ async def test_capture_records_exact_model_boundary_and_redacts_credentials(
         }],
         "retrieval": {
             "deterministicStates": ["complete"],
-            "semanticFailures": 0,
-            "semanticDisabled": False,
             "exactEvidenceIds": 2,
         },
         "revisionBinding": _revision_binding(),
@@ -345,8 +343,6 @@ async def test_capture_marks_missing_or_invalid_terminal_pipeline_evidence(
         "hunkReceipts": [],
         "retrieval": {
             "deterministicStates": [],
-            "semanticFailures": 0,
-            "semanticDisabled": True,
             "exactEvidenceIds": 0,
         },
     })
@@ -386,8 +382,6 @@ async def test_capture_marks_missing_or_invalid_terminal_pipeline_evidence(
         }],
         "retrieval": {
             "deterministicStates": ["failed"],
-            "semanticFailures": 1,
-            "semanticDisabled": True,
             "exactEvidenceIds": 0,
         },
     })

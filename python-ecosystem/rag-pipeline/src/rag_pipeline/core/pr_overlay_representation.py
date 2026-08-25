@@ -27,10 +27,9 @@ _PR_OVERLAY_SOURCE_PATHS = (
     "core/revision_preflight.py",
     "core/review_grouping.py",
     "services/base.py",
+    "services/code_search.py",
     "services/deterministic_context.py",
-    "services/pr_context.py",
     "services/query_service.py",
-    "services/semantic_search.py",
 )
 
 _PR_OVERLAY_DEPENDENCIES = (

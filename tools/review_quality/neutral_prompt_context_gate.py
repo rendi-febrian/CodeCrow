@@ -143,7 +143,7 @@ def _request(
         # generation. Supply the same complete base binding production sends;
         # the dry-run facade then returns the matching PR-generation receipts.
         # Without these coordinates Stage 1 correctly treats the request as an
-        # unbound legacy review and must not query PR-scoped vectors.
+        # unbound legacy review and must not query a PR-scoped overlay.
         ragCollectionTarget=f"neutral_{digest}_main_generation",
         ragBaseGenerationManifestSha256=hashlib.sha256(
             f"base-generation\0{digest}".encode("utf-8")
@@ -487,10 +487,6 @@ async def _capture_case(definition: NeutralCaseDefinition) -> dict[str, Any]:
         ),
         "expectedEvidenceVisible": not missing_evidence,
         "removedRelationVisible": not removed_relation_missing,
-        "noRagTruncation": quality["ragContextTruncationMarkers"] == 0,
-        "noCurrentSourceTruncation": (
-            quality["currentSourceTruncationMarkers"] == 0
-        ),
         "caseInputTokenCeiling": (
             capture["estimatedTotalInputTokens"] <= MAX_CASE_INPUT_TOKENS
         ),

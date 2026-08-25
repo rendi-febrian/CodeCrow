@@ -2,22 +2,20 @@
 import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Query
-from llama_index.core import Document as LlamaDocument
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
 
 from ..models import PRIndexRequest
 from ...core.repository_overlay import (
-    IncrementalIndexPreconditionError,
     build_overlay_capabilities,
     load_repository_snapshots,
 )
+from ...core.exact_index import ExactIndexPreconditionError
 from ...core.coordination import (
     MutationCoordinationUnavailable,
     MutationLeaseUnavailable,
 )
 from ...core.pr_overlay_identity import (
     ZERO_FINGERPRINT,
-    is_complete_reusable_generation,
     pr_overlay_generation_fingerprint,
 )
 from ...core.review_grouping import review_groups_from_architecture_payloads
@@ -32,6 +30,9 @@ from ...core.pr_overlay_manifest import (
     read_pr_overlay_generation,
 )
 from ...core.revision_binding import require_repository_generation
+from ...core.documents import Document
+from ...core.loader import REPOSITORY_FILE_SIZE_LIMIT_CODE
+from ...models.config import DEFAULT_MAX_FILE_SIZE_BYTES
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["pr"])
@@ -47,13 +48,33 @@ def _content_state(file_info: object) -> str:
     return state if state in {"complete", "partial_diff"} else "complete"
 
 
+def _configured_max_file_size_bytes(index_manager: object) -> int:
+    config = getattr(index_manager, "config", None)
+    configured = getattr(
+        config,
+        "max_file_size_bytes",
+        DEFAULT_MAX_FILE_SIZE_BYTES,
+    )
+    if (
+        isinstance(configured, bool)
+        or not isinstance(configured, int)
+        or configured < 1
+    ):
+        return DEFAULT_MAX_FILE_SIZE_BYTES
+    return configured
+
+
+def _utf8_size_bytes(content: str) -> int:
+    return len(content.encode("utf-8"))
+
+
 def _effective_detection_evidence(
     *,
     repository_plugins: tuple[str, ...],
     stored_plugin_ids: tuple[str, ...],
     requested_evidence: dict[str, list[str]],
     target_branch: str,
-    stored_fingerprint: str | None,
+    stored_fingerprint: str,
 ) -> dict[str, tuple[str, ...]]:
     """Bind the effective plugin set to target-index and PR evidence."""
     indexed = set(stored_plugin_ids)
@@ -64,7 +85,7 @@ def _effective_detection_evidence(
             evidence.add(
                 "indexed-target:"
                 f"{target_branch}:"
-                f"{stored_fingerprint or ZERO_FINGERPRINT}:"
+                f"{stored_fingerprint}:"
                 f"{plugin_id}"
             )
         if not evidence:
@@ -99,6 +120,168 @@ def _capabilities_payload(capabilities, implementation_fingerprint: str):
     }
 
 
+def _target_architecture_payloads(
+    index_manager,
+    collection_name: str,
+    *,
+    workspace: str,
+    project: str,
+    branch: str,
+    revision: str | None,
+    changed_paths,
+):
+    """Read exact target-branch graph facts for the changed paths.
+
+    Architecture lookup is auxiliary to PR indexing.  A storage failure must
+    therefore remain visible without rejecting an otherwise reviewable PR.
+    """
+    paths = tuple(sorted({path for path in changed_paths if path}))
+    if not paths:
+        return (), ()
+
+    payloads = {}
+    try:
+        for path_offset in range(0, len(paths), 64):
+            conditions = [
+                FieldCondition(
+                    key="workspace",
+                    match=MatchValue(value=workspace),
+                ),
+                FieldCondition(
+                    key="project",
+                    match=MatchValue(value=project),
+                ),
+                FieldCondition(
+                    key="branch",
+                    match=MatchValue(value=branch),
+                ),
+                FieldCondition(
+                    key="architecture_context",
+                    match=MatchValue(value=True),
+                ),
+                FieldCondition(
+                    key="architecture_paths",
+                    match=MatchAny(any=paths[path_offset:path_offset + 64]),
+                ),
+            ]
+            if revision:
+                conditions.append(FieldCondition(
+                    key="commit",
+                    match=MatchValue(value=revision),
+                ))
+
+            offset = None
+            while True:
+                points, offset = index_manager.qdrant_client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=Filter(
+                        must=conditions,
+                        must_not=[FieldCondition(
+                            key="pr",
+                            match=MatchValue(value=True),
+                        )],
+                    ),
+                    limit=256,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for point in points:
+                    payloads[str(point.id)] = point.payload or {}
+                if offset is None:
+                    break
+    except Exception as exception:
+        logger.warning(
+            "Could not load target-branch architecture facts for PR review "
+            "groups collection=%s branch=%s: %s",
+            collection_name,
+            branch,
+            exception,
+            exc_info=True,
+        )
+        return (), ({
+            "code": "target_architecture_facts_unavailable",
+            "message": (
+                "Exact target-branch architecture facts could not be loaded; "
+                "PR indexing continued with available overlay facts."
+            ),
+            "target_branch": branch,
+        },)
+
+    return tuple(payloads.values()), ()
+
+
+def _normalized_repository_path(value):
+    if not isinstance(value, str):
+        return ""
+    return value.strip().replace("\\", "/").lstrip("/")
+
+
+def _target_fallback_payloads(target_payloads, changed_paths, fallback_paths):
+    """Keep base facts only when every changed member lacks post-change source.
+
+    Overlay facts are authoritative for complete and deleted artifacts. A base
+    fact may fill a gap for partial files, but it must not reconnect a partial
+    file through a complete/deleted path when the post-change overlay removed
+    that relation.
+    """
+    changed = {
+        normalized
+        for path in changed_paths
+        if (normalized := _normalized_repository_path(path))
+    }
+    fallback = {
+        normalized
+        for path in fallback_paths
+        if (normalized := _normalized_repository_path(path))
+    }
+    if not fallback:
+        return ()
+
+    focused_payloads = []
+    for payload in target_payloads:
+        facts = payload.get("plugin_graph_facts")
+        if not isinstance(facts, (list, tuple)):
+            continue
+        focused_facts = []
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            members = {_normalized_repository_path(fact.get("path"))}
+            related_paths = fact.get("related_paths")
+            if isinstance(related_paths, (list, tuple)):
+                members.update(
+                    _normalized_repository_path(path)
+                    for path in related_paths
+                )
+            changed_members = (members - {""}) & changed
+            if changed_members and changed_members.issubset(fallback):
+                focused_facts.append(fact)
+        if focused_facts:
+            focused = dict(payload)
+            focused["plugin_graph_facts"] = focused_facts
+            focused_payloads.append(focused)
+    return tuple(focused_payloads)
+
+
+def _review_groups(
+    changed_paths,
+    overlay_payloads,
+    target_payloads,
+    fallback_paths,
+):
+    """Project groups with post-change facts taking deterministic precedence."""
+    target_fallbacks = _target_fallback_payloads(
+        target_payloads,
+        changed_paths,
+        fallback_paths,
+    )
+    return review_groups_from_architecture_payloads(
+        (*target_fallbacks, *overlay_payloads),
+        changed_paths,
+    )
+
+
 @router.post("/index/pr-files")
 def index_pr_files(request: PRIndexRequest):
     """
@@ -119,75 +302,39 @@ def index_pr_files(request: PRIndexRequest):
     mutation_lease = None
     try:
         mutation_lease = mutation_context.__enter__()
-        base_receipt = None
         target_branch = request.base_branch or request.branch
-        requested_collection_target = getattr(
-            request, "collection_target", None
+        base_receipt = require_repository_generation(
+            index_manager,
+            workspace=request.workspace,
+            project=request.project,
+            branch=target_branch,
+            revision=request.base_revision,
+            generation_manifest_sha256=(
+                request.base_generation_manifest_sha256
+            ),
+            collection_target=request.collection_target,
         )
-        requested_base_manifest = getattr(
-            request, "base_generation_manifest_sha256", None
-        )
-        if not isinstance(requested_collection_target, str):
-            requested_collection_target = None
-        if not isinstance(requested_base_manifest, str):
-            requested_base_manifest = None
-        if requested_collection_target and not request.base_revision:
-            raise IncrementalIndexPreconditionError(
-                "PR overlay collection target requires an exact base revision"
-            )
-        if requested_base_manifest and not request.base_revision:
-            raise IncrementalIndexPreconditionError(
-                "PR overlay base generation receipt requires an exact base revision"
-            )
-        exact_binding = bool(
-            request.base_revision
-            and (requested_collection_target or requested_base_manifest)
-        )
-        if exact_binding:
-            base_receipt = require_repository_generation(
-                index_manager,
-                workspace=request.workspace,
-                project=request.project,
-                branch=target_branch,
-                revision=request.base_revision,
-                generation_manifest_sha256=(
-                    requested_base_manifest
-                ),
-                collection_target=requested_collection_target,
-            )
-        collection_name = (
-            base_receipt["_collection_target"]
-            if base_receipt
-            else requested_collection_target
-            or index_manager._get_project_collection_name(
-                request.workspace, request.project
-            )
-        )
-        base_generation_receipt = (
-            {
-                "base_generation_manifest_sha256": base_receipt[
-                    "generation_manifest_sha256"
-                ],
-                "plugin_fingerprint": base_receipt["plugin_fingerprint"],
-                "plugin_descriptor_fingerprint": base_receipt[
-                    "plugin_descriptor_fingerprint"
-                ],
-                "plugin_implementation_fingerprint": base_receipt[
-                    "plugin_implementation_fingerprint"
-                ],
-                "index_representation_fingerprint": base_receipt[
-                    "index_representation_fingerprint"
-                ],
-            }
-            if base_receipt else {}
-        )
-
-        index_manager._ensure_collection_exists(collection_name)
+        collection_name = base_receipt["_collection_target"]
+        base_generation_receipt = {
+            "base_generation_manifest_sha256": base_receipt[
+                "generation_manifest_sha256"
+            ],
+            "plugin_fingerprint": base_receipt["plugin_fingerprint"],
+            "plugin_descriptor_fingerprint": base_receipt[
+                "plugin_descriptor_fingerprint"
+            ],
+            "plugin_implementation_fingerprint": base_receipt[
+                "plugin_implementation_fingerprint"
+            ],
+            "index_representation_fingerprint": base_receipt[
+                "index_representation_fingerprint"
+            ],
+        }
 
         # Keep the last complete PR generation until its replacement has been
-        # fully parsed, embedded and validated.  Mutation happens once at the
-        # end and the shared replacement primitive restores these records if
-        # either upsert or stale-point deletion fails.
+        # fully parsed and validated. Mutation happens once at the end and the
+        # shared replacement primitive restores these payloads with the fixed
+        # storage marker if either upsert or stale-point deletion fails.
         old_pr_points = []
         offset = None
         while True:
@@ -202,7 +349,7 @@ def index_pr_files(request: PRIndexRequest):
                 limit=256,
                 offset=offset,
                 with_payload=True,
-                with_vectors=True,
+                with_vectors=False,
             )
             old_pr_points.extend(points)
             if offset is None:
@@ -237,13 +384,8 @@ def index_pr_files(request: PRIndexRequest):
             include_facts=True,
         )
         requested_plugin_ids = tuple(request.repository_plugins)
-        if requested_plugin_ids:
-            if (
-                index_manager.plugin_catalog is None
-                or index_manager.plugin_runtime is None
-            ):
-                raise RuntimeError("repository plugins are unavailable")
-        if stored_plugin_ids:
+        selected_plugin_ids = (*stored_plugin_ids, *requested_plugin_ids)
+        if selected_plugin_ids:
             if (
                 index_manager.plugin_catalog is None
                 or index_manager.plugin_runtime is None
@@ -261,14 +403,15 @@ def index_pr_files(request: PRIndexRequest):
             for plugin_id in requested_plugin_ids
             if plugin_id not in stored_plugin_ids
         )
-        if requested_plugin_ids and index_manager.plugin_runtime is None:
-            raise RuntimeError("repository plugins are unavailable")
-
-        repository_plugins = tuple(
-            descriptor.id
-            for descriptor in index_manager.plugin_catalog.registry.resolve(
-                (*stored_plugin_ids, *requested_plugin_ids)
+        repository_plugins = (
+            tuple(
+                descriptor.id
+                for descriptor in index_manager.plugin_catalog.registry.resolve(
+                    selected_plugin_ids
+                )
             )
+            if selected_plugin_ids
+            else ()
         )
         implementation_fingerprint = (
             index_manager.plugin_catalog.implementation_fingerprint(
@@ -277,23 +420,10 @@ def index_pr_files(request: PRIndexRequest):
             if repository_plugins
             else "sha256:" + "0" * 64
         )
-        fingerprint = (
-            request.plugin_fingerprint
-            if missing_requested_plugins
-            else (stored_fingerprint or request.plugin_fingerprint)
-        )
         capabilities = None
         required_snapshot_plugins: set[str] = set()
         fresh_repository_plugins: set[str] = set()
         if repository_plugins:
-            if not request.source_revision:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "effective plugin capabilities require the immutable "
-                        "PR source revision"
-                    ),
-                )
             effective_detection_evidence = _effective_detection_evidence(
                 repository_plugins=repository_plugins,
                 stored_plugin_ids=tuple(stored_plugin_ids),
@@ -304,7 +434,6 @@ def index_pr_files(request: PRIndexRequest):
             capabilities = build_overlay_capabilities(
                 index_manager.plugin_catalog.registry,
                 repository_plugins,
-                fingerprint,
                 tuple(sorted(file_info.path for file_info in request.files)),
                 revision=request.source_revision,
                 detection_evidence=effective_detection_evidence,
@@ -377,113 +506,181 @@ def index_pr_files(request: PRIndexRequest):
                 and _content_state(file_info) != "complete"
             )
         ))
-        generation_fingerprint = None
-        if request.source_revision and request.base_revision:
-            generation_fingerprint = pr_overlay_generation_fingerprint(
-                workspace=request.workspace,
-                project=request.project,
-                pr_number=request.pr_number,
-                branch=request.branch,
-                base_branch=target_branch,
-                source_revision=request.source_revision,
-                base_revision=request.base_revision,
-                base_generation_manifest_sha256=(
-                    base_receipt["generation_manifest_sha256"]
-                    if base_receipt else ""
+        max_file_size_bytes = _configured_max_file_size_bytes(index_manager)
+        oversized_overlay_file_sizes = {}
+        for file_info in request.files:
+            if (
+                file_info.change_type == "DELETED"
+                or _content_state(file_info) != "complete"
+            ):
+                continue
+            content_size_bytes = _utf8_size_bytes(file_info.content)
+            if content_size_bytes > max_file_size_bytes:
+                oversized_overlay_file_sizes[file_info.path] = (
+                    content_size_bytes
+                )
+        oversized_overlay_files = tuple(sorted(oversized_overlay_file_sizes))
+        oversized_overlay_paths = set(oversized_overlay_files)
+        fallback_overlay_files = tuple(sorted({
+            *request_partial_files,
+            *oversized_overlay_files,
+        }))
+        for oversized_path in oversized_overlay_files:
+            logger.warning(
+                "PR repository source exceeds the configured indexing ceiling; "
+                "skipping it without truncation: code=%s pr=%s path=%s "
+                "bytes=%d max_bytes=%d",
+                REPOSITORY_FILE_SIZE_LIMIT_CODE,
+                request.pr_number,
+                oversized_path,
+                oversized_overlay_file_sizes[oversized_path],
+                max_file_size_bytes,
+            )
+        changed_paths = tuple(
+            file_info.path for file_info in request.files
+        )
+        (
+            target_architecture_payloads,
+            target_architecture_diagnostics,
+        ) = _target_architecture_payloads(
+            index_manager,
+            collection_name,
+            workspace=request.workspace,
+            project=request.project,
+            branch=target_branch,
+            revision=request.base_revision,
+            changed_paths=fallback_overlay_files,
+        )
+        index_diagnostics = list(target_architecture_diagnostics)
+        if request_partial_files:
+            index_diagnostics.append({
+                "code": "partial_diff_source_omitted",
+                "message": (
+                    "Partial diff content was not treated as complete source; "
+                    "exact target-branch architecture facts were used only "
+                    "as fallback for paths without complete source."
                 ),
-                files=request.files,
-                requested_plugin_ids=requested_plugin_ids,
-                repository_plugin_ids=repository_plugins,
-                request_plugin_fingerprint=request.plugin_fingerprint,
-                target_plugin_fingerprint=stored_fingerprint or ZERO_FINGERPRINT,
-                capability_fingerprint=(
-                    capabilities.fingerprint
-                    if capabilities is not None
-                    else ZERO_FINGERPRINT
+                "paths": list(request_partial_files),
+            })
+        if oversized_overlay_files:
+            index_diagnostics.append({
+                "code": REPOSITORY_FILE_SIZE_LIMIT_CODE,
+                "message": (
+                    "Complete PR source above the configured repository-index "
+                    "file ceiling was omitted as a whole without truncation. "
+                    "The PR diff remains review evidence."
                 ),
-                descriptor_fingerprint=(
-                    capabilities.descriptor_fingerprint
-                    if capabilities is not None
-                    else ZERO_FINGERPRINT
-                ),
-                implementation_fingerprint=implementation_fingerprint,
-                index_representation_fingerprint=representation_fingerprint,
-                pr_overlay_representation_fingerprint=(
+                "paths": list(oversized_overlay_files),
+                "file_sizes_bytes": {
+                    path: oversized_overlay_file_sizes[path]
+                    for path in oversized_overlay_files
+                },
+                "max_file_size_bytes": max_file_size_bytes,
+            })
+        generation_fingerprint = pr_overlay_generation_fingerprint(
+            workspace=request.workspace,
+            project=request.project,
+            pr_number=request.pr_number,
+            branch=request.branch,
+            base_branch=target_branch,
+            source_revision=request.source_revision,
+            base_revision=request.base_revision,
+            base_generation_manifest_sha256=base_receipt[
+                "generation_manifest_sha256"
+            ],
+            files=request.files,
+            requested_plugin_ids=requested_plugin_ids,
+            repository_plugin_ids=repository_plugins,
+            request_plugin_fingerprint=request.plugin_fingerprint,
+            target_plugin_fingerprint=stored_fingerprint,
+            capability_fingerprint=(
+                capabilities.fingerprint
+                if capabilities is not None
+                else ZERO_FINGERPRINT
+            ),
+            descriptor_fingerprint=(
+                capabilities.descriptor_fingerprint
+                if capabilities is not None
+                else ZERO_FINGERPRINT
+            ),
+            implementation_fingerprint=implementation_fingerprint,
+            index_representation_fingerprint=representation_fingerprint,
+            pr_overlay_representation_fingerprint=(
+                overlay_representation_fingerprint
+            ),
+            snapshots=snapshots,
+        )
+        reusable_receipt = read_pr_overlay_generation(
+            index_manager.qdrant_client,
+            collection_name,
+            workspace=request.workspace,
+            project=request.project,
+            pr_number=request.pr_number,
+            branch=request.branch,
+            base_branch=target_branch,
+            source_revision=request.source_revision,
+            base_revision=request.base_revision,
+            base_generation_manifest_sha256=base_receipt[
+                "generation_manifest_sha256"
+            ],
+            generation_fingerprint=generation_fingerprint,
+            overlay_representation_fingerprint=(
+                overlay_representation_fingerprint
+            ),
+        )
+        if reusable_receipt is not None:
+            architecture_points = sum(
+                1
+                for point in old_pr_points
+                if (
+                    (point.payload or {}).get("architecture_context")
+                    or (point.payload or {}).get("architecture_source")
+                )
+            )
+            logger.info(
+                "Reused PR #%s overlay generation: %s points from %s changed files",
+                request.pr_number,
+                len(old_pr_points),
+                len(request.files),
+            )
+            return {
+                "status": "reused",
+                **base_generation_receipt,
+                "pr_number": request.pr_number,
+                "files_processed": len(request.files),
+                "chunks_indexed": len(old_pr_points),
+                "chunks_failed": 0,
+                "architecture_packets_indexed": architecture_points,
+                "generation_fingerprint": generation_fingerprint,
+                **reusable_receipt,
+                "overlay_representation_fingerprint": (
                     overlay_representation_fingerprint
                 ),
-                snapshots=snapshots,
-            )
-            reusable_receipt = (
-                read_pr_overlay_generation(
-                    index_manager.qdrant_client,
-                    collection_name,
-                    workspace=request.workspace,
-                    project=request.project,
-                    pr_number=request.pr_number,
-                    branch=request.branch,
-                    base_branch=target_branch,
-                    source_revision=request.source_revision,
-                    base_revision=request.base_revision,
-                    base_generation_manifest_sha256=base_receipt[
-                        "generation_manifest_sha256"
-                    ],
-                    generation_fingerprint=generation_fingerprint,
-                    overlay_representation_fingerprint=(
-                        overlay_representation_fingerprint
+                "partial_files": list(request_partial_files),
+                "skipped_files": list(oversized_overlay_files),
+                "diagnostics": index_diagnostics,
+                "effective_project_capabilities": _capabilities_payload(
+                    capabilities,
+                    implementation_fingerprint,
+                ),
+                "review_groups": _review_groups(
+                    changed_paths,
+                    tuple(
+                        point.payload or {}
+                        for point in old_pr_points
+                        if (point.payload or {}).get("architecture_context")
                     ),
-                )
-                if base_receipt else None
-            )
-            if reusable_receipt is not None or (
-                base_receipt is None
-                and is_complete_reusable_generation(
-                    old_pr_points, generation_fingerprint
-                )
-            ):
-                architecture_points = sum(
-                    1
-                    for point in old_pr_points
-                    if (
-                        (point.payload or {}).get("architecture_context")
-                        or (point.payload or {}).get("architecture_source")
-                    )
-                )
-                logger.info(
-                    "Reused PR #%s overlay generation: %s points from %s changed files",
-                    request.pr_number,
-                    len(old_pr_points),
-                    len(request.files),
-                )
-                return {
-                    "status": "reused",
-                    **base_generation_receipt,
-                    "pr_number": request.pr_number,
-                    "files_processed": len(request.files),
-                    "chunks_indexed": len(old_pr_points),
-                    "chunks_failed": 0,
-                    "architecture_packets_indexed": architecture_points,
-                    "generation_fingerprint": generation_fingerprint,
-                    **(reusable_receipt or {}),
-                    "overlay_representation_fingerprint": (
-                        overlay_representation_fingerprint
-                    ),
-                    "partial_files": list(request_partial_files),
-                    "effective_project_capabilities": _capabilities_payload(
-                        capabilities,
-                        implementation_fingerprint,
-                    ),
-                    "review_groups": review_groups_from_architecture_payloads(
-                        (
-                            point.payload or {}
-                            for point in old_pr_points
-                            if (point.payload or {}).get("architecture_context")
-                        ),
-                        tuple(file_info.path for file_info in request.files),
-                    ),
-                }
+                    target_architecture_payloads,
+                    fallback_overlay_files,
+                ),
+            }
 
         file_dispositions = {}
-        active_overlay_files = list(request.files)
+        active_overlay_files = [
+            file_info
+            for file_info in request.files
+            if file_info.path not in oversized_overlay_paths
+        ]
         if capabilities is not None:
             from codecrow_plugins import FileDisposition
 
@@ -496,7 +693,7 @@ def index_pr_files(request: PRIndexRequest):
             }
             active_overlay_files = [
                 file_info
-                for file_info in request.files
+                for file_info in active_overlay_files
                 if file_dispositions[file_info.path] not in {
                     FileDisposition.EXCLUDED,
                     FileDisposition.GENERATED,
@@ -511,20 +708,11 @@ def index_pr_files(request: PRIndexRequest):
                 and _content_state(file_info) != "complete"
             )
         ))
-        if required_snapshot_plugins and partial_overlay_files:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "PR repository analysis requires complete changed-file "
-                    "source; partial diff content was supplied for "
-                    f"{', '.join(partial_overlay_files)}. Retrieve the complete "
-                    "post-change source before review."
-                ),
-            )
 
-        # Only complete post-change source is eligible for semantic embedding.
+        # Only complete post-change source can become an indexed source record.
         # Partial diffs remain review evidence in the inference request and are
-        # represented here only by their changed-file identity.
+        # represented here only by their changed-file identity and the exact
+        # target-branch architecture facts loaded above.
         documents = []
         for file_info in active_overlay_files:
             if not file_info.content or not file_info.content.strip():
@@ -538,7 +726,7 @@ def index_pr_files(request: PRIndexRequest):
                 if disposition is not FileDisposition.FULL:
                     continue
 
-            doc = LlamaDocument(
+            doc = Document(
                 text=file_info.content,
                 metadata={
                     "path": file_info.path,
@@ -558,6 +746,10 @@ def index_pr_files(request: PRIndexRequest):
         else:
             chunks = []
             split_skipped_paths = ()
+        split_skipped_paths = tuple(sorted({
+            *split_skipped_paths,
+            *oversized_overlay_files,
+        }))
 
         # Add PR metadata to all chunks
         for chunk in chunks:
@@ -585,24 +777,33 @@ def index_pr_files(request: PRIndexRequest):
             chunk.metadata["workspace"] = request.workspace
             chunk.metadata["project"] = request.project
             chunk.metadata["branch"] = request.branch
-            if generation_fingerprint:
-                chunk.metadata["pr_generation_fingerprint"] = (
-                    generation_fingerprint
-                )
-                chunk.metadata["pr_source_revision"] = request.source_revision
-                chunk.metadata["pr_base_revision"] = request.base_revision
-                if base_receipt:
-                    chunk.metadata["pr_base_generation_manifest_sha256"] = (
-                        base_receipt["generation_manifest_sha256"]
-                    )
-                    chunk.metadata["pr_overlay_base_branch"] = target_branch
+            chunk.metadata["pr_generation_fingerprint"] = generation_fingerprint
+            chunk.metadata["pr_source_revision"] = request.source_revision
+            chunk.metadata["pr_base_revision"] = request.base_revision
+            chunk.metadata["pr_base_generation_manifest_sha256"] = (
+                base_receipt["generation_manifest_sha256"]
+            )
+            chunk.metadata["pr_overlay_base_branch"] = target_branch
             chunk.metadata["indexed_at"] = datetime.now(timezone.utc).isoformat()
 
         point_id_branch = f"__pr__/{request.pr_number}/{request.branch}"
         analysis_revision = request.source_revision or f"pr-{request.pr_number}"
 
         architecture_nodes = []
-        if capabilities is not None and (snapshots or fresh_repository_plugins):
+        symbol_nodes = []
+        overlay_artifact_files = tuple(
+            file_info
+            for file_info in active_overlay_files
+            if (
+                file_info.change_type == "DELETED"
+                or _content_state(file_info) == "complete"
+            )
+        )
+        if (
+            capabilities is not None
+            and overlay_artifact_files
+            and (snapshots or fresh_repository_plugins)
+        ):
             from codecrow_plugins import (
                 FileArtifact,
                 RepositoryAnalysis,
@@ -624,10 +825,13 @@ def index_pr_files(request: PRIndexRequest):
                 (
                     FileArtifact(
                         path=file_info.path,
-                        content=file_info.content,
+                        content=(
+                            "" if file_info.change_type == "DELETED"
+                            else file_info.content
+                        ),
                         deleted=file_info.change_type == "DELETED",
                     )
-                    for file_info in active_overlay_files
+                    for file_info in overlay_artifact_files
                 ),
                 key=lambda artifact: artifact.path,
             ))
@@ -645,17 +849,24 @@ def index_pr_files(request: PRIndexRequest):
                 *repository_skipped_paths,
             }))
 
-            changed_paths = {
-                file_info.path for file_info in active_overlay_files
+            overlay_artifact_paths = {
+                file_info.path for file_info in overlay_artifact_files
             }
             affected_packets = tuple(
                 packet for packet in analysis.packets
-                if changed_paths.intersection(packet.paths)
+                if overlay_artifact_paths.intersection(packet.paths)
             )
             affected_related_paths = {
                 path for packet in affected_packets for path in packet.paths
             }
             affected_analysis = RepositoryAnalysis(
+                symbols=tuple(
+                    symbol for symbol in analysis.symbols
+                    if symbol.path in {
+                        *overlay_artifact_paths,
+                        *affected_related_paths,
+                    }
+                ),
                 packets=affected_packets,
                 contexts=tuple(
                     context for context in analysis.contexts
@@ -684,94 +895,91 @@ def index_pr_files(request: PRIndexRequest):
                     representation_fingerprint,
                 )
             )
-            for node in architecture_nodes:
+            symbol_nodes = index_manager._indexer._symbol_nodes(
+                affected_analysis,
+                capabilities,
+                request.workspace,
+                request.project,
+                request.branch,
+                analysis_revision,
+                implementation_fingerprint,
+                representation_fingerprint,
+            )
+            for node in (*architecture_nodes, *symbol_nodes):
                 node.metadata["pr"] = True
                 node.metadata["pr_number"] = request.pr_number
                 node.metadata["pr_branch"] = request.branch
                 node.metadata[PR_OVERLAY_REPRESENTATION_PAYLOAD_KEY] = (
                     overlay_representation_fingerprint
                 )
-                if generation_fingerprint:
-                    node.metadata["pr_generation_fingerprint"] = (
-                        generation_fingerprint
-                    )
-                    node.metadata["pr_source_revision"] = request.source_revision
-                    node.metadata["pr_base_revision"] = request.base_revision
-                    if base_receipt:
-                        node.metadata["pr_base_generation_manifest_sha256"] = (
-                            base_receipt["generation_manifest_sha256"]
-                        )
-                        node.metadata["pr_overlay_base_branch"] = target_branch
-                node.metadata["indexed_at"] = datetime.now(timezone.utc).isoformat()
-        overlay_receipt = {}
-        if generation_fingerprint and base_receipt:
-            identity_metadata = {
-                "plugin_ids": list(
-                    capabilities.repository_plugins
-                    if capabilities is not None else stored_plugin_ids
-                ),
-                "plugin_fingerprint": (
-                    capabilities.fingerprint
-                    if capabilities is not None else stored_fingerprint
-                ) or ZERO_FINGERPRINT,
-                "plugin_descriptor_fingerprint": (
-                    capabilities.descriptor_fingerprint
-                    if capabilities is not None
-                    else _stored_descriptor_fingerprint
-                ) or ZERO_FINGERPRINT,
-                "plugin_implementation_fingerprint": (
-                    implementation_fingerprint or ZERO_FINGERPRINT
-                ),
-                INDEX_REPRESENTATION_PAYLOAD_KEY: representation_fingerprint,
-                PR_OVERLAY_REPRESENTATION_PAYLOAD_KEY: (
-                    overlay_representation_fingerprint
-                ),
-            }
-
-            successful, overlay_receipt = (
-                index_manager._file_ops.replace_pr_overlay_generation(
-                    [*chunks, *architecture_nodes],
-                    old_pr_points,
-                    collection_name,
-                    request.workspace,
-                    request.project,
-                    point_id_branch,
-                    mutation_lease.assert_owned,
-                    pr_number=request.pr_number,
-                    branch=request.branch,
-                    base_branch=target_branch,
-                    source_revision=request.source_revision,
-                    base_revision=request.base_revision,
-                    base_generation_manifest_sha256=base_receipt[
-                        "generation_manifest_sha256"
-                    ],
-                    generation_fingerprint=generation_fingerprint,
-                    overlay_representation_fingerprint=(
-                        overlay_representation_fingerprint
-                    ),
-                    identity_metadata=identity_metadata,
+                node.metadata["pr_generation_fingerprint"] = generation_fingerprint
+                node.metadata["pr_source_revision"] = request.source_revision
+                node.metadata["pr_base_revision"] = request.base_revision
+                node.metadata["pr_base_generation_manifest_sha256"] = (
+                    base_receipt["generation_manifest_sha256"]
                 )
-            )
-        else:
-            successful = index_manager._file_ops._replace_points(
-                [*chunks, *architecture_nodes],
+                node.metadata["pr_overlay_base_branch"] = target_branch
+                node.metadata["indexed_at"] = datetime.now(timezone.utc).isoformat()
+        identity_metadata = {
+            "plugin_ids": list(
+                capabilities.repository_plugins
+                if capabilities is not None else stored_plugin_ids
+            ),
+            "plugin_fingerprint": (
+                capabilities.fingerprint
+                if capabilities is not None else stored_fingerprint
+            ),
+            "plugin_descriptor_fingerprint": (
+                capabilities.descriptor_fingerprint
+                if capabilities is not None
+                else _stored_descriptor_fingerprint
+            ),
+            "plugin_implementation_fingerprint": implementation_fingerprint,
+            INDEX_REPRESENTATION_PAYLOAD_KEY: representation_fingerprint,
+            PR_OVERLAY_REPRESENTATION_PAYLOAD_KEY: (
+                overlay_representation_fingerprint
+            ),
+        }
+
+        successful, overlay_receipt = (
+            index_manager._pr_overlay_ops.replace_pr_overlay_generation(
+                [*chunks, *architecture_nodes, *symbol_nodes],
                 old_pr_points,
                 collection_name,
                 request.workspace,
                 request.project,
                 point_id_branch,
                 mutation_lease.assert_owned,
+                pr_number=request.pr_number,
+                branch=request.branch,
+                base_branch=target_branch,
+                source_revision=request.source_revision,
+                base_revision=request.base_revision,
+                base_generation_manifest_sha256=base_receipt[
+                    "generation_manifest_sha256"
+                ],
+                generation_fingerprint=generation_fingerprint,
+                overlay_representation_fingerprint=(
+                    overlay_representation_fingerprint
+                ),
+                identity_metadata=identity_metadata,
             )
+        )
         skipped_points = (
-            len(chunks) + len(architecture_nodes) - successful
+            len(chunks) + len(architecture_nodes) + len(symbol_nodes) - successful
         )
 
         logger.info(
-            "Indexed PR #%s: %s semantic/architecture points from %s changed files (%s architecture packets)",
+            "Indexed PR #%s: %s structural points from %s changed files "
+            "(%s architecture packets, %s symbols, %s partial files, "
+            "%s oversized files)",
             request.pr_number,
             successful,
             len(request.files),
             len(architecture_nodes),
+            len(symbol_nodes),
+            len(partial_overlay_files),
+            len(oversized_overlay_files),
         )
 
         return {
@@ -784,29 +992,33 @@ def index_pr_files(request: PRIndexRequest):
             "chunks_skipped": skipped_points,
             "skipped_files": list(split_skipped_paths),
             "architecture_packets_indexed": len(architecture_nodes),
+            "symbols_indexed": len(symbol_nodes),
             "generation_fingerprint": generation_fingerprint,
             **overlay_receipt,
             "overlay_representation_fingerprint": (
                 overlay_representation_fingerprint
             ),
             "partial_files": list(request_partial_files),
+            "diagnostics": index_diagnostics,
             "effective_project_capabilities": _capabilities_payload(
                 capabilities,
                 implementation_fingerprint,
             ),
-            "review_groups": review_groups_from_architecture_payloads(
-                (
+            "review_groups": _review_groups(
+                changed_paths,
+                tuple(
                     node.metadata
                     for node in architecture_nodes
                     if node.metadata.get("architecture_context")
                 ),
-                tuple(file_info.path for file_info in active_overlay_files),
+                target_architecture_payloads,
+                fallback_overlay_files,
             ),
         }
 
     except HTTPException:
         raise
-    except IncrementalIndexPreconditionError as e:
+    except ExactIndexPreconditionError as e:
         logger.info("Rejected PR indexing against invalid repository state: %s", e)
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
@@ -829,12 +1041,10 @@ def delete_pr_files(
     workspace: str,
     project: str,
     pr_number: int,
-    collection_target: str | None = Query(default=None),
+    collection_target: str = Query(min_length=1),
 ):
     """Delete all indexed points for a specific PR."""
     index_manager = _get_index_manager()
-    if not isinstance(collection_target, str) or not collection_target.strip():
-        collection_target = None
     try:
         with index_manager.pr_overlay_mutation(
             workspace,
@@ -842,17 +1052,18 @@ def delete_pr_files(
             pr_number,
             "delete-pr-overlay",
         ) as lease:
-            collection_name = (
-                collection_target
-                or index_manager._get_project_collection_name(workspace, project)
-            )
             physical_collection = (
                 index_manager._collection_manager.resolve_collection_target(
-                    collection_name
+                    collection_target
                 )
             )
             if physical_collection is None:
                 return {"status": "skipped", "message": "Collection does not exist"}
+            physical_collection = (
+                index_manager._collection_manager.require_structural_collection(
+                    physical_collection
+                )
+            )
 
             # Existing exact generations may predate the PR filter indexes.
             # Repair them before the acknowledged filter delete. Keeping

@@ -1,6 +1,6 @@
 # CodeCrow Inference Orchestrator
 
-A sophisticated Python application for AI-powered code review using MCP (Model Context Protocol) servers with advanced RAG integration and Lost-in-the-Middle protection.
+A Python application for AI-powered code review using MCP (Model Context Protocol), structural repository context, and Lost-in-the-Middle protection.
 
 ---
 
@@ -8,7 +8,7 @@ A sophisticated Python application for AI-powered code review using MCP (Model C
 
 - [Overview](#overview)
 - [Architecture](#architecture)
-- [RAG Integration Flow](#rag-integration-flow)
+- [Structural Repository Context Flow](#structural-repository-context-flow)
 - [Task Context Flow](#task-context-flow)
 - [Lost-in-the-Middle Protection](#lost-in-the-middle-protection)
 - [Smart Chunking System](#smart-chunking-system)
@@ -28,9 +28,9 @@ CodeCrow Inference Orchestrator is the core component responsible for:
 - Receiving code review requests from the Pipeline Agent
 - Extracting and analyzing Pull Request diffs
 - Incorporating optional Jira/task-management context into PR-wide review
-- Integrating RAG context for enhanced code understanding
+- Integrating exact structural repository context for code understanding
 - Applying Lost-in-the-Middle protection for large PRs
-- Orchestrating LLM-based code review with MCP servers
+- Orchestrating direct and agentic LLM review through one shared execution service
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -70,13 +70,11 @@ inference-orchestrator/
 │   └── web_server.py          # FastAPI HTTP server
 ├── service/
 │   ├── review_service.py      # Core review orchestration
-│   ├── rag_client.py          # RAG Pipeline client
-│   └── llm_reranker.py        # RAG result ordering, optional LLM reranking
+│   └── rag_client.py          # Structural repository-index client
 ├── utils/
 │   ├── prompt_builder.py      # Prompt generation with L-i-M protection
 │   ├── response_parser.py     # JSON response extraction
-│   ├── context_builder.py     # Legacy RAG metrics/cache utilities
-│   ├── file_classifier.py     # Legacy neutral compatibility wrapper
+│   ├── file_classifier.py     # Neutral compatibility wrapper
 │   └── diff_parser.py         # Unified diff parsing
 └── requirements.txt
 ```
@@ -86,81 +84,72 @@ inference-orchestrator/
 | Component        | Responsibility                                   |
 | ---------------- | ------------------------------------------------ |
 | `ReviewService`  | Orchestrates the entire review pipeline          |
-| `RagClient`      | Communicates with RAG Pipeline for context       |
-| `ContextBuilder` | Legacy RAG metrics/cache utilities              |
-| `FileClassifier` | Legacy neutral wrapper; semantic priority is LLM-decided |
+| `RagClient`      | Structural indexing, deterministic context, and code search |
+| `FileClassifier` | Neutral file-classification compatibility wrapper |
 | `SmartChunker`   | Legacy neutral line/hunk chunking compatibility  |
-| `LLMReranker`    | Provider-score ordering; optional LLM reranking |
 | `PromptBuilder`  | Generates prompts with Lost-in-Middle protection |
+| Shared agent execution service | Creates agent sessions from a prompt, allowed MCP tools, repository bindings, and review metadata |
+
+### Stage 1 agent mode
+
+The project `useMcpTools` analysis setting defaults to enabled. The Pipeline Agent
+downloads the target-branch-head archive before inference and supplies a temporary
+local repository binding. Every Stage 1 file-review prompt then runs through the
+shared agent execution service with local file and VCS-compatible tools and
+revision-bound RAG search. The prompt still contains its diff, current-source
+projection, and preassembled structural RAG context; agent tools are additional
+ways to investigate that evidence.
+
+An explicit `false` uses the direct structured-model path. Disabling may reduce
+cost and latency, but may reduce output quality. Archive staging and file, VCS,
+and on-demand RAG tools are auxiliary. If snapshot staging fails, repository
+navigation continues with revision-pinned provider reads. If on-demand RAG fails,
+the agent retains repository tools and preassembled RAG. An MCP or agent execution
+failure records reduced context and reruns that batch with an MCP-free direct
+prompt containing the same assembled evidence.
 
 ---
 
-## RAG Integration Flow
+## Structural Repository Context Flow
 
-The Inference Orchestrator integrates with the RAG Pipeline to provide semantic code context during reviews.
+Reviews use revision-bound structural repository context. Stage 1 asks the
+repository index for exact changed-file chunks, symbol definitions, imports,
+inheritance, namespace relationships, and framework/plugin graph facts. The
+request is bound to the target collection, base revision and generation
+receipt; a successfully built PR overlay additionally binds the source revision,
+PR generation fingerprint, and overlay receipt.
 
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                        RAG Integration Flow                                │
-└────────────────────────────────────────────────────────────────────────────┘
+The returned chunks are filtered only for stale/deleted paths, exact duplicate
+evidence, and current-source redundancy. Match
+types and concrete `matched_on` values are included in the prompt. Only exact
+structural matches are used.
 
-     PR Request
-         │
-         ▼
-┌─────────────────┐
-│  1. Extract PR  │     Changed Files: [auth.py, user.py]
-│     Metadata    │     PR Title: "Fix auth token refresh"
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐      ┌──────────────────────────────────┐
-│  2. Query RAG   │─────▶│  RAG Pipeline (Qdrant)           │
-│     Pipeline    │      │  - Semantic search               │
-│                 │◀─────│  - Query decomposition           │
-└────────┬────────┘      │  - Provider scoring              │
-         │               └──────────────────────────────────┘
-         ▼
-┌─────────────────┐
-│  3. Rerank &    │     Preserve PR-indexed changed-file context
-│     Filter      │     Filter stale/deleted/corrupt chunks
-└────────┬────────┘     Deduplicate similar chunks
-         │
-         ▼
-┌─────────────────┐
-│  4. Build       │     Diff evidence
-│     Context     │     Structured parser metadata
-│                 │     Task / PR-wide context
-└────────┬────────┘     RAG context
-         │
-         ▼
-┌─────────────────┐
-│  5. Generate    │     System Prompt + L-i-M Instructions
-│     Prompt      │     + Structured Context
-└────────┬────────┘
-         │
-         ▼
-    LLM Review
-```
+This deterministic context remains in each Stage 1 prompt when agent mode is
+enabled. The RAG MCP tool can add focused revision-bound results on demand; it
+does not replace preassembly or make RAG a prerequisite for reviewing the diff.
 
-### RAG Query Parameters
+Stage 2 does not issue another repository search. It combines changed source,
+Stage 1 findings, exact architecture/enrichment data, plugin groups, migrations,
+and task context.
+
+`/codecrow ask` may use `POST /query/code-search` when the request supplies a
+complete branch/revision/generation/collection binding. Results expose
+`match_reasons`; internal ordering weights are not exposed as relevance or
+confidence values. Missing bindings and search
+failures skip this optional context while exact VCS MCP source tools remain
+available.
 
 ```python
-# Example RAG context request
-await rag_client.get_pr_context(
+await rag_client.get_deterministic_context(
     workspace="my-org",
     project="my-repo",
-    branch="main",
-    changed_files=["src/auth/token.py", "src/user/profile.py"],
-    diff_snippets=["def refresh_token(self):", "class UserProfile:"],
-    pr_title="Fix auth token refresh bug",
-    pr_description="Resolves issue with expired tokens...",
-    top_k=15,                          # Max RAG chunks to retrieve
-    enable_priority_reranking=True,    # Provider-side ordering hint
-    min_relevance_score=0.7            # Filter low-relevance results
+    branches=["main"],
+    file_paths=["src/auth/token.py"],
+    base_revision="<commit>",
+    base_generation_manifest_sha256="<receipt>",
+    collection_target="<sealed-collection>",
 )
 ```
-
----
 
 ## Task Context Flow
 
@@ -205,25 +194,22 @@ criterion is missing. The orchestrator handles this in three places:
    from one batch.
 2. `should_run_stage_2()` forces Stage 2 whenever `taskContext` is present, even
    in fast-check mode.
-3. Stage 2 receives a bounded full-PR state ledger, the current execution delta,
-   architecture context, RAG context, and all Stage 1 findings before making
+3. Stage 2 receives the complete supplied full-PR state ledger, the current execution delta,
+   architecture/plugin context and all Stage 1 findings before making
    task-coverage claims.
 
 ### Incremental Evidence Scopes
 
 Incremental analysis does not send the whole PR through every review stage:
 
-- Stage 0, Stage 1, PR-overlay/RAG work, hunk coverage, and new inline anchors
+- Stage 0, Stage 1, PR-overlay/index work, hunk coverage, and new inline anchors
   use only `deltaDiff`.
 - Stage 2 gets a locally assembled base-to-head ledger in addition to the delta.
-  The two blocks share the existing 24,000-character PR-evidence budget:
-  18,000 characters for the full-PR ledger and 6,000 for the current delta.
 - The ledger starts with a path manifest and then ranks task-relevant
-  changed-line excerpts. It does not cause another VCS, RAG, embedding, or model
+  changed hunks without omitting lower-ranked evidence. It does not cause another source-retrieval or model
   call because `rawDiff` is already carried in the incremental request.
-- If all changed-line evidence does not fit, the ledger is marked `BOUNDED`.
-  Omitted excerpts and RAG misses are never treated as evidence that an
-  implementation is absent.
+- If the supplied diff itself is incomplete, the ledger is marked `INCOMPLETE`;
+  it is never shortened to satisfy an orchestrator character budget.
 
 A new incremental task-coverage gap must cite a `DELTA###` excerpt that visibly
 removes the task behavior. Generic or mislabelled "the PR does not implement the
@@ -231,7 +217,7 @@ task" candidates are suppressed by the host publication gate. Full-review
 coverage claims require complete changed-line evidence and prompt-visible
 `PRF###` references.
 
-Successful task-aware reviews return bounded positive evidence in the
+Successful task-aware reviews return positive evidence in the
 machine-readable `taskEvidence` result field, separately from `comment`. The
 Pipeline Agent validates and stores normalized evidence rows in the database
 for prior same-task context in later PRs. PR and Jira comments contain only the
@@ -326,7 +312,7 @@ Large Language Models often lose focus on content in the middle of long prompts.
 │                          │                                 │
 │                          ▼                                 │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │  ████ RAG CONTEXT ████                               │  │
+│  │  ████ STRUCTURAL CONTEXT ████                        │  │
 │  │  Repository context with stale PR data protection     │  │
 │  └──────────────────────────────────────────────────────┘  │
 │                                                            │
@@ -352,7 +338,7 @@ directory label determines risk.
 3. **PR-WIDE CONTEXT**
    - Task intent, changed-file list, previous issues.
 
-4. **RAG CONTEXT**
+4. **STRUCTURAL REPOSITORY CONTEXT**
    - Repository context. Prefer PR-indexed chunks for changed files.
    - File identity is exact or a multi-segment repository-relative suffix.
      Basenames are never identities, so repeated framework paths such as
@@ -406,7 +392,7 @@ wrapper for older imports; it does not skip or demote paths by filename.
 ````python
 # Stage prompts are assembled from evidence sections:
 stage_1_prompt = {
-    "current_file_content": "bounded post-change source fetched at the analyzed commit",
+    "current_file_content": "complete post-change source or complete hunk-centered windows fetched at the analyzed commit",
     "diff_evidence": "changed hunks or hunk-preserving large-diff segment",
     "structured_parser_metadata": "raw parser metadata JSON",
     "task_context": "untrusted task/acceptance criteria text",
@@ -421,9 +407,9 @@ stage_1_prompt = {
 
 ## Token Budget Management
 
-Stage 1 uses latency-sized batches instead of filling the entire model context.
-Every changed file is still reviewed; large file diffs are split into
-hunk-preserving segments and processed independently.
+Stage 1 keeps structurally related files together while the combined diff fits
+the model budget. Large file diffs are split into hunk-preserving segments only
+when the evidence itself exceeds that budget.
 
 ### Evidence Distribution
 
@@ -449,7 +435,7 @@ hunk-preserving segments and processed independently.
 │  └────────────────────────────────────────────────────┘    │
 │                                                            │
 │  ┌────────────────────────────────────────────────────┐    │
-│  │  RAG CONTEXT                                      │    │
+│  │  STRUCTURAL REPOSITORY CONTEXT                    │    │
 │  └────────────────────────────────────────────────────┘    │
 │                                                            │
 └────────────────────────────────────────────────────────────┘
@@ -459,87 +445,41 @@ hunk-preserving segments and processed independently.
 
 Stage 1 batch size is controlled by environment settings such as
 `REVIEW_STAGE1_BATCH_TOKEN_BUDGET`, `REVIEW_STAGE1_DIFF_CHUNK_TOKEN_BUDGET`,
-`REVIEW_STAGE1_MAX_CURRENT_FILE_CHARS`,
-`REVIEW_STAGE1_CURRENT_SOURCE_BATCH_CHAR_BUDGET`, and
-`REVIEW_STAGE1_MAX_PARALLEL`. The current-source batch cap defaults to 48,000
-characters and is divided fairly across files after batching; complete diffs
-remain in the prompt and full enriched source remains available to verification.
-Output caps are applied per stage, but input evidence is split into additional
-batches rather than removed by file type.
+`REVIEW_STAGE1_MAX_PARALLEL`, and the source/metadata/RAG character limits.
+Complete changed hunks remain primary evidence. When the selected review-size
+profile reaches its Stage 1 invocation ceiling, lower-priority units are recorded
+as `budget_omitted`; omitted hunk/unit/context counts are carried into terminal
+coverage and are not interpreted as negative evidence.
 
-Default output caps are intentionally large enough for structured JSON:
+Normal review stages do not add a CodeCrow-generated output/completion cap.
+Provider-native context or completion limits still apply, and a provider adapter
+may supply a limit when its API requires one. Input packing remains independent
+of generated output: it keeps complete evidence records within each request's
+available context window.
 
-| Stage          | Small | Medium | Large |
-| -------------- | ----: | -----: | ----: |
-| Stage 0 plan   | 6,000 |  8,000 | 12,000 |
-| Stage 1 files  | 20,000 | 30,000 | 40,000 |
-| Verification   | 5,000 |  8,000 | 12,000 |
-| Stage 2 cross-file | 11,000 | 18,000 | 25,000 |
-| Dedup          | 3,000 |  5,000 |  8,000 |
-| Stage 3 report | 8,000 | 12,000 | 18,000 |
+Primary semantic invocation ceilings are also size-specific: Stage 1 total
+4/12/24 with at most 1/2/3 units for one hunk-owned item, Stage 2 1/2/4 packets,
+Stage 3 1/2/4 child calls plus at most one final synthesis, and branch
+reconciliation 1/2/4 packets. Structured primary calls retain the stage's
+configured reasoning effort. When a response is exhausted or invalid, a stage
+that supports retry may make one direct-output retry with reasoning disabled.
+Packet/shard omission counts are prompt-visible and preserved in provenance.
+When MCP tools are enabled, a Stage 1 agent can add tool and model turns inside a
+primary invocation; disabling the setting avoids that conditional work.
 
-Override any cap with variables such as
-`REVIEW_STAGE_0_MAX_OUTPUT_TOKENS`,
-`REVIEW_STAGE_1_LARGE_MAX_OUTPUT_TOKENS`, or
-`REVIEW_STAGE3_MAX_OUTPUT_TOKENS`. Set a cap to `0` to disable it for that
-stage. An all-size stage override takes precedence over the corresponding
-small/medium/large value.
-
-The global PR RAG query is started as a lazy fallback and no longer blocks
-planning/diff preparation. Stage 1 primarily uses per-batch deterministic,
-semantic, and duplication RAG; the fallback is awaited only if a batch cannot
-retrieve batch-specific context. PR-indexing is still awaited before Stage 1 so
-changed-file chunks are not stale. The request includes the source and target
-commit hashes. RAG returns `reused` without splitting or embedding only when every
-persisted PR point matches the exact commits, changed-file contents, selected
-plugin identities, and target repository snapshots; the orchestrator accepts
-that status as a satisfied indexing precondition. Older points or any identity
-change are rebuilt with rollback-safe replacement.
-
-After Stage 1, verification applies a deterministic publication and
-contradiction gate before the LLM verifier. New INFO notes,
-successful-fix confirmations, praise, and candidates that admit the current
-diff already implements their suggested fix are not publishable issues. A
-resolved lifecycle record is retained only when its ID matches an issue supplied
-from prior analysis. Every new finding's `codeSnippet` must occur verbatim in
-current source inside a reviewable diff hunk. Complete-file and retrieved code
-outside the hunk remains supporting evidence but cannot become an unrelated PR
-finding. This applies to `FILE` scope as well as line/block/function scope, and
-missing, stale, or out-of-hunk anchors are removed before verifier calls. For
-unused-import-like claims, the gate also rejects the claim when the named symbol
-is visibly referenced elsewhere. The same publication gate runs again after Stage 2, and rejected
-Stage 2 candidates are removed from Stage 3 report context. Optional Stage 3 MCP
-verification remains a secondary check. Every active finding receives a stable
-execution-local Verification ID, and every source read is host-pinned to the
-immutable reviewed commit. For a concrete line, the host asks the VCS MCP server
-for an anchor-centred source window instead of sending an unrelated full large
-file or accepting a size-filter placeholder. A dismissal is accepted only when
-the response metadata binds the same Verification ID, path, revision, and a
-window covering the primary and every consolidated location. Empty content,
-tool errors, filter placeholders, missing locations, wrong revisions,
-comments-only evidence, or ambiguity keeps the finding. Fresh findings without
-database IDs use the same object-identity path.
-
-RAG latency safeguards keep slow semantic search from blocking analysis while
-preserving deterministic context:
+PR overlay indexing is awaited before Stage 1 so changed-file structural
+context cannot silently come from the base branch. Exact source, base,
+generation, collection, plugin, and representation receipts determine whether
+the overlay can be reused. Optional structural retrieval failures disable
+repository context for the remaining batches and the review continues with
+changed source, diff evidence, enrichment, and plugin context.
 
 | Variable | Default | Purpose |
 | -------- | ------: | ------- |
-| `REVIEW_PR_INDEX_TIMEOUT_SECONDS` | 1200 | Max wait for the required current-source PR overlay to finish embedding and indexing before failing closed ahead of Stage 0 |
-| `REVIEW_SEMANTIC_RAG_TIMEOUT_SECONDS` | 5 | Max wait for per-batch semantic filler before disabling it for the remaining Stage 1 batches |
-| `REVIEW_GLOBAL_RAG_QUERY_TIMEOUT_SECONDS` | 5 | Max runtime for the global fallback PR-context query |
-| `REVIEW_GLOBAL_RAG_FALLBACK_TIMEOUT_SECONDS` | 5 | Max time a batch waits for the lazy global fallback task |
-| `REVIEW_DETERMINISTIC_RAG_MAX_CHUNKS` | 80 | Max deterministic chunks normalized from all deterministic RAG groups before prompt formatting |
-| `REVIEW_DUPLICATION_RAG_QUERY_TIMEOUT_SECONDS` | 5 | Max wait for each duplication-search query before dropping that slow supplemental result |
-| `REVIEW_DUPLICATION_RAG_QUERY_CONCURRENCY` | 8 | Max parallel duplication-search queries per batch or Stage 2 prefetch |
-| `REVIEW_DUPLICATION_RAG_MAX_QUERIES` | 8 | Max duplication-search queries to send for one retrieval call |
-
-Per-batch LLM reranking is disabled by default (`LLM_RERANK_ENABLED=false`) to
-avoid one extra model call per batch. The same retrieved chunks are preserved for
-the review model; set `LLM_RERANK_ENABLED=true` to opt into listwise reranking.
+| `REVIEW_PR_INDEX_TIMEOUT_SECONDS` | 1200 | Maximum PR overlay indexing wait |
 
 Final issue deduplication begins with exact local root identities and uses grouped
-semantic dedup by default (`REVIEW_LLM_DEDUP_ENABLED=true`). The host sends only
+model-assisted dedup by default (`REVIEW_LLM_DEDUP_ENABLED=true`). The host sends only
 ambiguous candidate components; unrelated singletons consume no dedup tokens.
 The model returns explicit duplicate groups, and only `HIGH`-confidence decisions
 inside one host-selected component can merge findings. Omitted, uncertain,
@@ -548,8 +488,10 @@ severity drift does not split a proven root cause. Cross-file consolidation is
 allowed only for one shared causal defect and retains every secondary `file:line`
 in the finding's reason and `relatedLocations`.
 
-Candidate components are packed near `REVIEW_DEDUP_BATCH_CHAR_BUDGET=48000`
-without field-level clipping; an oversized component is sent intact by itself.
+Candidate components use the shared 60k estimated-input target and the request's
+model-context value with a generation reserve. Whole candidate groups are packed
+without field-level clipping. If one indivisible group cannot fit, no oversized
+request is sent and every finding in that group is retained.
 `REVIEW_DEDUP_MAX_PARALLEL=4` limits candidate batches within one review and does
 not serialize concurrently admitted reviews. Set `REVIEW_LLM_DEDUP_ENABLED=false`
 to use exact local merging only.
@@ -564,14 +506,14 @@ anchor cannot suppress another finding. These Java checks add no model calls.
 Full-pipeline prompt dry runs forward the normal Stage 0–3 progress events and
 persist a compact `review_evidence_completed` record with terminal hunk counts,
 registered/completed review-unit counts, deterministic retrieval states, and
-semantic failure state. The artifact also binds those diagnostics to the target
+exact evidence counts. The artifact also binds those diagnostics to the target
 and source branches, immutable head/base object IDs, changed/deleted manifests,
 and raw-diff digest. Review-scoped plugin diagnostics are captured without
 cross-talk between concurrent reviews. `tools.review_quality.prompt_dry_run_audit`
 fails closed when any general pipeline stage, exact coverage state, retrieval
 state, plugin diagnostic, prompt budget, or review-provider guard is missing.
 Review-scoped assembly diagnostics record per-batch character allocations for
-diff, current source, AST metadata, RAG, plugin context, project rules, task
+diff, current source, AST metadata, structural context, plugin context, project rules, task
 context, and prior issues; they add nothing to the prompt itself. These
 diagnostics do not add model calls and are not precision/recall measurements.
 
@@ -605,91 +547,12 @@ evidence.
 
 ---
 
-## Caching & Optimization
-
-### RAG Cache
-
-In-memory caching reduces redundant RAG queries:
-
-```
-┌────────────────────────────────────────────────────────────┐
-│                     RAG Cache Flow                         │
-├────────────────────────────────────────────────────────────┤
-│                                                            │
-│  Request                                                   │
-│     │                                                      │
-│     ▼                                                      │
-│  ┌─────────────────┐                                       │
-│  │  Generate Key   │     MD5(workspace:project:branch:     │
-│  │                 │          files:title:desc)            │
-│  └────────┬────────┘                                       │
-│           │                                                │
-│           ▼                                                │
-│  ┌─────────────────┐                                       │
-│  │  Check Cache    │────── HIT ──────▶ Return cached      │
-│  │                 │                     (skip RAG query)  │
-│  └────────┬────────┘                                       │
-│           │                                                │
-│          MISS                                              │
-│           │                                                │
-│           ▼                                                │
-│  ┌─────────────────┐                                       │
-│  │  Query RAG      │                                       │
-│  │  Pipeline       │                                       │
-│  └────────┬────────┘                                       │
-│           │                                                │
-│           ▼                                                │
-│  ┌─────────────────┐                                       │
-│  │  Store in       │     TTL: 5 minutes                   │
-│  │  Cache          │     Max entries: 100                 │
-│  └────────┬────────┘                                       │
-│           │                                                │
-│           ▼                                                │
-│       Return result                                        │
-│                                                            │
-└────────────────────────────────────────────────────────────┘
-```
-
-### Cache Configuration
-
-```python
-class RAGCache:
-    DEFAULT_TTL_SECONDS = 300   # 5 minutes
-    MAX_CACHE_SIZE = 100        # Max entries
-
-    # Auto-eviction of oldest 10% when full
-    # Invalidation by workspace/project/branch
-```
-
-### RAG Metrics
-
-Performance tracking for RAG operations:
-
-```python
-@dataclass
-class RAGMetrics:
-    query_count: int              # Number of RAG queries
-    total_results: int            # Raw results before filtering
-    filtered_results: int         # Results after threshold filter
-    high_priority_hits: int       # Compatibility field; no local priority classification
-    medium_priority_hits: int     # Compatibility field; no local priority classification
-    low_priority_hits: int        # Compatibility field; no local priority classification
-    avg_relevance_score: float    # Average relevance (0-1)
-    min_relevance_score: float
-    max_relevance_score: float
-    processing_time_ms: float     # Total RAG processing time
-    reranking_applied: bool       # Whether optional LLM reranking was used
-    cache_hit: bool               # Whether result was from cache
-```
-
----
-
 ## Installation
 
 ### Requirements
 
 - Python 3.10+
-- RAG Pipeline running (optional but recommended)
+- Structural repository-index service running (optional enrichment)
 - MCP Server JAR file
 
 ### Setup
@@ -723,7 +586,7 @@ MCP_SERVER_JAR="/path/to/mcp-server.jar"
 # LLM tuning (provider credentials are supplied with each Java request)
 LLM_TEMPERATURE="0.0"
 
-# RAG Integration
+# Structural repository index
 RAG_ENABLED="true"
 RAG_API_URL="http://rag-pipeline:8001"
 ```
@@ -752,9 +615,7 @@ Submit a code review request.
     "task_summary": "Add refund export",
     "description": "Acceptance Criteria\n- Exports approved refunds"
   },
-  "ragEnabled": true,
-  "ragTopK": 15,
-  "ragMinScore": 0.7
+  "ragEnabled": true
 }
 ```
 
@@ -773,12 +634,6 @@ Submit a code review request.
         "suggestedFix": "Use parameterized queries..."
       }
     }
-  },
-  "metrics": {
-    "rag_query_count": 3,
-    "rag_results": 12,
-    "rag_cache_hit": false,
-    "processing_time_ms": 1250
   },
   "error": null
 }

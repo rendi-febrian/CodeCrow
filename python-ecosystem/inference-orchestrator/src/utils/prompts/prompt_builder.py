@@ -176,7 +176,10 @@ class PromptBuilder:
         task_context: str = "No task context available.",
         use_mcp_tools: bool = False,
         target_branch: str = "",
+        vcs_workspace: str = "",
+        vcs_repo_slug: str = "",
         plugin_context: str = "",
+        batch_boundary_context: str = "",
     ) -> str:
         """
         Build prompt for Stage 1: Batch File Review.
@@ -191,7 +194,7 @@ class PromptBuilder:
 FILE #{i+1}: {f['path']}
 Type: {f.get('type', 'MODIFIED')}
 Focus Areas: {', '.join(f.get('focus_areas', []))}
-Current File Content (post-change; may be bounded when explicitly labelled):
+Current File Content (post-change):
 {f.get('current_code', f.get('old_code', ''))}
 
 {diff_label}:
@@ -252,16 +255,19 @@ These rules refine evidence collection only. Report a finding only when supplied
             pr_files_context=pr_files_context,
             deleted_files_context=deleted_files_context,
             task_context=task_context or "No task context available.",
+            batch_boundary_context=(
+                batch_boundary_context
+                or "No dependency edge crosses this Stage 1 batch boundary."
+            ),
             line_number_instructions=CODE_SNIPPET_AND_SCOPE_INSTRUCTIONS
         )
 
         # Conditionally append MCP tool instructions
         if use_mcp_tools and target_branch:
-            from service.review.orchestrator.mcp_tool_executor import McpToolExecutor
-            max_calls = McpToolExecutor.STAGE_CONFIG["stage_1"]["max_calls"]
             prompt += STAGE_1_MCP_TOOL_SECTION.format(
-                max_calls=max_calls,
-                target_branch=target_branch
+                target_branch=target_branch,
+                workspace=vcs_workspace,
+                repo_slug=vcs_repo_slug,
             )
 
         return prompt
@@ -275,7 +281,6 @@ These rules refine evidence collection only. Report a finding only when supplied
         architecture_context: str,
         migrations: str,
         cross_file_concerns: List[str],
-        cross_module_context: str = "",
         project_rules: str = "",
         task_context: str = "No task context available.",
         task_history_context: str = "No prior task history available.",
@@ -284,7 +289,6 @@ These rules refine evidence collection only. Report a finding only when supplied
     ) -> str:
         """
         Build prompt for Stage 2: Cross-File & Architectural Review.
-        Includes cross-module RAG context for duplication detection.
         ``project_rules`` is a compact digest of custom project rules
         (titles + types only) so Stage 2 can respect ENFORCE/SUPPRESS at
         the architectural level.
@@ -313,7 +317,6 @@ These rules refine evidence collection only. Report a finding only when supplied
             stage_1_findings_json=stage_1_findings_json,
             architecture_context=architecture_context,
             migrations=migrations,
-            cross_module_context=cross_module_context or "No cross-module context available (RAG not configured or no similar implementations found).",
             project_rules_digest=project_rules_digest
         )
 

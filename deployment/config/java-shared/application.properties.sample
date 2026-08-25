@@ -185,29 +185,16 @@ logging.level.org.hibernate.orm.jdbc.bind=OFF
 # transport after one minute while allowing an active stream to run indefinitely.
 #codecrow.rag.api.timeout.stream-idle=60
 # Exact configured-branch builds are serialized by default because architecture
-# finalization shares CPU, memory, Qdrant, and embedding clients in one RAG process.
+# finalization shares CPU, memory, and Qdrant access in one indexing process.
 # Raise these only after provisioning independent capacity for concurrent builds.
 #codecrow.rag.branch-build.parallelism=1
 #codecrow.rag.branch-build.global-parallelism=1
-# Repair interval for readable Qdrant current-branch aliases of active generations.
-#codecrow.rag.operator-alias.reconcile-interval-ms=300000
-#codecrow.rag.operator-alias.reconcile-initial-delay-ms=15000
 # Exact-generation operation recovery. A live build heartbeats its persisted
 # operation; a published operation also repairs an interrupted job/status handoff.
 #codecrow.rag.generation.stale-after-minutes=30
 #codecrow.rag.generation.recovery-interval-ms=300000
 #codecrow.rag.generation.recovery-initial-delay-ms=60000
-# Legacy unsealed incremental updates use a separate database job lease because
-# they do not own an immutable generation operation.
-#codecrow.rag.legacy-job.lease-seconds=120
-#codecrow.rag.legacy-job.heartbeat-interval-seconds=15
-#codecrow.rag.legacy-job.heartbeat-threads=4
-#codecrow.rag.legacy-job.recovery-interval-ms=30000
-#codecrow.rag.legacy-job.recovery-initial-delay-ms=30000
-#codecrow.rag.legacy-job.recovery-batch-size=100
-# Shared VCS acquisition threshold for incremental RAG and reconciliation
-# fallback. The legacy codecrow.rag.incremental.archive-file-threshold property
-# remains a fallback when this property is not set.
+# Shared VCS acquisition threshold for repository generations and reconciliation.
 #codecrow.vcs.file-retrieval.archive-threshold=25
 
 # Analysis Lock Configuration

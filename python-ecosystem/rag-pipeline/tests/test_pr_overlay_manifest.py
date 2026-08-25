@@ -1,16 +1,12 @@
-from types import SimpleNamespace
-
 import pytest
-from llama_index.core.schema import TextNode
+from rag_pipeline.core.documents import TextNode
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 
-from rag_pipeline.core.index_manager.indexer import FileOperations
+from rag_pipeline.core.index_manager.indexer import PrOverlayOperations
 from rag_pipeline.core.index_manager.point_operations import PointOperations
 from rag_pipeline.core.pr_overlay_manifest import read_pr_overlay_generation
-from rag_pipeline.core.repository_overlay import (
-    IncrementalIndexPreconditionError,
-)
+from rag_pipeline.core.exact_index import ExactIndexPreconditionError
 
 
 SOURCE_REVISION = "a" * 40
@@ -26,27 +22,11 @@ def _operations():
     client = QdrantClient(":memory:")
     client.create_collection(
         collection_name="overlay",
-        vectors_config=VectorParams(size=2, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=1, distance=Distance.DOT),
     )
-    embed_model = SimpleNamespace(
-        get_text_embedding_batch=lambda texts: [
-            [0.1, 0.2] for _ in texts
-        ],
-    )
-    point_operations = PointOperations(
-        client,
-        embed_model,
-        embedding_dim=2,
-    )
-    file_operations = FileOperations(
-        client,
-        point_operations,
-        SimpleNamespace(),
-        SimpleNamespace(),
-        SimpleNamespace(),
-        SimpleNamespace(),
-    )
-    return client, file_operations
+    point_operations = PointOperations(client)
+    overlay_operations = PrOverlayOperations(client, point_operations)
+    return client, overlay_operations
 
 
 def _node(
@@ -62,6 +42,7 @@ def _node(
             "project": "project",
             "branch": "main",
             "path": "app/code/Service.php",
+            "structural_unit": True,
             "pr": True,
             "pr_number": 42,
             "pr_branch": "main",
@@ -169,7 +150,7 @@ def test_pr_overlay_rejects_tampered_member_with_same_count():
     )
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="member integrity",
     ):
         _read(client, receipt["overlay_generation_manifest_sha256"])
@@ -177,18 +158,17 @@ def test_pr_overlay_rejects_tampered_member_with_same_count():
 
 def test_pr_overlay_without_unique_manifest_is_not_reusable():
     client, operations = _operations()
-    chunk_data = operations.point_ops.prepare_chunks_for_embedding(
+    chunk_data = operations.point_ops.prepare_chunks_for_storage(
         [_node()],
         "workspace",
         "project",
         "__pr__/42/main",
     )
-    points = operations.point_ops.embed_and_create_points(chunk_data)
+    points = operations.point_ops.create_points(chunk_data)
     operations.point_ops.upsert_points("overlay", points)
-    operations.point_ops._seal_persisted_point_digests("overlay", points)
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="manifest is missing",
     ):
         _read(client)
@@ -217,7 +197,7 @@ def test_failed_new_generation_never_overwrites_or_hides_prior_lease():
         collection_name="overlay",
         limit=20,
         with_payload=True,
-        with_vectors=True,
+        with_vectors=False,
     )
 
     original_upsert = operations.point_ops.upsert_points

@@ -60,7 +60,7 @@ class TestServiceSecretMiddleware:
         mw = ServiceSecretMiddleware(mock_app, secret="")
 
         mock_request = MagicMock()
-        mock_request.url.path = "/query/search"
+        mock_request.url.path = "/query/code-search"
         mock_call_next = AsyncMock(return_value=MagicMock(status_code=200))
 
         result = await mw.dispatch(mock_request, mock_call_next)
@@ -74,7 +74,7 @@ class TestServiceSecretMiddleware:
         mw = ServiceSecretMiddleware(mock_app, secret="my-secret")
 
         mock_request = MagicMock()
-        mock_request.url.path = "/query/search"
+        mock_request.url.path = "/query/code-search"
         mock_request.headers = {"x-service-secret": "my-secret"}
         mock_call_next = AsyncMock(return_value=MagicMock(status_code=200))
 
@@ -89,7 +89,7 @@ class TestServiceSecretMiddleware:
         mw = ServiceSecretMiddleware(mock_app, secret="my-secret")
 
         mock_request = MagicMock()
-        mock_request.url.path = "/query/search"
+        mock_request.url.path = "/query/code-search"
         mock_request.headers = {"x-service-secret": "wrong-secret"}
         mock_request.client.host = "127.0.0.1"
         mock_call_next = AsyncMock()
@@ -108,7 +108,7 @@ class TestAppCreation:
         """Ensure the app object can be imported (lifespan not triggered without TestClient)."""
         from rag_pipeline.api.api import app
         assert app is not None
-        assert app.title == "CodeCrow RAG API"
+        assert app.title == "CodeCrow Repository Index API"
 
     @pytest.mark.asyncio
     async def test_shutdown_drains_http_index_workers_before_clients_close(self):
@@ -116,18 +116,9 @@ class TestAppCreation:
 
         order = []
         manager = MagicMock()
-        manager.embed_model.close.side_effect = lambda: order.append(
-            "manager-embed-close"
-        )
         manager.close.side_effect = lambda: order.append("manager-close")
         query_service = MagicMock()
-        query_service.embed_model.close.side_effect = lambda: order.append(
-            "query-embed-close"
-        )
         query_service.close.side_effect = lambda: order.append("query-close")
-        queue_consumer = MagicMock()
-        queue_consumer.start = AsyncMock()
-        queue_consumer.stop = AsyncMock()
         drain_workers = AsyncMock(side_effect=lambda: order.append("drain"))
         test_app = SimpleNamespace(state=SimpleNamespace())
 
@@ -144,10 +135,6 @@ class TestAppCreation:
                 return_value=query_service,
             ),
             patch(
-                "rag_pipeline.server.rag_queue_consumer.RAGQueueConsumer",
-                return_value=queue_consumer,
-            ),
-            patch(
                 "rag_pipeline.api.routers.index."
                 "drain_index_repository_stream_workers",
                 drain_workers,
@@ -156,12 +143,9 @@ class TestAppCreation:
             async with api_module.lifespan(test_app):
                 pass
 
-        queue_consumer.stop.assert_awaited_once()
         drain_workers.assert_awaited_once()
         assert order == [
             "drain",
-            "manager-embed-close",
-            "query-embed-close",
             "query-close",
             "manager-close",
         ]

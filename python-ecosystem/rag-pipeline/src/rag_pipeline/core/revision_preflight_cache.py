@@ -107,9 +107,9 @@ class RevisionPreflightCache:
 
         stored_value = copy.deepcopy(value)
         with self._lock:
-            # An absent revision can later appear in a legacy mutable target.
-            # Positive receipts belong to sealed immutable generations; cache
-            # those, but keep absence immediately observable and retryable.
+            # An exact target may be published after an earlier lookup. Cache
+            # positive immutable receipts, but keep absence immediately
+            # observable and retryable.
             if stored_value is not None:
                 self._values[key] = _CacheEntry(
                     expires_at=(

@@ -60,6 +60,7 @@ class ProjectServiceRagConfigTest {
         assertThat(rag.branchRetentionDays()).isEqualTo(14);
         assertThat(rag.indexedBranches()).containsExactly("develop", "release");
         assertThat(rag.transientBranchIndexesEnabled()).isTrue();
+        assertThat(updated.getConfiguration().useMcpTools()).isTrue();
     }
 
     @Test
@@ -75,5 +76,16 @@ class ProjectServiceRagConfigTest {
         assertThat(rag.branchRetentionDays()).isEqualTo(30);
         assertThat(rag.indexedBranches()).containsExactly("develop", "release");
         assertThat(rag.transientBranchIndexesEnabled()).isTrue();
+    }
+
+    @Test
+    void ragUpdatePreservesExplicitlyDisabledMcpReviewSetting() {
+        project.getConfiguration().setUseMcpTools(false);
+
+        Project updated = projectService.updateRagConfig(
+                10L, 20L, false, "develop",
+                List.of("service/**"), List.of("generated/**"));
+
+        assertThat(updated.getConfiguration().useMcpTools()).isFalse();
     }
 }

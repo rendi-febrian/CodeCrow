@@ -15,6 +15,7 @@ from codecrow_plugins import (
     FileArtifact,
     GraphFact,
     PluginDescriptor,
+    PluginDiagnostic,
     PluginOutcome,
     RepositoryAnalysis,
     RepositorySnapshot,
@@ -77,6 +78,7 @@ class ContractFileRecord:
     root_types: tuple[tuple[str, str], ...] = ()
     declarations: tuple[FieldOccurrence, ...] = ()
     references: tuple[ReferenceOccurrence, ...] = ()
+    partial_reasons: tuple[str, ...] = ()
 
 
 def _is_contract_path(path: str) -> bool:
@@ -98,7 +100,7 @@ def _graphql_declarations(content: str) -> tuple[FieldOccurrence, ...]:
         )
         for definition in parse_schema(content)
         for field in definition.fields
-    )[:_MAX_CANDIDATES_PER_FILE])
+    ))
 
 
 def _graphql_references(
@@ -111,7 +113,7 @@ def _graphql_references(
         for item in parse_operations(
             content,
             embedded_only=embedded_only,
-        )[:_MAX_CANDIDATES_PER_FILE]
+        )
     )
 
 
@@ -146,7 +148,7 @@ def _record(artifact: FileArtifact) -> ContractFileRecord | None:
         return None
     contract = _is_contract_path(artifact.path)
     lowered = artifact.path.casefold()
-    declarations = (
+    all_declarations = (
         _graphql_declarations(artifact.content)
         if lowered.endswith((".graphqls", ".graphql")) and contract
         else ()
@@ -170,6 +172,17 @@ def _record(artifact: FileArtifact) -> ContractFileRecord | None:
         references = tuple(sorted({*references, *_json_references(artifact.content)}))
     if not contract and not references:
         return None
+    partial_reasons = []
+    declarations = all_declarations[:_MAX_CANDIDATES_PER_FILE]
+    if len(all_declarations) > len(declarations):
+        partial_reasons.append(
+            f"declarations:{len(all_declarations) - len(declarations)}"
+        )
+    admitted_references = references[:_MAX_CANDIDATES_PER_FILE]
+    if len(references) > len(admitted_references):
+        partial_reasons.append(
+            f"references:{len(references) - len(admitted_references)}"
+        )
     return ContractFileRecord(
         path=artifact.path,
         is_contract=contract,
@@ -179,7 +192,8 @@ def _record(artifact: FileArtifact) -> ContractFileRecord | None:
             else ()
         ),
         declarations=tuple(declarations),
-        references=tuple(references),
+        references=tuple(admitted_references),
+        partial_reasons=tuple(sorted(partial_reasons)),
     )
 
 
@@ -207,6 +221,7 @@ def _record_mapping(record: ContractFileRecord) -> dict[str, object]:
             }
             for item in record.references
         ],
+        "partialReasons": list(record.partial_reasons),
     }
 
 
@@ -269,6 +284,9 @@ def _record_from_mapping(value: object) -> ContractFileRecord:
         )),
         declarations=declarations(),
         references=references(),
+        partial_reasons=tuple(sorted(
+            str(reason) for reason in value.get("partialReasons", [])
+        )),
     )
 
 
@@ -587,9 +605,25 @@ class ContractGraphSession:
 
     def finish(self, dependencies: RepositoryAnalysis):
         current = self._packets_for(self.records)
+        diagnostics = tuple(
+            PluginDiagnostic(
+                code="data-contract-candidate-limit",
+                message=(
+                    "data-contract candidates were omitted beyond the "
+                    f"{_MAX_CANDIDATES_PER_FILE}-candidate file admission: "
+                    + ", ".join(record.partial_reasons)
+                ),
+                plugin_id=self.plugin_id,
+                path=record.path,
+                recoverable=True,
+            )
+            for record in sorted(self.records.values())
+            if record.partial_reasons
+        )
         return PluginOutcome.handled(RepositoryAnalysis(
             packets=tuple(sorted((*current, *self._removed_packets(current)))),
             snapshots=(self._snapshot(),),
+            diagnostics=diagnostics,
         ))
 
 

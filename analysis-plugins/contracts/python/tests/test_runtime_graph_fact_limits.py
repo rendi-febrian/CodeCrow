@@ -75,18 +75,8 @@ def _fact(
     )
 
 
-def _serialized_facts_bytes(facts: tuple[GraphFact, ...]) -> int:
-    return len(json.dumps(
-        [dict(fact.as_metadata()) for fact in facts],
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8"))
-
-
-def test_graph_facts_reject_every_overlong_string_location_without_truncating():
-    limit = PluginRuntime.MAX_GRAPH_FACT_STRING_LENGTH
-    overlong = "x" * (limit + 1)
+def test_graph_facts_reject_large_strings_in_every_fact_location():
+    overlong = "x" * 4_097
     valid = _fact("valid", "kept")
     invalid = (
         _fact(overlong, "kind"),
@@ -98,7 +88,9 @@ def test_graph_facts_reject_every_overlong_string_location_without_truncating():
         _fact("attribute-value", "source", attributes=(("key", overlong),)),
         _fact("related-path", "source", related_paths=(overlong,)),
     )
-    runtime, capabilities = _runtime({"bounded": (valid, *invalid)})
+    runtime, capabilities = _runtime({
+        "complete": tuple(reversed((valid, *invalid))),
+    })
 
     facts, diagnostics = runtime.graph_facts(
         FileArtifact("src/example.py", "pass"),
@@ -107,52 +99,74 @@ def test_graph_facts_reject_every_overlong_string_location_without_truncating():
 
     assert facts == (valid,)
     assert len(diagnostics) == 1
-    assert diagnostics[0].code == "plugin-index-output-limit"
-    assert diagnostics[0].plugin_id == "bounded"
-    assert diagnostics[0].path == "src/example.py"
-    assert diagnostics[0].recoverable is True
-    assert "8 fact(s)" in diagnostics[0].message
-    assert str(limit) in diagnostics[0].message
+    diagnostic = diagnostics[0]
+    assert diagnostic.code == "plugin-index-output-limit"
+    assert diagnostic.plugin_id == "complete"
+    assert diagnostic.path == "src/example.py"
+    assert diagnostic.recoverable is True
+    assert "8 fact(s)" in diagnostic.message
+    assert "4096 characters" in diagnostic.message
 
 
-def test_graph_fact_byte_budget_is_global_deterministic_and_per_artifact():
-    alpha = _fact("alpha", "alpha", target="α" * 32)
-    beta = _fact("beta", "beta", target="β" * 32)
-    runtime, capabilities = _runtime({
-        "first": (alpha,),
-        "second": (beta, beta),
-    })
-    runtime.MAX_GRAPH_FACT_BYTES_PER_ARTIFACT = _serialized_facts_bytes((alpha,))
+def test_graph_facts_bound_serialized_payload_bytes():
+    first = _fact("first", "first", target="α" * 32)
+    second = _fact("second", "second", target="β" * 32)
+    runtime, capabilities = _runtime({"first": (first,), "second": (second,)})
+    runtime.MAX_GRAPH_FACT_BYTES_PER_ARTIFACT = len(json.dumps(
+        [dict(first.as_metadata())],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8"))
 
-    first_facts, first_diagnostics = runtime.graph_facts(
-        FileArtifact("src/first.py", "pass"),
+    facts, diagnostics = runtime.graph_facts(
+        FileArtifact("src/example.py", "pass"),
         capabilities,
     )
-    second_facts, second_diagnostics = runtime.graph_facts(
-        FileArtifact("src/second.py", "pass"),
+
+    assert facts == (first,)
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic.code == "plugin-index-output-limit"
+    assert diagnostic.plugin_id == "second"
+    assert diagnostic.path == "src/example.py"
+    assert diagnostic.recoverable is True
+    assert "1 fact(s)" in diagnostic.message
+    assert "byte artifact budget" in diagnostic.message
+
+
+def test_graph_facts_bound_records_with_diagnostics():
+    first = tuple(_fact("first", f"first-{index:03d}") for index in range(125))
+    second = tuple(_fact("second", f"second-{index:03d}") for index in range(125))
+    runtime, capabilities = _runtime({"first": first, "second": second})
+
+    facts, diagnostics = runtime.graph_facts(
+        FileArtifact("src/example.py", "pass"),
         capabilities,
     )
 
-    assert first_facts == second_facts == (alpha,)
-    assert _serialized_facts_bytes(first_facts) <= (
-        runtime.MAX_GRAPH_FACT_BYTES_PER_ARTIFACT
-    )
-    assert [diagnostic.plugin_id for diagnostic in first_diagnostics] == ["second"]
-    assert [diagnostic.path for diagnostic in first_diagnostics] == ["src/first.py"]
-    assert [diagnostic.path for diagnostic in second_diagnostics] == ["src/second.py"]
-    assert all(diagnostic.recoverable for diagnostic in first_diagnostics)
+    assert facts == tuple(sorted((*first, *second[:75])))
+    assert len(facts) == 200
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic.code == "plugin-index-output-limit"
+    assert diagnostic.plugin_id == "second"
+    assert diagnostic.path == "src/example.py"
+    assert diagnostic.recoverable is True
+    assert "50 fact(s)" in diagnostic.message
 
 
-def test_graph_fact_byte_budget_preserves_balanced_kind_selection():
+def test_graph_fact_merge_is_deterministic_across_kinds_and_duplicates():
     facts = (
         _fact("kind-a", "a-1", target="x" * 32),
         _fact("kind-a", "a-0", target="x" * 32),
         _fact("kind-b", "b-1", target="x" * 32),
         _fact("kind-b", "b-0", target="x" * 32),
     )
-    expected = tuple(sorted((facts[1], facts[3])))
-    runtime, capabilities = _runtime({"balanced": tuple(reversed(facts))})
-    runtime.MAX_GRAPH_FACT_BYTES_PER_ARTIFACT = _serialized_facts_bytes(expected)
+    expected = tuple(sorted(facts))
+    runtime, capabilities = _runtime({
+        "complete": (*tuple(reversed(facts)), facts[0]),
+    })
 
     selected, diagnostics = runtime.graph_facts(
         FileArtifact("src/example.py", "pass"),
@@ -161,6 +175,4 @@ def test_graph_fact_byte_budget_preserves_balanced_kind_selection():
 
     assert selected == expected
     assert {fact.kind for fact in selected} == {"kind-a", "kind-b"}
-    assert len(diagnostics) == 1
-    assert diagnostics[0].plugin_id == "balanced"
-    assert "2 fact(s)" in diagnostics[0].message
+    assert diagnostics == ()

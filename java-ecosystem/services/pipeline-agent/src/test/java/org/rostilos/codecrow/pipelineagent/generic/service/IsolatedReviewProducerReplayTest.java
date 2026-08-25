@@ -140,6 +140,8 @@ class IsolatedReviewProducerReplayTest {
                     .isEqualTo(SOURCE_BRANCH);
             assertThat(reviewRequest.getBaseCommitHash())
                     .isEqualTo(baseRevision);
+            assertThat(reviewRequest.getTargetHeadCommitHash())
+                    .isEqualTo(baseRevision);
             assertThat(reviewRequest.getCurrentCommitHash())
                     .isEqualTo(headRevision);
             assertThat(reviewRequest.getRagEnabled()).isFalse();
@@ -176,6 +178,8 @@ class IsolatedReviewProducerReplayTest {
             assertThat(queuedRequest.path("sourceBranchName").asText())
                     .isEqualTo(SOURCE_BRANCH);
             assertThat(queuedRequest.path("baseCommitHash").asText())
+                    .isEqualTo(baseRevision);
+            assertThat(queuedRequest.path("targetHeadCommitHash").asText())
                     .isEqualTo(baseRevision);
             assertThat(queuedRequest.path("currentCommitHash").asText())
                     .isEqualTo(headRevision);

@@ -56,6 +56,7 @@ public class AiAnalysisRequestImpl implements AiAnalysisRequest {
     protected final String deltaDiff;
     protected final String previousCommitHash;
     protected final String currentCommitHash;
+    protected final String targetHeadCommitHash;
     protected final String baseCommitHash;
 
     // File enrichment data (full file contents + dependency graph)
@@ -106,6 +107,7 @@ public class AiAnalysisRequestImpl implements AiAnalysisRequest {
         this.deltaDiff = builder.deltaDiff;
         this.previousCommitHash = builder.previousCommitHash;
         this.currentCommitHash = builder.currentCommitHash;
+        this.targetHeadCommitHash = builder.targetHeadCommitHash;
         this.baseCommitHash = builder.baseCommitHash;
         // File enrichment data
         this.enrichmentData = builder.enrichmentData;
@@ -259,6 +261,13 @@ public class AiAnalysisRequestImpl implements AiAnalysisRequest {
     }
 
     @Override
+    public String getTargetHeadCommitHash() {
+        return targetHeadCommitHash != null && !targetHeadCommitHash.isBlank()
+                ? targetHeadCommitHash
+                : baseCommitHash;
+    }
+
+    @Override
     public String getBaseCommitHash() {
         return baseCommitHash;
     }
@@ -325,6 +334,7 @@ public class AiAnalysisRequestImpl implements AiAnalysisRequest {
         private String deltaDiff;
         private String previousCommitHash;
         private String currentCommitHash;
+        private String targetHeadCommitHash;
         private String baseCommitHash;
         // File enrichment data
         private PrEnrichmentDataDto enrichmentData;
@@ -413,8 +423,8 @@ public class AiAnalysisRequestImpl implements AiAnalysisRequest {
          * This provides the LLM with complete issue history including resolved issues,
          * helping it understand what was already found and fixed.
          * 
-         * Issues are deduplicated by fingerprint (file + line ±3 + severity + truncated
-         * reason).
+         * Issues are deduplicated by fingerprint (file + line ±3 + severity + complete
+         * normalized reason).
          * When duplicates exist across versions, we keep the most recent version's data
          * but preserve resolved status if ANY version marked it resolved.
          * 
@@ -479,19 +489,19 @@ public class AiAnalysisRequestImpl implements AiAnalysisRequest {
 
         /**
          * Compute a fingerprint for an issue to detect duplicates across PR versions.
-         * Uses: file + normalized line (±3 tolerance) + severity + first 50 chars of
-         * reason.
+         * Uses: file + normalized line (±3 tolerance) + severity + complete normalized
+         * reason. A prefix-only reason would merge distinct findings and discard one.
          */
         private String computeIssueFingerprint(AiRequestPreviousIssueDTO issue) {
             String file = issue.file() != null ? issue.file() : "";
             // Normalize line to nearest multiple of 3 for tolerance
             int lineGroup = issue.line() != null ? (issue.line() / 3) : 0;
             String severity = issue.severity() != null ? issue.severity() : "";
-            String reasonPrefix = issue.reason() != null
-                    ? issue.reason().substring(0, Math.min(50, issue.reason().length())).toLowerCase().trim()
+            String normalizedReason = issue.reason() != null
+                    ? issue.reason().toLowerCase().trim()
                     : "";
 
-            return file + "::" + lineGroup + "::" + severity + "::" + reasonPrefix;
+            return file + "::" + lineGroup + "::" + severity + "::" + normalizedReason;
         }
 
         /**
@@ -590,6 +600,11 @@ public class AiAnalysisRequestImpl implements AiAnalysisRequest {
 
         public T withBaseCommitHash(String baseCommitHash) {
             this.baseCommitHash = baseCommitHash;
+            return self();
+        }
+
+        public T withTargetHeadCommitHash(String targetHeadCommitHash) {
+            this.targetHeadCommitHash = targetHeadCommitHash;
             return self();
         }
 

@@ -1,5 +1,6 @@
 from typing import Dict, Optional
 import os
+import sys
 
 
 class MCPConfigBuilder:
@@ -9,7 +10,8 @@ class MCPConfigBuilder:
     def build_config(jar_path: str, jvm_props: Optional[Dict[str, str]] = None,
                      include_platform_mcp: bool = False,
                      platform_mcp_jar_path: Optional[str] = None,
-                     platform_jvm_props: Optional[Dict[str, str]] = None) -> dict:
+                     platform_jvm_props: Optional[Dict[str, str]] = None,
+                     rag_mcp_context: Optional[Dict[str, str]] = None) -> dict:
         """
         Build MCP configuration with optional Platform MCP server.
         
@@ -19,6 +21,8 @@ class MCPConfigBuilder:
             include_platform_mcp: Whether to include Platform MCP server
             platform_mcp_jar_path: Path to Platform MCP server JAR
             platform_jvm_props: JVM properties for Platform MCP server
+            rag_mcp_context: Exact repository-generation binding for the optional
+                repository code-search MCP server.
         """
         jvm_props = jvm_props or {}
         jvm_args = []
@@ -58,6 +62,28 @@ class MCPConfigBuilder:
                 "type": "stdio"
             }
 
+        if rag_mcp_context:
+            rag_env = {
+                f"CODECROW_RAG_MCP_{key.upper()}": str(value)
+                for key, value in rag_mcp_context.items()
+                if value is not None and str(value).strip()
+            }
+            rag_env["RAG_API_URL"] = os.environ.get(
+                "RAG_API_URL", "http://rag-pipeline:8001"
+            )
+            service_secret = (
+                os.environ.get("SERVICE_SECRET")
+                or os.environ.get("CODECROW_RAG_API_SECRET")
+            )
+            if service_secret:
+                rag_env["SERVICE_SECRET"] = service_secret
+            mcp_servers["codecrow-rag-mcp"] = {
+                "command": sys.executable,
+                "args": ["-m", "service.rag.rag_mcp_server"],
+                "env": rag_env,
+                "type": "stdio",
+            }
+
         return {
             "mcpServers": mcp_servers
         }
@@ -66,7 +92,10 @@ class MCPConfigBuilder:
     def build_jvm_props(project_id: int, pull_request_id: int, workspace: str,
          repo_slug: str, oAuthClient: str = None, oAuthSecret: str = None, 
          access_token: str = None, max_allowed_tokens: int = None,
-         vcs_provider: str = None, vcs_base_url: str = None) -> Dict[str, str]:
+         vcs_provider: str = None, vcs_base_url: str = None,
+         local_repo_path: str = None,
+         local_repo_target_branch: str = None,
+         local_repo_revision: str = None) -> Dict[str, str]:
         """
         Build JVM properties dictionary from request parameters.
 
@@ -78,9 +107,12 @@ class MCPConfigBuilder:
             oAuthClient: OAuth consumer key (for OAUTH_MANUAL connections)
             oAuthSecret: OAuth consumer secret (for OAUTH_MANUAL connections)
             access_token: Bearer token (for APP connections - used instead of oAuthClient/oAuthSecret)
-            max_allowed_tokens: Optional per-request token limit to pass to the MCP server.
+            max_allowed_tokens: Optional per-request token limit passed to the MCP server.
             vcs_provider: VCS provider type (github, bitbucket_cloud, gitlab) for MCP server selection.
             vcs_base_url: GitLab instance root for self-managed GitLab.
+            local_repo_path: Shared target-head snapshot directory.
+            local_repo_target_branch: Branch name represented by the snapshot.
+            local_repo_revision: Immutable revision represented by the snapshot.
 
         Returns:
             Dictionary of JVM properties
@@ -108,8 +140,6 @@ class MCPConfigBuilder:
             if oAuthSecret is not None:
                 jvm_props["oAuthSecret"] = oAuthSecret
 
-        # If provided, expose max allowed tokens as a JVM property so the MCP server
-        # can read it (System.getProperty) and decide whether to fetch large diffs / files.
         if max_allowed_tokens is not None:
             jvm_props["max.allowed.tokens"] = str(max_allowed_tokens)
 
@@ -118,5 +148,11 @@ class MCPConfigBuilder:
             jvm_props["vcs.provider"] = vcs_provider
         if vcs_base_url is not None:
             jvm_props["vcs.baseUrl"] = vcs_base_url
+        if local_repo_path is not None:
+            jvm_props["local.repo.path"] = local_repo_path
+        if local_repo_target_branch is not None:
+            jvm_props["local.repo.targetBranch"] = local_repo_target_branch
+        if local_repo_revision is not None:
+            jvm_props["local.repo.revision"] = local_repo_revision
 
         return jvm_props

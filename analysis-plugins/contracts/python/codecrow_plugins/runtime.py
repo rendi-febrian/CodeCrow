@@ -30,8 +30,10 @@ class PluginRuntime:
     """Host-side composition. Implementations return data; the host owns policy."""
 
     MAX_FACTS_PER_FILE = 200
+    MAX_FRAMEWORK_FACTS_PER_FILE = 160
     MAX_GRAPH_FACT_STRING_LENGTH = 4_096
     MAX_GRAPH_FACT_BYTES_PER_ARTIFACT = 262_144
+    MAX_REVIEW_PATHS_PER_PLUGIN = 80
     MAX_RULES = 40
     MAX_EVIDENCE_REQUESTS = 80
     MAX_REPOSITORY_SYMBOLS = 250_000
@@ -223,17 +225,28 @@ class PluginRuntime:
                     else:
                         valid_facts.append(fact)
                 if overlong_count:
-                    rejected.setdefault(plugin_id, [0, 0])[0] += overlong_count
+                    rejected.setdefault(plugin_id, [0, 0, 0])[0] += overlong_count
+                unique_facts = tuple(sorted(set(valid_facts)))
+                contribution_limit = (
+                    self.MAX_FRAMEWORK_FACTS_PER_FILE
+                    if descriptor.kind is PluginKind.FRAMEWORK
+                    else self.MAX_FACTS_PER_FILE
+                )
+                selected_facts = self._balanced_facts(
+                    unique_facts,
+                    contribution_limit,
+                )
+                if len(unique_facts) > len(selected_facts):
+                    rejected.setdefault(plugin_id, [0, 0, 0])[2] += (
+                        len(unique_facts) - len(selected_facts)
+                    )
                 contributions.append((
                     descriptor.kind,
                     plugin_id,
-                    self._balanced_facts(
-                        tuple(valid_facts),
-                        self.MAX_FACTS_PER_FILE,
-                    ),
+                    selected_facts,
                 ))
         facts: set[GraphFact] = set()
-        serialized_bytes = 2  # The opening and closing brackets of the JSON array.
+        serialized_bytes = 2  # Opening and closing brackets of the JSON array.
         for _, plugin_id, contribution in sorted(
             contributions,
             key=lambda item: (
@@ -241,12 +254,11 @@ class PluginRuntime:
                 item[1],
             ),
         ):
-            if len(facts) >= self.MAX_FACTS_PER_FILE:
-                break
             for fact in contribution:
-                if len(facts) >= self.MAX_FACTS_PER_FILE:
-                    break
                 if fact in facts:
+                    continue
+                if len(facts) >= self.MAX_FACTS_PER_FILE:
+                    rejected.setdefault(plugin_id, [0, 0, 0])[2] += 1
                     continue
                 fact_bytes = self._serialized_fact_bytes(fact)
                 added_bytes = fact_bytes + (1 if facts else 0)
@@ -254,11 +266,13 @@ class PluginRuntime:
                     serialized_bytes + added_bytes
                     > self.MAX_GRAPH_FACT_BYTES_PER_ARTIFACT
                 ):
-                    rejected.setdefault(plugin_id, [0, 0])[1] += 1
+                    rejected.setdefault(plugin_id, [0, 0, 0])[1] += 1
                     continue
                 facts.add(fact)
                 serialized_bytes += added_bytes
-        for plugin_id, (overlong_count, byte_count) in sorted(rejected.items()):
+        for plugin_id, (overlong_count, byte_count, count_limit) in sorted(
+            rejected.items()
+        ):
             reasons = []
             if overlong_count:
                 reasons.append(
@@ -269,6 +283,11 @@ class PluginRuntime:
                 reasons.append(
                     f"{byte_count} fact(s) exceeding the "
                     f"{self.MAX_GRAPH_FACT_BYTES_PER_ARTIFACT}-byte artifact budget"
+                )
+            if count_limit:
+                reasons.append(
+                    f"{count_limit} fact(s) exceeding per-plugin or artifact "
+                    "fact admission"
                 )
             diagnostics.append(PluginDiagnostic(
                 code="plugin-index-output-limit",
@@ -302,6 +321,32 @@ class PluginRuntime:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8"))
+
+    @staticmethod
+    def _balanced_facts(
+        facts: tuple[GraphFact, ...],
+        limit: int,
+    ) -> tuple[GraphFact, ...]:
+        """Bound noisy contributors without starving a semantic fact kind."""
+        by_kind: dict[str, list[GraphFact]] = {}
+        for fact in sorted(set(facts)):
+            by_kind.setdefault(fact.kind, []).append(fact)
+        selected: list[GraphFact] = []
+        offset = 0
+        kinds = tuple(sorted(by_kind))
+        while len(selected) < limit:
+            added = False
+            for kind in kinds:
+                values = by_kind[kind]
+                if offset < len(values):
+                    selected.append(values[offset])
+                    added = True
+                    if len(selected) == limit:
+                        break
+            if not added:
+                break
+            offset += 1
+        return tuple(selected)
 
     def syntax_contribution(
         self,
@@ -364,29 +409,6 @@ class PluginRuntime:
             tuple(diagnostics),
         )
 
-    @staticmethod
-    def _balanced_facts(facts: tuple[GraphFact, ...], limit: int) -> tuple[GraphFact, ...]:
-        """Bound noisy contributors without starving any semantic fact kind."""
-        by_kind: dict[str, list[GraphFact]] = {}
-        for fact in sorted(set(facts)):
-            by_kind.setdefault(fact.kind, []).append(fact)
-        selected: list[GraphFact] = []
-        offset = 0
-        kinds = tuple(sorted(by_kind))
-        while len(selected) < limit:
-            added = False
-            for kind in kinds:
-                values = by_kind[kind]
-                if offset < len(values):
-                    selected.append(values[offset])
-                    added = True
-                    if len(selected) == limit:
-                        break
-            if not added:
-                break
-            offset += 1
-        return tuple(selected)
-
     def review_contribution(
         self,
         paths: tuple[str, ...],
@@ -413,8 +435,19 @@ class PluginRuntime:
             contributor = getattr(implementation, "review", None)
             if contributor is None:
                 continue
+            review_paths = owned_paths[: self.MAX_REVIEW_PATHS_PER_PLUGIN]
+            if len(owned_paths) > len(review_paths):
+                diagnostics.append(PluginDiagnostic(
+                    code="plugin-review-input-limit",
+                    message=(
+                        f"review contribution admitted {len(review_paths)} of "
+                        f"{len(owned_paths)} owned paths"
+                    ),
+                    plugin_id=plugin_id,
+                    recoverable=True,
+                ))
             try:
-                outcome = contributor(owned_paths)
+                outcome = contributor(review_paths)
             except Exception as exception:
                 diagnostics.append(
                     PluginDiagnostic(
@@ -430,13 +463,27 @@ class PluginRuntime:
                 rules.update(outcome.value.rules)
                 requests.update(outcome.value.evidence_requests)
                 groups.update(outcome.value.group_paths)
+        selected_rules = tuple(sorted(rules)[: self.MAX_RULES])
+        selected_requests = self._balanced_evidence_requests(
+            tuple(requests),
+            self.MAX_EVIDENCE_REQUESTS,
+        )
+        omitted_rules = len(rules) - len(selected_rules)
+        omitted_requests = len(requests) - len(selected_requests)
+        if omitted_rules or omitted_requests:
+            diagnostics.append(PluginDiagnostic(
+                code="plugin-review-output-limit",
+                message=(
+                    f"review contribution omitted {omitted_rules} rule(s) and "
+                    f"{omitted_requests} evidence request(s) beyond the "
+                    "aggregate admission"
+                ),
+                recoverable=True,
+            ))
         return (
             ReviewContribution(
-                rules=tuple(sorted(rules)[: self.MAX_RULES]),
-                evidence_requests=self._balanced_evidence_requests(
-                    tuple(requests),
-                    self.MAX_EVIDENCE_REQUESTS,
-                ),
+                rules=selected_rules,
+                evidence_requests=selected_requests,
                 group_paths=tuple(sorted(groups)),
             ),
             tuple(diagnostics),
@@ -447,7 +494,7 @@ class PluginRuntime:
         requests: tuple,
         limit: int,
     ) -> tuple:
-        """Cap exact requests without allowing one plugin evidence kind to starve another."""
+        """Bound exact requests without allowing one kind to starve another."""
         by_kind: dict[str, list] = {}
         for request in sorted(set(requests)):
             by_kind.setdefault(request.kind, []).append(request)
@@ -814,8 +861,8 @@ class RepositoryAnalysisHandle:
                 ))
                 continue
             self._diagnostics.extend(contribution.diagnostics)
-            symbols.update(contribution.symbols)
-            if len(symbols) > self._runtime.MAX_REPOSITORY_SYMBOLS:
+            candidate_symbols = {*symbols, *contribution.symbols}
+            if len(candidate_symbols) > self._runtime.MAX_REPOSITORY_SYMBOLS:
                 self._diagnostics.append(PluginDiagnostic(
                     code="plugin-repository-symbol-limit",
                     message=(
@@ -824,37 +871,19 @@ class RepositoryAnalysisHandle:
                     ),
                     plugin_id=plugin_id,
                 ))
+                break
+            candidate_packets = dict(packets)
             for packet in contribution.packets:
                 key = (packet.plugin_id, packet.kind, packet.key)
-                if key in packets and packets[key] != packet:
+                if key in candidate_packets and candidate_packets[key] != packet:
                     self._diagnostics.append(PluginDiagnostic(
                         code="plugin-repository-packet-conflict",
                         message=f"conflicting architecture packet {key}",
                         plugin_id=plugin_id,
                     ))
                     continue
-                packets[key] = packet
-            for snapshot in contribution.snapshots:
-                key = (snapshot.plugin_id, snapshot.kind)
-                if key in snapshots and snapshots[key] != snapshot:
-                    self._diagnostics.append(PluginDiagnostic(
-                        code="plugin-repository-snapshot-conflict",
-                        message=f"conflicting repository snapshot {key}",
-                        plugin_id=plugin_id,
-                    ))
-                    continue
-                snapshots[key] = snapshot
-            for context in contribution.contexts:
-                key = (context.plugin_id, context.kind, context.path)
-                if key in contexts and contexts[key] != context:
-                    self._diagnostics.append(PluginDiagnostic(
-                        code="plugin-repository-context-conflict",
-                        message=f"conflicting repository context {key}",
-                        plugin_id=plugin_id,
-                    ))
-                    continue
-                contexts[key] = context
-            if len(packets) > self._runtime.MAX_ARCHITECTURE_PACKETS:
+                candidate_packets[key] = packet
+            if len(candidate_packets) > self._runtime.MAX_ARCHITECTURE_PACKETS:
                 self._diagnostics.append(PluginDiagnostic(
                     code="plugin-repository-packet-limit",
                     message=(
@@ -863,9 +892,36 @@ class RepositoryAnalysisHandle:
                     ),
                     plugin_id=plugin_id,
                 ))
+                break
+            candidate_snapshots = dict(snapshots)
+            for snapshot in contribution.snapshots:
+                key = (snapshot.plugin_id, snapshot.kind)
+                if key in candidate_snapshots and candidate_snapshots[key] != snapshot:
+                    self._diagnostics.append(PluginDiagnostic(
+                        code="plugin-repository-snapshot-conflict",
+                        message=f"conflicting repository snapshot {key}",
+                        plugin_id=plugin_id,
+                    ))
+                    continue
+                candidate_snapshots[key] = snapshot
+            candidate_contexts = dict(contexts)
+            for context in contribution.contexts:
+                key = (context.plugin_id, context.kind, context.path)
+                if key in candidate_contexts and candidate_contexts[key] != context:
+                    self._diagnostics.append(PluginDiagnostic(
+                        code="plugin-repository-context-conflict",
+                        message=f"conflicting repository context {key}",
+                        plugin_id=plugin_id,
+                    ))
+                    continue
+                candidate_contexts[key] = context
+            symbols = candidate_symbols
+            packets = candidate_packets
+            snapshots = candidate_snapshots
+            contexts = candidate_contexts
             current = RepositoryAnalysis(
-                symbols=tuple(sorted(symbols)[: self._runtime.MAX_REPOSITORY_SYMBOLS]),
-                packets=tuple(sorted(packets.values())[: self._runtime.MAX_ARCHITECTURE_PACKETS]),
+                symbols=tuple(sorted(symbols)),
+                packets=tuple(sorted(packets.values())),
                 snapshots=tuple(sorted(snapshots.values())),
                 contexts=tuple(sorted(contexts.values())),
             )

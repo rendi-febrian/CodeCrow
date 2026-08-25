@@ -781,7 +781,9 @@ public class ProjectService implements IProjectService {
             Boolean transientBranchIndexesEnabled) {
         ProjectConfig currentConfig = project.getConfiguration();
         boolean useLocalMcp = currentConfig != null && currentConfig.useLocalMcp();
-        boolean useMcpTools = currentConfig != null && currentConfig.useMcpTools();
+        boolean useMcpTools = currentConfig != null
+                ? currentConfig.useMcpTools()
+                : ProjectConfig.DEFAULT_USE_MCP_TOOLS;
         String mainBranch = currentConfig != null ? currentConfig.mainBranch() : null;
         var branchAnalysis = currentConfig != null ? currentConfig.branchAnalysis() : null;
         Boolean prAnalysisEnabled = currentConfig != null ? currentConfig.prAnalysisEnabled() : true;
@@ -866,7 +868,9 @@ public class ProjectService implements IProjectService {
         ProjectConfig currentConfig = project.getConfiguration();
         boolean useLocalMcp = currentConfig != null && currentConfig.useLocalMcp();
         boolean newUseMcpTools = useMcpTools != null ? useMcpTools
-                : (currentConfig != null && currentConfig.useMcpTools());
+                : (currentConfig != null
+                        ? currentConfig.useMcpTools()
+                        : ProjectConfig.DEFAULT_USE_MCP_TOOLS);
         String mainBranch = currentConfig != null ? currentConfig.mainBranch() : null;
         var branchAnalysis = currentConfig != null ? currentConfig.branchAnalysis() : null;
         var ragConfig = currentConfig != null ? currentConfig.ragConfig() : null;
@@ -952,7 +956,9 @@ public class ProjectService implements IProjectService {
 
         ProjectConfig currentConfig = project.getConfiguration();
         boolean useLocalMcp = currentConfig != null && currentConfig.useLocalMcp();
-        boolean useMcpTools = currentConfig != null && currentConfig.useMcpTools();
+        boolean useMcpTools = currentConfig != null
+                ? currentConfig.useMcpTools()
+                : ProjectConfig.DEFAULT_USE_MCP_TOOLS;
         String mainBranch = currentConfig != null ? currentConfig.mainBranch() : null;
         var branchAnalysis = currentConfig != null ? currentConfig.branchAnalysis() : null;
         var ragConfig = currentConfig != null ? currentConfig.ragConfig() : null;

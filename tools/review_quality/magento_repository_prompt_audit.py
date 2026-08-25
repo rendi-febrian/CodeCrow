@@ -411,7 +411,7 @@ def run_audit(
         "limitations": [
             (
                 "The audit uses exact plugin-produced facts and the production "
-                "prompt assembler, but does not execute semantic embedding search "
+                "prompt assembler, but does not execute a remote repository index "
                 "or review-model candidate generation."
             ),
             (

@@ -51,7 +51,7 @@ class TestExtractLlmResponseText:
     def test_none_content(self):
         resp = _FakeResponse(None)
         result = extract_llm_response_text(resp)
-        assert result == "None"
+        assert result == ""
 
     def test_empty_list(self):
         resp = _FakeResponse([])

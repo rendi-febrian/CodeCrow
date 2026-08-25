@@ -19,13 +19,11 @@ from .generation_manifest import (
     generation_manifest_point_id,
     generation_manifest_content,
     is_sha256_hex,
-    verified_generation_member,
+    verify_generation_member_page,
 )
 from .index_representation import INDEX_REPRESENTATION_PAYLOAD_KEY
-from .repository_overlay import (
-    IncrementalIndexPreconditionError,
-    scroll_branch_points,
-)
+from .exact_index import ExactIndexPreconditionError
+from .repository_overlay import scroll_branch_points
 
 
 _IDENTITY_PAYLOAD_FIELDS = (
@@ -53,7 +51,7 @@ def _payload_identity(payload):
             for fingerprint in fingerprints
         )
     ):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision point is missing repository build identity; "
             "fully reindex the revision"
         )
@@ -82,7 +80,7 @@ def _load_exact_repository_facts(
         ),
     )
     if not points:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository detection facts are missing; "
             "fully reindex the revision"
         )
@@ -95,7 +93,7 @@ def _load_exact_repository_facts(
             or type(payload.get("facts_parts")) is not int
             or payload["facts_parts"] < 1
         ):
-            raise IncrementalIndexPreconditionError(
+            raise ExactIndexPreconditionError(
                 "exact revision repository detection facts have invalid part "
                 "metadata; fully reindex the revision"
             )
@@ -106,7 +104,7 @@ def _load_exact_repository_facts(
         actual_parts != list(range(expected_parts))
         or any(payload.get("facts_parts") != expected_parts for payload in ordered)
     ):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository detection facts are incomplete; "
             "fully reindex the revision"
         )
@@ -124,7 +122,7 @@ def _load_exact_repository_facts(
             for payload in ordered
         )
     ):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository detection facts have invalid integrity "
             "metadata; fully reindex the revision"
         )
@@ -134,13 +132,13 @@ def _load_exact_repository_facts(
         for payload in ordered
     ]
     if not all(isinstance(part, str) for part in content_parts):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository detection facts have invalid content; "
             "fully reindex the revision"
         )
     content = "".join(content_parts)
     if hashlib.sha256(content.encode("utf-8")).hexdigest() != expected_digest:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository detection facts failed integrity "
             "validation; fully reindex the revision"
         )
@@ -151,7 +149,7 @@ def _load_exact_repository_facts(
         if state_identity is None:
             state_identity = candidate
         elif state_identity != candidate:
-            raise IncrementalIndexPreconditionError(
+            raise ExactIndexPreconditionError(
                 "exact revision repository detection facts have inconsistent "
                 "build identity; fully reindex the revision"
             )
@@ -166,12 +164,12 @@ def _load_exact_repository_facts(
             source_root=decoded.get("sourceRoot"),
         )
     except Exception as exception:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository detection facts are invalid; "
             "fully reindex the revision"
         ) from exception
     if repository_facts.revision != commit:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository detection facts do not match the "
             "requested commit; fully reindex the revision"
         )
@@ -187,7 +185,7 @@ def _validate_generation_manifest(
     """Validate the single seal against every observed non-manifest point."""
     if len(manifest_points) != 1:
         reason = "missing" if not manifest_points else "not unique"
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             f"exact revision repository generation manifest is {reason}; "
             "fully reindex the revision"
         )
@@ -224,7 +222,7 @@ def _validate_generation_manifest(
         or not isinstance(index_exclude_patterns, list)
         or not is_sha256_hex(index_selection_policy_sha256)
     ):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository generation manifest is invalid; "
             "fully reindex the revision"
         )
@@ -240,7 +238,7 @@ def _validate_generation_manifest(
             )
         )
     except GenerationManifestError as exception:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository index selection policy is invalid; "
             "fully reindex the revision"
         ) from exception
@@ -250,12 +248,12 @@ def _validate_generation_manifest(
         or index_selection_policy_sha256
         != observed_selection_policy_sha256
     ):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository index selection policy failed "
             "integrity validation; fully reindex the revision"
         )
     if expected_count != len(members):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository generation is incomplete: "
             f"expected={expected_count}, actual={len(members)}; "
             "fully reindex the revision"
@@ -264,12 +262,12 @@ def _validate_generation_manifest(
     try:
         observed_members_digest = compute_generation_members_digest(members)
     except GenerationManifestError as exception:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository generation members are invalid; "
             "fully reindex the revision"
         ) from exception
     if observed_members_digest != expected_members_digest:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository generation membership failed integrity "
             "validation; fully reindex the revision"
         )
@@ -290,7 +288,7 @@ def _validate_generation_manifest(
         hashlib.sha256(expected_content.encode("utf-8")).hexdigest()
         != expected_manifest_digest
     ):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository generation manifest failed integrity "
             "validation; fully reindex the revision"
         )
@@ -315,21 +313,17 @@ def read_repository_generation_manifest_receipt(
     project: str,
     branch: str,
     commit: str,
-    generation_manifest_sha256: str | None = None,
+    generation_manifest_sha256: str,
 ):
     """Validate one registry-selected immutable seal without scanning members.
 
-    Readable aliases are non-authoritative operator conveniences. The Java
-    registry has already accepted the digest returned by the full generation
-    build, so alias repair only needs to prove that the selected physical
-    target still contains that exact coordinate-bound manifest. Exact review
-    preflight continues to verify every member and vector separately.
+    The registry has already accepted the digest returned by the full
+    generation build. Exact deletion only needs to prove that the selected
+    physical target still contains that coordinate-bound manifest; review
+    preflight continues to verify every member payload separately.
     """
-    if (
-        generation_manifest_sha256 is not None
-        and not is_sha256_hex(generation_manifest_sha256)
-    ):
-        raise IncrementalIndexPreconditionError(
+    if not is_sha256_hex(generation_manifest_sha256):
+        raise ExactIndexPreconditionError(
             "repository generation manifest receipt is invalid"
         )
     records = client.retrieve(
@@ -354,16 +348,13 @@ def read_repository_generation_manifest_receipt(
         or payload.get("generation_schema") != GENERATION_SCHEMA
         or payload.get("path") != GENERATION_MANIFEST_PATH
         or not is_sha256_hex(stored_manifest_sha256)
-        or (
-            generation_manifest_sha256 is not None
-            and stored_manifest_sha256 != generation_manifest_sha256
-        )
+        or stored_manifest_sha256 != generation_manifest_sha256
     ):
         return None
 
     # Recompute the manifest digest from its complete coordinate/membership
     # metadata. This remains O(1): member contents are intentionally not read
-    # on the optional alias-repair path.
+    # while validating the exact registry-selected deletion target.
     expected_count = payload.get("generation_member_count")
     members_sha256 = payload.get("generation_members_sha256")
     source_tree_sha256 = payload.get("source_tree_sha256")
@@ -453,7 +444,7 @@ def _require_unmixed_branch_revision(
                 or payload.get("pr") is True
                 or payload.get("commit") != commit
             ):
-                raise IncrementalIndexPreconditionError(
+                raise ExactIndexPreconditionError(
                     "exact revision branch contains mixed repository revisions; "
                     "fully reindex the revision"
                 )
@@ -499,9 +490,10 @@ def read_repository_revision_preflight(
             limit=256,
             offset=offset,
             with_payload=True,
-            with_vectors=True,
+            with_vectors=False,
         )
         point_count += len(points)
+        page_members = []
         for point in points:
             payload = point.payload or {}
             if (
@@ -509,7 +501,7 @@ def read_repository_revision_preflight(
                 or payload.get("commit") != commit
                 or payload.get("pr") is True
             ):
-                raise IncrementalIndexPreconditionError(
+                raise ExactIndexPreconditionError(
                     "exact revision query returned a point outside the requested "
                     "repository snapshot"
                 )
@@ -517,28 +509,25 @@ def read_repository_revision_preflight(
             if identity is None:
                 identity = candidate
             elif identity != candidate:
-                raise IncrementalIndexPreconditionError(
+                raise ExactIndexPreconditionError(
                     "exact revision has inconsistent repository build identity; "
                     "fully reindex the revision"
                 )
             if payload.get(GENERATION_MANIFEST_PAYLOAD_KEY) is True:
-                # Retain only the small manifest payload. Keeping its 4096-d
-                # vector would otherwise pin one full Qdrant point until the
-                # complete generation scan finishes.
+                # Retain only the small manifest payload while the complete
+                # generation scan finishes.
                 manifest_points.append(SimpleNamespace(payload=dict(payload)))
             else:
-                try:
-                    # Verify while this page is live and retain only the
-                    # compact (point id, digest) receipt. Never accumulate
-                    # complete payloads and vectors for the whole repository.
-                    members.append(verified_generation_member(point))
-                except GenerationManifestError as exception:
-                    # Preserve validation priority from the original preflight:
-                    # mixed identity/revision and missing-manifest diagnostics
-                    # are established before member-content failure. Keep only
-                    # the error text so its traceback cannot pin this page.
-                    if member_validation_error is None:
-                        member_validation_error = str(exception)
+                page_members.append(point)
+        try:
+            members.extend(verify_generation_member_page(page_members))
+        except GenerationManifestError as exception:
+            # Preserve validation priority from the original preflight: mixed
+            # identity/revision and missing-manifest diagnostics are established
+            # before member-content failure. Keep only the error text so its
+            # traceback cannot pin this page.
+            if member_validation_error is None:
+                member_validation_error = str(exception)
         point = None
         payload = None
         del points
@@ -562,7 +551,7 @@ def read_repository_revision_preflight(
             commit,
         )
     if member_validation_error is not None:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision repository generation member content failed "
             "integrity validation; fully reindex the revision"
         )
@@ -581,7 +570,7 @@ def read_repository_revision_preflight(
         )
     )
     if identity != state_identity:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "exact revision points do not match repository detection build "
             "identity; fully reindex the revision"
         )

@@ -8,9 +8,7 @@ from collections import defaultdict
 
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-
-class IncrementalIndexPreconditionError(RuntimeError):
-    """The branch requires a full reindex before an incremental mutation."""
+from .exact_index import ExactIndexPreconditionError
 
 
 def scroll_branch_points(
@@ -18,8 +16,6 @@ def scroll_branch_points(
     collection_name: str,
     branch: str,
     conditions=(),
-    *,
-    with_vectors: bool = False,
 ):
     """Read all points matching an exact branch-scoped neutral filter."""
     points = []
@@ -34,7 +30,7 @@ def scroll_branch_points(
             limit=256,
             offset=offset,
             with_payload=True,
-            with_vectors=with_vectors,
+            with_vectors=False,
         )
         points.extend(batch)
         if offset is None:
@@ -83,7 +79,7 @@ def load_repository_snapshots(
         payload = point.payload or {}
         key = (payload.get("snapshot_plugin"), payload.get("snapshot_kind"))
         if not all(isinstance(value, str) and value for value in key):
-            raise IncrementalIndexPreconditionError(
+            raise ExactIndexPreconditionError(
                 "repository snapshot point is missing plugin identity; fully "
                 "reindex the branch"
             )
@@ -105,7 +101,7 @@ def load_repository_snapshots(
         elif (
             plugin_ids != candidate_ids
         ):
-            raise IncrementalIndexPreconditionError(
+            raise ExactIndexPreconditionError(
                 "repository snapshot plugin selection is inconsistent; "
                 "fully reindex the branch"
             )
@@ -116,7 +112,7 @@ def load_repository_snapshots(
         expected_parts = ordered[0].get("snapshot_parts") if ordered else 0
         actual_parts = [payload.get("snapshot_part") for payload in ordered]
         if actual_parts != list(range(expected_parts)):
-            raise IncrementalIndexPreconditionError(
+            raise ExactIndexPreconditionError(
                 f"repository snapshot {plugin_id}:{kind} is incomplete; fully "
                 "reindex the branch"
             )
@@ -127,7 +123,7 @@ def load_repository_snapshots(
         expected_digest = ordered[0].get("snapshot_content_sha256")
         actual_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         if not expected_digest or actual_digest != expected_digest:
-            raise IncrementalIndexPreconditionError(
+            raise ExactIndexPreconditionError(
                 f"repository snapshot {plugin_id}:{kind} failed integrity "
                 "validation; fully reindex the branch"
             )
@@ -180,7 +176,7 @@ def load_repository_facts(client, collection_name: str, branch: str):
         or [payload.get("facts_part") for payload in ordered]
         != list(range(expected_parts))
     ):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "repository detection facts are incomplete; fully reindex the branch"
         )
 
@@ -194,7 +190,7 @@ def load_repository_facts(client, collection_name: str, branch: str):
         or hashlib.sha256(content.encode("utf-8")).hexdigest()
         != expected_digest
     ):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "repository detection facts failed integrity validation; fully "
             "reindex the branch"
         )
@@ -212,7 +208,7 @@ def load_repository_facts(client, collection_name: str, branch: str):
             identity = candidate
             plugin_ids_identity = candidate[0]
         elif plugin_ids_identity != candidate[0]:
-            raise IncrementalIndexPreconditionError(
+            raise ExactIndexPreconditionError(
                 "repository detection facts plugin selection is inconsistent; "
                 "fully reindex the branch"
             )
@@ -227,7 +223,7 @@ def load_repository_facts(client, collection_name: str, branch: str):
             source_root=decoded.get("sourceRoot"),
         )
     except Exception as exception:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "repository detection facts are invalid; fully reindex the branch"
         ) from exception
 
@@ -287,53 +283,21 @@ def load_branch_capability_metadata(client, collection_name: str, branch: str):
     return (), None, None, None
 
 
-def architecture_group_from_payload(payload):
-    """Recover the neutral compaction group from stored packet metadata."""
-    plugin_id = payload.get("architecture_plugin")
-    kind = payload.get("architecture_kind")
-    source_path = payload.get("architecture_source_path")
-    if not source_path:
-        facts = payload.get("plugin_graph_facts") or ()
-        fact_paths = {
-            fact.get("path") for fact in facts
-            if isinstance(fact, dict) and fact.get("path")
-        }
-        if len(fact_paths) == 1:
-            source_path = next(iter(fact_paths))
-    if all(isinstance(value, str) and value for value in (plugin_id, kind, source_path)):
-        return plugin_id, kind, source_path
-    raise RuntimeError("architecture point is missing its neutral compaction identity")
-
-
 def architecture_group_id(group):
     """Return the stable storage identity for one neutral graph group."""
     return hashlib.sha256("\0".join(group).encode("utf-8")).hexdigest()
 
 
-def affected_architecture_groups(analysis, changed_paths):
-    """Find graph groups whose contract paths intersect changed files."""
-    changed = set(changed_paths)
-    groups = set()
-    for packet in analysis.packets:
-        packet_changed = bool(changed.intersection(packet.paths))
-        for fact in packet.facts:
-            fact_paths = {fact.path, *fact.related_paths}
-            if packet_changed or changed.intersection(fact_paths):
-                groups.add((packet.plugin_id, packet.kind, fact.path))
-    return groups
-
-
 def build_overlay_capabilities(
     registry,
     repository_plugins: tuple[str, ...],
-    fingerprint: str,
     paths: tuple[str, ...],
     *,
-    revision: str | None = None,
-    detection_evidence=None,
+    revision: str,
+    detection_evidence,
 ):
     """Recreate neutral capabilities for an already-selected repository."""
-    from codecrow_plugins import PluginKind, ProjectCapabilities, ProjectSelector
+    from codecrow_plugins import PluginKind, ProjectSelector
 
     resolved = registry.resolve(repository_plugins)
     active_languages = tuple(
@@ -349,27 +313,9 @@ def build_overlay_capabilities(
         )
         if matches:
             file_plugins[path] = matches
-    if revision is not None or detection_evidence is not None:
-        if not revision:
-            raise ValueError(
-                "effective overlay capabilities require an immutable revision"
-            )
-        if detection_evidence is None:
-            raise ValueError(
-                "effective overlay capabilities require selection evidence"
-            )
-        return ProjectSelector(registry).project(
-            revision=revision,
-            repository_plugins=repository_plugins,
-            file_plugins=file_plugins,
-            detection_evidence=detection_evidence,
-        )
-
-    return ProjectCapabilities(
+    return ProjectSelector(registry).project(
+        revision=revision,
         repository_plugins=repository_plugins,
         file_plugins=file_plugins,
-        detection_evidence={},
-        unavailable_capabilities=(),
-        fingerprint=fingerprint,
-        descriptor_fingerprint=registry.fingerprint_for(repository_plugins),
+        detection_evidence=detection_evidence,
     )

@@ -2,7 +2,6 @@ from types import SimpleNamespace
 
 from rag_pipeline.core.pr_overlay_identity import (
     ZERO_FINGERPRINT,
-    is_complete_reusable_generation,
     pr_overlay_generation_fingerprint,
 )
 
@@ -141,15 +140,3 @@ def test_generation_identity_changes_with_overlay_representation():
         snapshots=(),
     )
     assert changed != baseline
-
-
-def test_reuse_requires_every_point_to_have_the_expected_identity():
-    expected = "sha256:" + "1" * 64
-    matching = SimpleNamespace(payload={"pr_generation_fingerprint": expected})
-    stale = SimpleNamespace(payload={
-        "pr_generation_fingerprint": ZERO_FINGERPRINT,
-    })
-
-    assert is_complete_reusable_generation((matching,), expected)
-    assert not is_complete_reusable_generation((), expected)
-    assert not is_complete_reusable_generation((matching, stale), expected)

@@ -58,7 +58,7 @@ Unit tests for the two Python packages in the CodeCrow platform.
 ### rag-pipeline (`tests/`)
 
 - **conftest.py** — fixtures for FastAPI test client, mock Qdrant/Redis, tree-sitter parsers
-- **test\_\*.py** — 30+ test modules covering API routes, chunking, indexing, search, reranking, parsers, etc.
+- **test\_\*.py** — 30+ test modules covering API routes, chunking, indexing, structural search, parsers, etc.
 - **pytest.ini** — `asyncio_mode = auto`
 
 ## Logs

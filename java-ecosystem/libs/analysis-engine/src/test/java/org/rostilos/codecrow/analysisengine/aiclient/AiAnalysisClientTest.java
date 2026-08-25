@@ -11,6 +11,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.rostilos.codecrow.analysisengine.dto.request.ai.AiAnalysisRequest;
 import org.rostilos.codecrow.analysisengine.dto.request.ai.AiAnalysisRequestImpl;
+import org.rostilos.codecrow.analysisengine.dto.request.ai.LocalRepositorySnapshot;
 import org.rostilos.codecrow.analysisengine.util.PromptDryRunMode;
 import org.rostilos.codecrow.analysisengine.dto.request.ai.AiRequestPreviousIssueDTO;
 import org.rostilos.codecrow.analysisengine.dto.request.ai.enrichment.FileContentDto;
@@ -319,6 +320,38 @@ class AiAnalysisClientTest {
                 }
 
                 @Test
+                @DisplayName("should include ephemeral local repository snapshot in queued request payload")
+                void shouldIncludeLocalRepositorySnapshotInQueuedRequestPayload() throws Exception {
+                        Map<String, Object> finalEvent = new HashMap<>();
+                        finalEvent.put("type", "final");
+                        finalEvent.put("result", Map.of("comment", "ok", "issues", List.of()));
+                        when(queueService.rightPop(anyString(), anyLong()))
+                                        .thenReturn(objectMapper.writeValueAsString(finalEvent));
+
+                        client.performAnalysis(
+                                        mockRequest,
+                                        new LocalRepositorySnapshot(
+                                                        "/tmp/codecrow-pr-review-123",
+                                                        "main",
+                                                        "target-head-sha"),
+                                        null);
+
+                        var payloadCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
+                        verify(queueService).leftPush(eq("codecrow:analysis:jobs"), payloadCaptor.capture());
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> queued = objectMapper.readValue(
+                                        payloadCaptor.getValue(), Map.class);
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> requestPayload =
+                                        (Map<String, Object>) queued.get("request");
+
+                        assertThat(requestPayload)
+                                        .containsEntry("localRepoPath", "/tmp/codecrow-pr-review-123")
+                                        .containsEntry("localRepoTargetBranch", "main")
+                                        .containsEntry("localRepoRevision", "target-head-sha");
+                }
+
+                @Test
                 @DisplayName("should bind exact target branch generation to queued review")
                 void shouldBindExactTargetBranchGenerationToQueuedReview() throws Exception {
                         var repository = mock(org.rostilos.codecrow.core.persistence.repository.rag
@@ -330,7 +363,7 @@ class AiAnalysisClientTest {
                         when(generation.getCollectionName()).thenReturn("opaque-master-generation");
                         when(generation.getManifestDigest()).thenReturn("master-manifest");
                         when(repository.findAvailableExactGeneration(
-                                        eq(1L), eq("main"), eq("master-base"), anyList()))
+                                        eq(1L), eq("main"), eq("master-target-head"), anyList()))
                                         .thenReturn(List.of(generation));
                         org.springframework.test.util.ReflectionTestUtils.setField(
                                         client, "branchGenerationRepository", repository);
@@ -340,8 +373,13 @@ class AiAnalysisClientTest {
                                         eq(1L), eq("main"), any())).thenReturn(1);
                         AiAnalysisRequest exactRequest = new TestAiAnalysisRequest() {
                                 @Override
+                                public String getTargetHeadCommitHash() {
+                                        return "master-target-head";
+                                }
+
+                                @Override
                                 public String getBaseCommitHash() {
-                                        return "master-base";
+                                        return "merge-base";
                                 }
                         };
                         Map<String, Object> finalEvent = Map.of(
@@ -361,6 +399,8 @@ class AiAnalysisClientTest {
                         Map<String, Object> requestPayload =
                                         (Map<String, Object>) queued.get("request");
                         assertThat(requestPayload)
+                                        .containsEntry("targetHeadCommitHash", "master-target-head")
+                                        .containsEntry("baseCommitHash", "merge-base")
                                         .containsEntry("ragCollectionTarget", "opaque-master-generation")
                                         .containsEntry("ragBaseGenerationManifestSha256", "master-manifest");
                         verify(branchRepository).markAccessedIfUnclaimed(

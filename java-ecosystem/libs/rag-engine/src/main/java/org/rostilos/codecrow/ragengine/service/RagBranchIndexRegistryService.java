@@ -42,16 +42,7 @@ public class RagBranchIndexRegistryService {
             RagBranchIndex branchIndex,
             RagBranchIndexGeneration generation,
             RagIndexOperation operation,
-            boolean existingOperation,
-            String sourceCollectionTarget) {
-
-        public BuildRegistration(
-                RagBranchIndex branchIndex,
-                RagBranchIndexGeneration generation,
-                RagIndexOperation operation,
-                boolean existingOperation) {
-            this(branchIndex, generation, operation, existingOperation, null);
-        }
+            boolean existingOperation) {
     }
 
     @Transactional
@@ -86,16 +77,14 @@ public class RagBranchIndexRegistryService {
                     branchIndex,
                     operation.getGeneration(),
                     operation,
-                    true,
-                    sourceCollectionTarget(operation.getGeneration()));
+                    true);
         }
 
         RagBranchIndex branchIndex = branchIndexRepository
                 .findByProjectIdAndBranchNameForUpdate(project.getId(), branch)
                 .orElseGet(() -> new RagBranchIndex(project, branch, kind));
         rejectCleanupClaim(branchIndex);
-        if (branchIndex.getIndexKind() == RagBranchIndexKind.LEGACY
-                || kind == RagBranchIndexKind.PRIMARY
+        if (kind == RagBranchIndexKind.PRIMARY
                 || (branchIndex.getIndexKind() == RagBranchIndexKind.TRANSIENT
                     && kind == RagBranchIndexKind.DURABLE)) {
             branchIndex.setIndexKind(kind);
@@ -123,14 +112,7 @@ public class RagBranchIndexRegistryService {
                 branchIndex,
                 generation,
                 operation,
-                false,
-                sourceCollectionTarget(generation));
-    }
-
-    private static String sourceCollectionTarget(
-            RagBranchIndexGeneration generation) {
-        RagBranchIndexGeneration parent = generation.getParentGeneration();
-        return parent != null ? parent.getCollectionName() : null;
+                false);
     }
 
     @Transactional

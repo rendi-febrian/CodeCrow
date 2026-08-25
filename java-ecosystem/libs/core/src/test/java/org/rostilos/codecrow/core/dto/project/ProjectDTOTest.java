@@ -115,6 +115,7 @@ class ProjectDTOTest {
             assertThat(dto.vcsConnectionId()).isNull();
             assertThat(dto.aiConnectionId()).isNull();
             assertThat(dto.defaultBranchId()).isNull();
+            assertThat(dto.useMcpTools()).isTrue();
         }
 
         @Test
@@ -281,6 +282,23 @@ class ProjectDTOTest {
             ProjectDTO dto = ProjectDTO.fromProject(project);
 
             assertThat(dto.taskContextAnalysisEnabled()).isFalse();
+        }
+
+        @Test
+        @DisplayName("should expose an explicitly disabled MCP review setting")
+        void shouldExposeExplicitlyDisabledMcpReviewSetting() {
+            Project project = new Project();
+            setField(project, "id", 1L);
+            project.setName("Test");
+            project.setIsActive(true);
+
+            ProjectConfig config = new ProjectConfig();
+            config.setUseMcpTools(false);
+            project.setConfiguration(config);
+
+            ProjectDTO dto = ProjectDTO.fromProject(project);
+
+            assertThat(dto.useMcpTools()).isFalse();
         }
 
         @Test

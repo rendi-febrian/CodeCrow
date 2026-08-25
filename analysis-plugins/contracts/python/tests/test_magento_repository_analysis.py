@@ -19,7 +19,6 @@ from codecrow_plugins import (
 PLUGINS_ROOT = Path(__file__).resolve().parents[3]
 PROJECT_ROOT = PLUGINS_ROOT.parent
 
-
 def _symbols() -> tuple[SymbolDefinition, ...]:
     values = (
         SymbolDefinition(
@@ -414,6 +413,86 @@ def test_magento_repository_reports_timed_substages():
         and event.get("status") == "completed"
         and isinstance(event.get("durationMs"), int)
         for event in events
+    )
+
+
+def test_magento_repository_session_retains_admitted_view_sources():
+    catalog = PluginCatalog.discover(PLUGINS_ROOT)
+    session = catalog.implementation("magento").start_repository_analysis(
+        "admission-test"
+    ).value
+    retained_paths = {
+        "vendor/acme/theme/Magento_Theme/layouts.xml",
+        "vendor/acme/theme/view/frontend/page_layout/one-column.xml",
+        "vendor/acme/theme/view/frontend/web/css/source.css",
+        "vendor/acme/theme/view/frontend/web/css/source.less",
+        "vendor/acme/theme/view/frontend/web/graphql/cart.gql",
+        "vendor/acme/theme/view/frontend/web/graphql/cart.graphql",
+        "vendor/acme/theme/view/frontend/web/js/component.js",
+        "vendor/acme/theme/view/frontend/web/js/component.jsx",
+        "vendor/acme/theme/view/frontend/web/js/component.mjs",
+        "vendor/acme/theme/view/frontend/web/js/component.ts",
+        "vendor/acme/theme/view/frontend/web/js/component.tsx",
+        "vendor/acme/theme/view/frontend/web/template/item.html",
+    }
+    ignored_paths = {
+        "vendor/acme/theme/docs/example.txt",
+        "vendor/acme/theme/docs/layouts.xml",
+    }
+
+    session.ingest(tuple(
+        FileArtifact(path, f"source:{path}")
+        for path in sorted((*retained_paths, *ignored_paths))
+    ))
+
+    assert retained_paths <= set(session.artifacts)
+    assert ignored_paths.isdisjoint(session.artifacts)
+
+
+def test_magento_theme_only_repository_emits_theme_and_view_facts():
+    analysis = _resolve(
+        artifacts={
+            "composer.json": '{"type":"magento2-theme"}',
+            "registration.php": """<?php
+                ComponentRegistrar::register(
+                    ComponentRegistrar::THEME,
+                    'frontend/Acme/standalone',
+                    __DIR__
+                );
+            """,
+            "theme.xml": "<theme><title>Standalone</title></theme>",
+            "Magento_Theme/layout/default.xml": """
+                <page><body><block name="standalone.banner"
+                    template="Magento_Theme::banner.phtml" /></body></page>
+            """,
+            "Magento_Theme/templates/banner.phtml": "<div>Banner</div>",
+        },
+        symbols=(),
+    )
+    facts = tuple(
+        fact for packet in analysis.packets for fact in packet.facts
+    )
+
+    assert any(
+        fact.kind == "magento-theme"
+        and fact.source == "Acme/standalone"
+        for fact in facts
+    )
+    assert any(
+        fact.kind == "magento-layout-handle"
+        and fact.source == "default"
+        and fact.path == "Magento_Theme/layout/default.xml"
+        for fact in facts
+    )
+    assert any(
+        fact.kind == "magento-layout-block"
+        and fact.target == "standalone.banner"
+        for fact in facts
+    )
+    assert not any(
+        packet.kind == "magento-module"
+        or any(fact.kind.startswith("magento-module") for fact in packet.facts)
+        for packet in analysis.packets
     )
 
 
@@ -1435,6 +1514,41 @@ def test_magento_graphql_client_resolves_custom_query_root():
     }
 
 
+def test_magento_graphql_client_reads_retained_graphql_documents():
+    client_paths = {
+        "app/code/Acme/GraphQl/view/frontend/web/graphql/products.gql",
+        "app/code/Acme/GraphQl/view/frontend/web/graphql/products.graphql",
+    }
+    analysis = _resolve(
+        artifacts={
+            "app/code/Acme/GraphQl/etc/module.xml": (
+                '<config><module name="Acme_GraphQl" /></config>'
+            ),
+            "app/code/Acme/GraphQl/etc/schema.graphqls": """
+                type Query { products: Products }
+                type Products { total_count: Int! }
+            """,
+            **{
+                path: "query Products { products { total_count } }"
+                for path in client_paths
+            },
+        },
+        symbols=(),
+    )
+    client_facts = tuple(
+        fact
+        for packet in analysis.packets
+        for fact in packet.facts
+        if fact.kind == "magento-graphql-operation-field"
+    )
+
+    assert {fact.path for fact in client_facts} == client_paths
+    assert {
+        fact.target.rsplit("::", 1)[-1]
+        for fact in client_facts
+    } == {"Query.products", "Products.total_count"}
+
+
 def test_module_only_repository_keeps_cross_module_relationships():
     interface_path = "app/code/Acme/Contracts/Api/CartInterface.php"
     implementation_path = "app/code/Acme/Checkout/Model/Cart.php"
@@ -1576,6 +1690,26 @@ def test_layout_binds_selected_phtml_to_exact_block_method_and_view_model(
             "Acme\\Checkout\\ViewModel\\Cart",
             "class",
             "app/code/Acme/Checkout/ViewModel/Cart.php",
+        ),
+        SymbolDefinition(
+            (
+                "template:app/code/Acme/Checkout/view/frontend/"
+                "templates/cart.phtml"
+            ),
+            "template",
+            (
+                "app/code/Acme/Checkout/view/frontend/"
+                "templates/cart.phtml"
+            ),
+            attributes=((
+                "php-template-instance-call-reference:0000",
+                json.dumps({
+                    "line": 1,
+                    "literalStringArguments": {},
+                    "method": "getCartId",
+                    "receiver": "block",
+                }, sort_keys=True, separators=(",", ":")),
+            ),),
         ),
     )
     analysis = _resolve(
@@ -2928,6 +3062,65 @@ def test_magento_interceptor_facts_respect_php_applicability_and_direct_override
         fact.kind == "magento-intercepted-method"
         and fact.target == "Vendor\\Model\\FinalTarget::save"
         for fact in facts
+    )
+
+
+def test_magento_inherited_plugin_facts_bound_descendant_expansion():
+    descendants = tuple(
+        SymbolDefinition(
+            f"Vendor\\Model\\Descendant{index:03d}",
+            "class",
+            f"app/code/Vendor/Module/Model/Descendant{index:03d}.php",
+            parents=("Vendor\\Model\\Base",),
+        )
+        for index in range(200)
+    )
+    analysis = _resolve(
+        artifacts={
+            "app/etc/config.php": """<?php return ['modules' => [
+                'Vendor_Module' => 1,
+            ]];""",
+            "app/code/Vendor/Module/etc/module.xml": (
+                '<config><module name="Vendor_Module" /></config>'
+            ),
+            "app/code/Vendor/Module/etc/di.xml": r"""
+                <config>
+                    <type name="Vendor\Model\Base">
+                        <plugin name="guard" type="Vendor\Plugin\Guard" />
+                    </type>
+                </config>
+            """,
+        },
+        symbols=tuple(sorted((
+            SymbolDefinition(
+                "Vendor\\Model\\Base",
+                "class",
+                "app/code/Vendor/Module/Model/Base.php",
+            ),
+            SymbolDefinition(
+                "Vendor\\Plugin\\Guard",
+                "class",
+                "app/code/Vendor/Module/Plugin/Guard.php",
+            ),
+            *descendants,
+        ))),
+    )
+    inherited = tuple(
+        fact
+        for packet in analysis.packets
+        for fact in packet.facts
+        if fact.kind == "magento-di-inherited-plugin"
+        and fact.target == "Vendor\\Plugin\\Guard"
+    )
+
+    assert len(inherited) == 199
+    assert any(
+        fact.source == "Vendor\\Model\\Descendant198"
+        for fact in inherited
+    )
+    assert not any(
+        fact.source == "Vendor\\Model\\Descendant199"
+        for fact in inherited
     )
 
 
@@ -4726,7 +4919,6 @@ def test_magento_architecture_reaches_stage_1_as_focused_fresh_context():
         chunks,
         architecture_context,
         architecture_related,
-        set(),
     )
 
     expected_facts = [
@@ -4782,8 +4974,7 @@ def test_magento_architecture_reaches_stage_1_as_focused_fresh_context():
         if queue_handler_path
         in node.metadata["architecture_paths"]
         and any(
-            fact["kind"]
-            == "magento-message-effective-handler"
+            fact["kind"] == "magento-message-effective-handler"
             for fact in node.metadata["plugin_graph_facts"]
         )
     ]
@@ -4816,7 +5007,6 @@ def test_magento_architecture_reaches_stage_1_as_focused_fresh_context():
         queue_chunks,
         {},
         {},
-        set(),
     )
     queue_prompt_context = context_helpers.format_rag_context(
         {
@@ -4855,7 +5045,9 @@ def test_magento_architecture_reaches_stage_1_as_focused_fresh_context():
     system_nodes = [
         node for node in nodes
         if (
-            system_path in node.metadata["architecture_paths"]
+            {system_path, conditional_layout_path}.intersection(
+                node.metadata["architecture_paths"]
+            )
             and any(
                 (
                     fact["kind"].startswith("magento-system-config-")
@@ -4897,7 +5089,6 @@ def test_magento_architecture_reaches_stage_1_as_focused_fresh_context():
         system_chunks,
         {},
         {},
-        set(),
     )
     system_prompt_context = context_helpers.format_rag_context(
         {
@@ -4926,6 +5117,84 @@ def test_magento_architecture_reaches_stage_1_as_focused_fresh_context():
         system_prompt_context
     )
     assert len(system_prompt_context) <= 32_000
+
+    layout_template_path = (
+        "app/code/Acme/Checkout/view/frontend/templates/cart.phtml"
+    )
+    block_path = "app/code/Acme/Checkout/Block/Cart.php"
+    effective_layout_nodes = [
+        node
+        for node in nodes
+        if (
+            {conditional_layout_path, layout_template_path}.intersection(
+                node.metadata["architecture_paths"]
+            )
+            and any(
+                fact["kind"] in {
+                    "magento-layout-effective-node",
+                    "magento-layout-effective-template",
+                    "magento-template-effective-block-binding",
+                }
+                for fact in node.metadata["plugin_graph_facts"]
+            )
+        )
+    ]
+    assert effective_layout_nodes
+    service.qdrant_client = FakeQdrant([
+        SimpleNamespace(
+            id=f"effective-layout-packet-{index}",
+            payload={
+                **node.metadata,
+                "text": node.text,
+                "branch": "feature",
+                "pr": True,
+                "pr_number": 42,
+            },
+        )
+        for index, node in enumerate(effective_layout_nodes)
+    ])
+    effective_layout_chunks = []
+    service._query_architecture_context(
+        "collection",
+        FieldCondition(key="branch", match=MatchValue(value="feature")),
+        [conditional_layout_path, layout_template_path],
+        10,
+        ["feature", "main"],
+        "feature",
+        set(),
+        {conditional_layout_path, layout_template_path},
+        set(),
+        effective_layout_chunks,
+        {},
+        {},
+    )
+    effective_layout_prompt = context_helpers.format_rag_context(
+        {
+            "relevant_code": [
+                {**chunk, "_source": "pr_indexed"}
+                for chunk in effective_layout_chunks
+            ]
+        },
+        pr_changed_files=[conditional_layout_path, layout_template_path],
+    )
+    assert "magento-layout-effective-node" in effective_layout_prompt
+    assert "magento-layout-effective-template" in effective_layout_prompt
+    assert "magento-template-effective-block-binding" in (
+        effective_layout_prompt
+    )
+    assert "conditionally-rendered-by-effective-block" in (
+        effective_layout_prompt
+    )
+    assert len(effective_layout_prompt) <= 32_000
+    assert any(
+        {conditional_layout_path, layout_template_path, block_path}
+        <= set(group)
+        for group in review_groups_from_architecture_payloads(
+            (node.metadata for node in effective_layout_nodes),
+            (conditional_layout_path, layout_template_path, block_path),
+        )
+    )
+
     assert review_groups_from_architecture_payloads(
         (node.metadata for node in system_nodes),
         (
@@ -4992,7 +5261,6 @@ def test_magento_architecture_reaches_stage_1_as_focused_fresh_context():
         menu_chunks,
         {},
         {},
-        set(),
     )
     menu_prompt_context = context_helpers.format_rag_context(
         {

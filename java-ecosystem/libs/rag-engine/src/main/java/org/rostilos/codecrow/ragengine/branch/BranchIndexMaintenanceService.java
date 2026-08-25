@@ -294,7 +294,7 @@ public class BranchIndexMaintenanceService {
             if (primary && job != null && admittedBuild != null) {
                 if (admittedBuild.statusAdmission()
                         == BranchIndexBuildAdmissionService.ProjectStatusAdmission.UPDATING) {
-                    trackingService.markIncrementalUpdateFailed(
+                    trackingService.markGenerationRefreshFailed(
                             project, diagnostic, job.getId());
                 } else {
                     trackingService.markIndexingFailed(
@@ -340,7 +340,7 @@ public class BranchIndexMaintenanceService {
             return List.copyOf(branches);
         }
         if (requestedBranch == null || requestedBranch.isBlank()) {
-            throw new IllegalArgumentException("A configured RAG branch must be selected");
+            return List.of(primary);
         }
         String branch = requestedBranch.trim();
         if (branch.equals(primary)) {

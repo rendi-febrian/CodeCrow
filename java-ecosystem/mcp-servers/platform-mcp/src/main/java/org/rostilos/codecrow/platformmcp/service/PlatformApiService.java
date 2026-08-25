@@ -105,8 +105,8 @@ public class PlatformApiService {
      * Search issues by criteria.
      * Security: Uses the projectId from constructor (from validated webhook chain).
      */
-    public List<Map<String, Object>> searchIssues(String severity, String category, 
-                                                   String status, Integer limit) throws IOException {
+    public List<Map<String, Object>> searchIssues(String severity, String category,
+                                                   String status) throws IOException {
         StringBuilder urlBuilder = new StringBuilder(apiBaseUrl)
                 .append("/api/internal/issues?projectId=")
                 .append(projectId);
@@ -120,8 +120,6 @@ public class PlatformApiService {
         if (status != null && !status.isEmpty()) {
             urlBuilder.append("&status=").append(URLEncoder.encode(status, StandardCharsets.UTF_8));
         }
-        urlBuilder.append("&limit=").append(limit != null ? limit : 50);
-        
         String url = urlBuilder.toString();
         
         Request.Builder requestBuilder = new Request.Builder()

@@ -1,6 +1,7 @@
 from rag_pipeline.core.review_grouping import (
     review_groups_from_architecture_payloads,
 )
+from rag_pipeline.api.routers.pr import _review_groups
 
 
 def test_review_groups_project_only_changed_paths_from_neutral_graph_facts():
@@ -91,3 +92,44 @@ def test_review_groups_ignore_single_changed_endpoint_and_malformed_facts():
         payloads,
         ["changed.php", "other.php"],
     ) == []
+
+
+def test_pr_overlay_facts_override_base_relations_for_complete_and_deleted_paths():
+    changed = [
+        "complete.py",
+        "deleted.py",
+        "partial.py",
+        "other-partial.py",
+    ]
+    overlay_payloads = [{
+        "plugin_graph_facts": [{
+            "path": "complete.py",
+            "related_paths": ["deleted.py"],
+        }],
+    }]
+    target_payloads = [{
+        "plugin_graph_facts": [
+            {
+                "path": "partial.py",
+                "related_paths": ["complete.py"],
+            },
+            {
+                "path": "partial.py",
+                "related_paths": ["other-partial.py"],
+            },
+            {
+                "path": "deleted.py",
+                "related_paths": ["partial.py"],
+            },
+        ],
+    }]
+
+    assert _review_groups(
+        changed,
+        overlay_payloads,
+        target_payloads,
+        ["partial.py", "other-partial.py"],
+    ) == [
+        ["complete.py", "deleted.py"],
+        ["other-partial.py", "partial.py"],
+    ]

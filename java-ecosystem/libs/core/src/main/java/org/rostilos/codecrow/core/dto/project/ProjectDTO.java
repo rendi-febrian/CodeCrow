@@ -105,7 +105,7 @@ public record ProjectDTO(
         Boolean prAnalysisEnabled = project.isPrAnalysisEnabled();
         Boolean branchAnalysisEnabled = project.isBranchAnalysisEnabled();
         String installationMethod = null;
-        Boolean useMcpTools = false;
+        Boolean useMcpTools = ProjectConfig.DEFAULT_USE_MCP_TOOLS;
         Boolean taskContextAnalysisEnabled = true;
 
         ProjectConfig config = project.getConfiguration();

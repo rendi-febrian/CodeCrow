@@ -3,19 +3,28 @@ Conditional MCP tool prompt sections (appended when useMcpTools=True).
 """
 
 STAGE_1_MCP_TOOL_SECTION = """
-## Available VCS Tools (Context Gap Filling)
-If the diff and RAG context are INSUFFICIENT to understand the code changes,
-you may call the following tool to read related files from the target branch:
+## Repository Tools (Additional Context)
+You are reviewing this batch as an agent. The diff, complete-file evidence, and
+preassembled RAG context above remain your primary review input. When they leave
+a concrete context gap, you can inspect the request-bound repository with:
 
-- **getBranchFileContent(branch, filePath)** — Read a file's full content from the repository.
+- **getRootDirectory(workspace, projectKey, branch)** — List the target
+  snapshot's top-level entries.
+- **getDirectoryByPath(workspace, projectKey, branch, dirPath)** — Inspect a
+  directory in the target snapshot.
+- **getBranchFileContent(workspace, repoSlug, branch, filePath, startLine?,
+  endLine?)** — Read a file or bounded line window from the target snapshot.
+- **searchRepositoryCode(query, top_k)** — Search the exact indexed repository
+  generation when that optional RAG tool is available.
 
-RULES:
-1. You have a MAXIMUM of {max_calls} tool calls for this batch.
-2. Use tools ONLY when context is truly missing (e.g., an interface definition, a parent class, a config file referenced in the diff).
-3. Do NOT call tools for files already present in the diff or RAG context above.
-4. After tool calls, continue your review with the enriched context.
+The local tree tools are backed by the downloaded target-head snapshot when it
+is available; provider-backed reads remain a fail-open fallback. Avoid rereading
+files already supplied in this prompt. After gathering any missing context,
+return the complete structured review for every file in this batch.
 
-TARGET BRANCH: {target_branch}
+TARGET BRANCH/REVISION REF: {target_branch}
+VCS WORKSPACE: {workspace}
+VCS REPOSITORY (repoSlug/projectKey): {repo_slug}
 """
 
 STAGE_3_MCP_VERIFICATION_SECTION = """

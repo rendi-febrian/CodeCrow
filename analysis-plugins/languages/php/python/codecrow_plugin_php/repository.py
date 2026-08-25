@@ -36,6 +36,7 @@ _STATIC_CALL_REFERENCE = "php-static-call-reference:"
 _INSTANCE_CALL_REFERENCE = "php-instance-call-reference:"
 _CHAINED_INSTANCE_CALL_REFERENCE = "php-chained-instance-call-reference:"
 _LITERAL_INSTANCE_CALL_REFERENCE = "php-literal-instance-call-reference:"
+_TEMPLATE_INSTANCE_CALL_REFERENCE = "php-template-instance-call-reference:"
 _CLASS_CONSTANT_DECLARATION = "php-class-constant:"
 _CLASS_CONSTANT_REFERENCE = "php-class-constant-reference:"
 logger = logging.getLogger(__name__)
@@ -52,6 +53,13 @@ def _thread_parser() -> "PhpAstParser":
 
 def _parse_artifact(artifact: FileArtifact) -> tuple[SymbolDefinition, ...]:
     return _thread_parser().parse(artifact)
+
+
+def _parse_template_artifact(
+    artifact: FileArtifact,
+) -> tuple[SymbolDefinition, ...]:
+    template = _thread_parser().parse_template(artifact)
+    return (template,) if template is not None else ()
 
 
 def _text(node, source: bytes) -> str:
@@ -208,6 +216,15 @@ class PhpAstParser:
         "trait_declaration": "trait",
         "enum_declaration": "enum",
     }
+    TEMPLATE_CALLABLE_SCOPES = {
+        "anonymous_function",
+        "arrow_function",
+        "function_definition",
+    }
+    TEMPLATE_ASSIGNMENTS = {
+        "assignment_expression",
+        "augmented_assignment_expression",
+    }
 
     def __init__(self) -> None:
         try:
@@ -301,6 +318,169 @@ class PhpAstParser:
                 attributes=tuple(sorted(type_attributes | method_attributes)),
             ))
         return tuple(sorted(symbols))
+
+    def parse_template(
+        self,
+        artifact: FileArtifact,
+    ) -> SymbolDefinition | None:
+        """Retain exact direct variable calls from one PHP template.
+
+        Magento owns the meaning of conventional receivers such as ``$block``;
+        the PHP plugin only publishes syntax-proven receiver, method, literal
+        argument, path, and line metadata. Calls in comments/HTML/strings and
+        dynamic receiver or method expressions are deliberately absent.
+        """
+
+        source = artifact.content.encode("utf-8")
+        tree = self._parser.parse(source)
+        root = tree.root_node
+        if root.has_error:
+            return None
+
+        declaration_types = set(self.DECLARATIONS)
+        excluded_scopes = declaration_types | self.TEMPLATE_CALLABLE_SCOPES
+        reassigned_at: dict[str, int] = {}
+        uncertain_reassignment_at: int | None = None
+        for node in _walk(root):
+            if node.type not in self.TEMPLATE_ASSIGNMENTS:
+                continue
+            if _nearest(node, excluded_scopes) is not None:
+                continue
+            left = node.child_by_field_name("left")
+            if left is None:
+                uncertain_reassignment_at = min(
+                    uncertain_reassignment_at or node.end_byte,
+                    node.end_byte,
+                )
+                continue
+            if left.type == "variable_name":
+                receiver_name = _text(left, source).strip().lstrip("$")
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", receiver_name):
+                    reassigned_at[receiver_name] = min(
+                        reassigned_at.get(receiver_name, node.end_byte),
+                        node.end_byte,
+                    )
+                else:
+                    uncertain_reassignment_at = min(
+                        uncertain_reassignment_at or node.end_byte,
+                        node.end_byte,
+                    )
+                continue
+            # Mutating an element or property does not replace the receiver.
+            # Other assignment targets (for example dynamic variables or
+            # destructuring) cannot be attributed safely, so later calls
+            # abstain rather than guessing which template binding survived.
+            if left.type not in {
+                "member_access_expression",
+                "nullsafe_member_access_expression",
+                "scoped_property_access_expression",
+                "subscript_expression",
+            }:
+                uncertain_reassignment_at = min(
+                    uncertain_reassignment_at or node.end_byte,
+                    node.end_byte,
+                )
+
+        references: set[tuple[int, str, str, tuple[tuple[int, str], ...]]] = set()
+        literal_pattern = re.compile(
+            r"(?P<quote>['\"])(?P<value>[A-Za-z0-9_.:/-]{1,256})(?P=quote)"
+        )
+        for node in _walk(root):
+            if node.type not in {
+                "member_call_expression",
+                "nullsafe_member_call_expression",
+            }:
+                continue
+            # Declarations have their normal symbols. Named functions,
+            # closures, and arrow functions have their own runtime scope, so
+            # none of their receiver calls belong to top-level PHTML context.
+            if _nearest(node, excluded_scopes) is not None:
+                continue
+            receiver = node.child_by_field_name("object")
+            method_node = node.child_by_field_name("name")
+            if (
+                receiver is None
+                or receiver.type != "variable_name"
+                or method_node is None
+                or method_node.type not in {"name", "identifier"}
+            ):
+                continue
+            receiver_name = _text(receiver, source).strip().lstrip("$")
+            method = _text(method_node, source).strip()
+            if (
+                not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", receiver_name)
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", method)
+            ):
+                continue
+            if (
+                node.start_byte >= reassigned_at.get(receiver_name, node.end_byte + 1)
+                or (
+                    uncertain_reassignment_at is not None
+                    and node.start_byte >= uncertain_reassignment_at
+                )
+            ):
+                continue
+            arguments = node.child_by_field_name("arguments") or next(
+                (
+                    child
+                    for child in node.named_children
+                    if child.type == "arguments"
+                ),
+                None,
+            )
+            literal_arguments: list[tuple[int, str]] = []
+            if arguments is not None:
+                for position, argument in enumerate(arguments.named_children):
+                    value_node = argument
+                    if (
+                        argument.type == "argument"
+                        and len(argument.named_children) == 1
+                    ):
+                        value_node = argument.named_children[0]
+                    match = literal_pattern.fullmatch(
+                        _text(value_node, source).strip()
+                    )
+                    if match is not None:
+                        literal_arguments.append((position, match.group("value")))
+            references.add((
+                node.start_point[0] + 1,
+                receiver_name,
+                method,
+                tuple(literal_arguments),
+            ))
+        if not references:
+            return None
+        attributes = tuple(
+            (
+                f"{_TEMPLATE_INSTANCE_CALL_REFERENCE}{index:04d}",
+                json.dumps(
+                    {
+                        "line": line_number,
+                        "literalStringArguments": {
+                            str(position): value
+                            for position, value in literal_arguments
+                        },
+                        "method": method,
+                        "receiver": receiver,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+            for index, (
+                line_number,
+                receiver,
+                method,
+                literal_arguments,
+            ) in enumerate(sorted(references))
+        )
+        return SymbolDefinition(
+            qualified_name=f"template:{artifact.path}",
+            kind="template",
+            path=artifact.path,
+            line=min(reference[0] for reference in references),
+            attributes=attributes,
+        )
 
     def _namespace_for(self, declaration, source: bytes) -> str:
         namespace_node = _nearest(declaration, {"namespace_definition"})
@@ -2072,7 +2252,7 @@ class PhpRepositorySession:
         php_artifacts = tuple(
             artifact
             for artifact in artifacts
-            if artifact.path.casefold().endswith((".php", ".inc"))
+            if artifact.path.casefold().endswith((".php", ".phtml", ".inc"))
         )
         if not php_artifacts:
             return
@@ -2082,20 +2262,37 @@ class PhpRepositorySession:
         }
         parseable = tuple(
             artifact for artifact in php_artifacts
-            if not artifact.deleted and _DECLARATION_HINT.search(artifact.content)
+            if (
+                not artifact.deleted
+                and not artifact.path.casefold().endswith(".phtml")
+                and _DECLARATION_HINT.search(artifact.content)
+            )
         )
-        if not parseable:
+        templates = tuple(
+            artifact
+            for artifact in php_artifacts
+            if not artifact.deleted
+            and artifact.path.casefold().endswith(".phtml")
+        )
+        parse_jobs = (
+            *((_parse_artifact, artifact) for artifact in parseable),
+            *((_parse_template_artifact, artifact) for artifact in templates),
+        )
+        if not parse_jobs:
             return
         workers = self._parse_workers()
-        if workers == 1 or len(parseable) == 1:
-            parsed = tuple(_parse_artifact(artifact) for artifact in parseable)
+        if workers == 1 or len(parse_jobs) == 1:
+            parsed = tuple(parser(artifact) for parser, artifact in parse_jobs)
         else:
             if self._executor is None:
                 self._executor = ThreadPoolExecutor(
                     max_workers=workers,
                     thread_name_prefix="codecrow-php-ast",
                 )
-            parsed = tuple(self._executor.map(_parse_artifact, parseable))
+            parsed = tuple(self._executor.map(
+                lambda job: job[0](job[1]),
+                parse_jobs,
+            ))
         for symbols in parsed:
             self._symbols.update(symbols)
 

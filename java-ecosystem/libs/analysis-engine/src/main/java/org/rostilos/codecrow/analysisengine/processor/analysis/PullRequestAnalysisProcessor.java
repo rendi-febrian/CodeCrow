@@ -21,6 +21,7 @@ import org.rostilos.codecrow.analysisengine.dto.request.ai.enrichment.FileConten
 import org.rostilos.codecrow.analysisengine.dto.request.ai.enrichment.PrEnrichmentDataDto;
 import org.rostilos.codecrow.analysisengine.exception.AnalysisLockedException;
 import org.rostilos.codecrow.analysisengine.service.AnalysisLockService;
+import org.rostilos.codecrow.analysisengine.service.LocalRepositorySnapshotService;
 import org.rostilos.codecrow.analysisengine.service.PullRequestService;
 import org.rostilos.codecrow.commitgraph.service.AnalyzedCommitService;
 import org.rostilos.codecrow.analysisengine.service.vcs.VcsAiClientService;
@@ -74,6 +75,7 @@ public class PullRequestAnalysisProcessor {
     private final ApplicationEventPublisher eventPublisher;
     private final AnalyzedCommitService analyzedCommitService;
     private final VcsClientProvider vcsClientProvider;
+    private final LocalRepositorySnapshotService localRepositorySnapshotService;
     private final FileSnapshotService fileSnapshotService;
     private final PrIssueTrackingService prIssueTrackingService;
     private final AstScopeEnricher astScopeEnricher;
@@ -93,6 +95,7 @@ public class PullRequestAnalysisProcessor {
             AnalysisLockService analysisLockService,
             AnalyzedCommitService analyzedCommitService,
             VcsClientProvider vcsClientProvider,
+            LocalRepositorySnapshotService localRepositorySnapshotService,
             FileSnapshotService fileSnapshotService,
             PrIssueTrackingService prIssueTrackingService,
             AstScopeEnricher astScopeEnricher,
@@ -107,6 +110,7 @@ public class PullRequestAnalysisProcessor {
         this.eventPublisher = eventPublisher;
         this.analyzedCommitService = analyzedCommitService;
         this.vcsClientProvider = vcsClientProvider;
+        this.localRepositorySnapshotService = localRepositorySnapshotService;
         this.fileSnapshotService = fileSnapshotService;
         this.prIssueTrackingService = prIssueTrackingService;
         this.astScopeEnricher = astScopeEnricher;
@@ -242,10 +246,35 @@ public class PullRequestAnalysisProcessor {
                         project.getId(), request.getPullRequestId());
             }
 
-            Map<String, Object> aiResponse = aiAnalysisClient.performAnalysis(aiRequest, event -> {
-                log.debug("Received event from AI client: type={}", event.get("type"));
-                emitEvent(consumer, event);
-            });
+            Map<String, Object> aiResponse;
+            Optional<LocalRepositorySnapshotService.PreparedSnapshot> localSnapshot = Optional.empty();
+            if (!promptDryRun
+                    && aiRequest.getUseMcpTools()) {
+                VcsRepoInfo repository = ProjectVcsInfoRetriever.getVcsInfo(project);
+                localSnapshot = localRepositorySnapshotService.prepare(
+                        repository.getVcsConnection(),
+                        repository.getRepoWorkspace(),
+                        repository.getRepoSlug(),
+                        request.getTargetBranchName(),
+                        aiRequest.getTargetHeadCommitHash());
+            }
+
+            if (localSnapshot.isPresent()) {
+                try (LocalRepositorySnapshotService.PreparedSnapshot snapshot = localSnapshot.get()) {
+                    aiResponse = aiAnalysisClient.performAnalysis(
+                            aiRequest,
+                            snapshot.transport(),
+                            event -> {
+                                log.debug("Received event from AI client: type={}", event.get("type"));
+                                emitEvent(consumer, event);
+                            });
+                }
+            } else {
+                aiResponse = aiAnalysisClient.performAnalysis(aiRequest, event -> {
+                    log.debug("Received event from AI client: type={}", event.get("type"));
+                    emitEvent(consumer, event);
+                });
+            }
             requireConfirmedLease(lockLease);
 
             if (AiAnalysisClient.isPromptDryRunResult(aiResponse)) {
@@ -745,6 +774,7 @@ public class PullRequestAnalysisProcessor {
     private Map<String, String> reviewIdentityInputs(AiAnalysisRequest request) {
         TreeMap<String, String> inputs = new TreeMap<>();
         putIdentity(inputs, "baseCommit", request.getBaseCommitHash());
+        putIdentity(inputs, "targetHeadCommit", request.getTargetHeadCommitHash());
         putIdentity(inputs, "headCommit", request.getCurrentCommitHash());
         putIdentity(inputs, "previousCommit", request.getPreviousCommitHash());
         putIdentity(inputs, "targetBranch", request.getTargetBranchName());

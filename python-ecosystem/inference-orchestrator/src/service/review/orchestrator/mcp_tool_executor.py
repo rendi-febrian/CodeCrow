@@ -62,6 +62,7 @@ class McpToolExecutor:
         self.review_revision = str(review_revision or "").strip()
         self.verification_issues = dict(verification_issues or {})
         self._lock = asyncio.Lock()
+        self._vcs_session = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -120,7 +121,8 @@ class McpToolExecutor:
         )
 
         try:
-            result = await self.client.session.call_tool(tool_name, arguments)
+            session = await self._get_vcs_session()
+            result = await session.call_tool(tool_name, arguments)
             # Extract text content from MCP result
             if hasattr(result, "content"):
                 text = "\n".join(
@@ -169,6 +171,37 @@ class McpToolExecutor:
                 {"tool": tool_name, "args": arguments, "success": False, "error": str(e)}
             )
             return f"Tool call failed: {e}"
+
+    async def _get_vcs_session(self):
+        """Resolve the named VCS session exposed by the current MCP client."""
+        if self._vcs_session is not None:
+            return self._vcs_session
+
+        get_sessions = getattr(self.client, "get_all_active_sessions", None)
+        if callable(get_sessions):
+            sessions = get_sessions()
+            if isinstance(sessions, dict) and not sessions:
+                sessions = await self.client.create_all_sessions()
+            if isinstance(sessions, dict):
+                self._vcs_session = sessions.get("codecrow-vcs-mcp")
+                if self._vcs_session is None:
+                    self._vcs_session = next(
+                        (
+                            session
+                            for name, session in sessions.items()
+                            if "vcs" in str(name).casefold()
+                        ),
+                        None,
+                    )
+                if self._vcs_session is not None:
+                    return self._vcs_session
+
+        # Compatibility with the previous client wrapper and focused doubles.
+        legacy_session = getattr(self.client, "session", None)
+        if legacy_session is not None:
+            self._vcs_session = legacy_session
+            return legacy_session
+        raise RuntimeError("VCS MCP session is unavailable")
 
     def get_tool_definitions(self) -> List[Dict[str, Any]]:
         """Return OpenAI-compatible function definitions for allowed tools."""

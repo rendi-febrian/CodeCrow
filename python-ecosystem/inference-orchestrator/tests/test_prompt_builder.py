@@ -136,6 +136,27 @@ class TestBuildStage1:
         )
         assert "RAG data here" in result
 
+    def test_agent_prompt_keeps_rag_and_supplies_repository_tool_binding(self):
+        result = PromptBuilder.build_stage_1_batch_prompt(
+            files=[{"path": "a.py", "diff": "+x"}],
+            priority="HIGH",
+            rag_context="preassembled RAG evidence",
+            use_mcp_tools=True,
+            target_branch="main",
+            vcs_workspace="tenant",
+            vcs_repo_slug="repository",
+        )
+
+        assert "preassembled RAG evidence" in result
+        assert "searchRepositoryCode" in result
+        assert (
+            "getBranchFileContent(workspace, repoSlug, branch, filePath, startLine?,"
+            in result
+        )
+        assert "TARGET BRANCH/REVISION REF: main" in result
+        assert "VCS WORKSPACE: tenant" in result
+        assert "VCS REPOSITORY (repoSlug/projectKey): repository" in result
+
     def test_with_all_pr_files(self):
         files = [{"path": "a.py", "diff": "+x"}]
         result = PromptBuilder.build_stage_1_batch_prompt(
@@ -143,6 +164,20 @@ class TestBuildStage1:
             all_pr_files=["a.py", "b.py", "c.py"],
         )
         assert "b.py" in result or "OTHER FILES" in result
+
+    def test_other_pr_file_scaffold_is_bounded(self):
+        files = [{"path": "current.py", "diff": "+x"}]
+        other_files = [f"peer-{index:03d}.py" for index in range(50)]
+
+        result = PromptBuilder.build_stage_1_batch_prompt(
+            files=files,
+            priority="HIGH",
+            all_pr_files=["current.py", *other_files],
+        )
+
+        assert "peer-019.py" in result
+        assert "peer-020.py" not in result
+        assert "... and 30 more files" in result
 
     def test_with_deleted_files(self):
         files = [{"path": "a.py", "diff": "+x"}]
@@ -152,6 +187,19 @@ class TestBuildStage1:
         )
         assert "DELETED" in result
         assert "old.py" in result
+
+    def test_deleted_file_scaffold_is_bounded(self):
+        deleted = [f"deleted-{index:03d}.py" for index in range(60)]
+
+        result = PromptBuilder.build_stage_1_batch_prompt(
+            files=[{"path": "a.py", "diff": "+x"}],
+            priority="HIGH",
+            deleted_files=deleted,
+        )
+
+        assert "deleted-029.py" in result
+        assert "deleted-030.py" not in result
+        assert "... and 30 more" in result
 
     def test_project_rules(self):
         files = [{"path": "a.py", "diff": "+x"}]
@@ -277,7 +325,7 @@ class TestBuildStage2:
         assert "baseline bug described by the task/PR" in result
         assert "Different valid implementation techniques are not" in result
         assert "hypotheses, not findings" in result
-        assert "newly added fix as duplication" in result
+        assert "speculate that similar code" in result
         assert "already-applied fixes belong" in result
         assert "Different styles or" in result
         assert "DATA_INTEGRITY" not in result

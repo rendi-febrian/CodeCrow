@@ -1,294 +1,402 @@
-"""
-Tests for rag_pipeline.services — RAGQueryBase, SemanticSearchMixin,
-DeterministicContextMixin, PRContextMixin.
-"""
-import pytest
-from types import SimpleNamespace
-from unittest.mock import patch, MagicMock, PropertyMock
+"""Unit coverage for deterministic structural code search."""
+
+from unittest.mock import MagicMock
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, PointStruct, Record, VectorParams
+
+import rag_pipeline.services.code_search as code_search_module
+from rag_pipeline.services.code_search import CodeSearchMixin
 
 
-def _mock_config(**overrides):
-    """Create a mock RAGConfig for service tests."""
-    cfg = MagicMock()
-    cfg.qdrant_url = overrides.get("qdrant_url", "http://localhost:6333")
-    cfg.qdrant_api_key = overrides.get("qdrant_api_key", None)
-    cfg.qdrant_collection_prefix = overrides.get("qdrant_collection_prefix", "rag")
-    cfg.embedding_provider = overrides.get("embedding_provider", "ollama")
-    cfg.embedding_dim = overrides.get("embedding_dim", 768)
-    cfg.embedding_supports_instructions = overrides.get("embedding_supports_instructions", False)
-    cfg.ollama_model = "nomic-embed-text"
-    cfg.ollama_base_url = "http://localhost:11434"
-    cfg.openrouter_api_key = "sk-test"
-    cfg.openrouter_model = "openai/text-embedding-3-small"
-    cfg.openrouter_base_url = "https://openrouter.ai/api/v1"
-    return cfg
+def _service_with_points():
+    client = QdrantClient(":memory:")
+    client.create_collection(
+        "generation",
+        vectors_config=VectorParams(size=1, distance=Distance.DOT),
+    )
+    client.upsert("generation", points=[
+        PointStruct(id=1, vector=[1.0], payload={
+            "workspace": "ws",
+            "project": "project",
+            "branch": "main",
+            "commit": "revision",
+            "path": "src/UserService.py",
+            "text": "class UserService: pass",
+            "primary_name": "UserService",
+            "symbol_names": ["UserService"],
+            "search_terms": ["class", "service", "user", "userservice"],
+            "structural_record_type": "structural_unit",
+        }),
+        PointStruct(id=2, vector=[1.0], payload={
+            "workspace": "other-tenant",
+            "project": "project",
+            "branch": "main",
+            "commit": "revision",
+            "path": "src/UserService.py",
+            "text": "class UserService: pass",
+            "search_terms": ["userservice"],
+            "structural_record_type": "structural_unit",
+        }),
+        PointStruct(id=3, vector=[1.0], payload={
+            "workspace": "ws",
+            "project": "project",
+            "branch": "main",
+            "commit": "revision",
+            "path": "__analysis_state__/repository-facts/000000.state",
+            "text": "userservice",
+            "search_terms": ["userservice"],
+            "structural_record_type": "repository_facts",
+        }),
+    ], wait=True)
+    service = CodeSearchMixin()
+    service.qdrant_client = client
+    service._collection_or_alias_exists = MagicMock(return_value=True)
+    service._observe_branches = MagicMock()
+    return service
 
 
-# ─────────────────────────────────────────────────────────────
-# RAGQueryBase
-# ─────────────────────────────────────────────────────────────
-class TestRAGQueryBase:
-
-    @patch("rag_pipeline.services.base.create_embedding_model")
-    @patch("rag_pipeline.services.base.get_embedding_model_info")
-    @patch("rag_pipeline.services.base.QdrantClient")
-    def test_init(self, MockQdrant, mock_info, mock_create):
-        from rag_pipeline.services.base import RAGQueryBase
-
-        mock_info.return_value = {"provider": "ollama", "type": "local"}
-        mock_create.return_value = MagicMock()
-
-        config = _mock_config()
-        base = RAGQueryBase(config)
-
-        assert base.config is config
-        MockQdrant.assert_called_once_with(
-            url="http://localhost:6333",
-            api_key=None,
-            timeout=30,
-        )
-        assert base.qdrant_client is not None
-        assert base.embed_model is not None
-
-        base.close()
-        MockQdrant.return_value.close.assert_called_once_with()
-
-    @patch("rag_pipeline.services.base.create_embedding_model")
-    @patch("rag_pipeline.services.base.get_embedding_model_info")
-    @patch("rag_pipeline.services.base.QdrantClient")
-    def test_collection_or_alias_exists_true(self, MockQdrant, mock_info, mock_create):
-        from rag_pipeline.services.base import RAGQueryBase
-
-        mock_info.return_value = {"provider": "ollama", "type": "local"}
-        mock_create.return_value = MagicMock()
-
-        config = _mock_config()
-        base = RAGQueryBase(config)
-
-        mock_collection = MagicMock()
-        mock_collection.name = "test_collection"
-        base.qdrant_client.get_collections.return_value.collections = [mock_collection]
-        base.qdrant_client.get_aliases.return_value.aliases = []
-
-        assert base._collection_or_alias_exists("test_collection") is True
-
-    @patch("rag_pipeline.services.base.create_embedding_model")
-    @patch("rag_pipeline.services.base.get_embedding_model_info")
-    @patch("rag_pipeline.services.base.QdrantClient")
-    def test_collection_or_alias_exists_false(self, MockQdrant, mock_info, mock_create):
-        from rag_pipeline.services.base import RAGQueryBase
-
-        mock_info.return_value = {"provider": "ollama", "type": "local"}
-        mock_create.return_value = MagicMock()
-
-        config = _mock_config()
-        base = RAGQueryBase(config)
-
-        base.qdrant_client.get_collections.return_value.collections = []
-        base.qdrant_client.get_aliases.return_value.aliases = []
-
-        assert base._collection_or_alias_exists("nonexistent") is False
-
-    @patch("rag_pipeline.services.base.create_embedding_model")
-    @patch("rag_pipeline.services.base.get_embedding_model_info")
-    @patch("rag_pipeline.services.base.QdrantClient")
-    def test_get_project_collection_name(self, MockQdrant, mock_info, mock_create):
-        from rag_pipeline.services.base import RAGQueryBase
-
-        mock_info.return_value = {"provider": "ollama", "type": "local"}
-        mock_create.return_value = MagicMock()
-
-        config = _mock_config(qdrant_collection_prefix="rag")
-        base = RAGQueryBase(config)
-
-        name = base._get_project_collection_name("workspace1", "project1")
-        assert name.startswith("rag_")
-
-    @patch("rag_pipeline.services.base.create_embedding_model")
-    @patch("rag_pipeline.services.base.get_embedding_model_info")
-    @patch("rag_pipeline.services.base.QdrantClient")
-    def test_plugin_identity_fingerprints_do_not_filter_stored_points(
-        self, MockQdrant, mock_info, mock_create
-    ):
-        from rag_pipeline.services.base import RAGQueryBase
-
-        mock_info.return_value = {"provider": "ollama", "type": "local"}
-        mock_create.return_value = MagicMock()
-        catalog = MagicMock()
-        catalog.registry.fingerprint_for.return_value = "sha256:descriptor"
-        catalog.implementation_fingerprint.return_value = "sha256:implementation"
-        base = RAGQueryBase(_mock_config(), plugin_catalog=catalog)
-        legacy = SimpleNamespace(payload={
-            "plugin_ids": ["python", "fastapi"],
-            "plugin_descriptor_fingerprint": "sha256:other-descriptor",
-            "plugin_implementation_fingerprint": "sha256:old",
-            "index_representation_fingerprint": "sha256:older-host",
-        })
-
-        assert base._accept_stored_points([legacy]) == [legacy]
-        catalog.registry.fingerprint_for.assert_not_called()
-        catalog.implementation_fingerprint.assert_not_called()
-
-
-class TestRAGQueryService:
-
-    @patch("rag_pipeline.services.base.create_embedding_model")
-    @patch("rag_pipeline.services.base.get_embedding_model_info")
-    @patch("rag_pipeline.services.base.QdrantClient")
-    def test_facade_forwards_plugin_catalog(
-        self, MockQdrant, mock_info, mock_create
-    ):
-        from rag_pipeline.services.query_service import RAGQueryService
-
-        mock_info.return_value = {"provider": "ollama", "type": "local"}
-        mock_create.return_value = MagicMock()
-        catalog = MagicMock()
-
-        service = RAGQueryService(_mock_config(), plugin_catalog=catalog)
-
-        assert service.plugin_catalog is catalog
-        point = SimpleNamespace(payload={
-            "plugin_descriptor_fingerprint": "sha256:legacy",
-        })
-        assert service._accept_stored_points([point]) == [point]
-
-
-# ─────────────────────────────────────────────────────────────
-# SemanticSearchMixin._dedupe_by_branch_priority
-# ─────────────────────────────────────────────────────────────
-class TestSemanticSearchDedup:
-
-    def test_dedupe_empty_results(self):
-        from rag_pipeline.services.semantic_search import SemanticSearchMixin
-
-        mixin = SemanticSearchMixin()
-        result = mixin._dedupe_by_branch_priority([], "feature")
-        assert result == []
-
-    def test_dedupe_prefers_target_branch(self):
-        from rag_pipeline.services.semantic_search import SemanticSearchMixin
-
-        mixin = SemanticSearchMixin()
-        results = [
-            {"text": "code A", "score": 0.8, "metadata": {"path": "a.py", "branch": "main"}},
-            {"text": "code A new", "score": 0.9, "metadata": {"path": "a.py", "branch": "feature"}},
-        ]
-        deduped = mixin._dedupe_by_branch_priority(results, "feature")
-        # Should keep feature branch version for same path
-        feature_results = [r for r in deduped if r["metadata"]["branch"] == "feature"]
-        assert len(feature_results) >= 1
-
-    def test_search_post_filters_boolean_plugin_points(self):
-        from rag_pipeline.services.semantic_search import SemanticSearchMixin
-
-        semantic_node = SimpleNamespace(
-            node=SimpleNamespace(text="class Service {}", metadata={
-                "path": "src/Service.java",
+def _service_with_many_matching_points(count: int):
+    client = QdrantClient(":memory:")
+    client.create_collection(
+        "generation",
+        vectors_config=VectorParams(size=1, distance=Distance.DOT),
+    )
+    client.upsert(
+        "generation",
+        points=[
+            PointStruct(id=index + 1, vector=[1.0], payload={
+                "workspace": "ws",
+                "project": "project",
                 "branch": "main",
-            }),
-            score=0.9,
+                "commit": "revision",
+                "path": f"src/match_{index:03d}.py",
+                "text": f"def shared_identifier_{index}(): pass",
+                "primary_name": f"shared_identifier_{index}",
+                "search_terms": ["shared", "identifier"],
+                "structural_record_type": "structural_unit",
+                "start_line": index + 1,
+            })
+            for index in range(count)
+        ],
+        wait=True,
+    )
+    service = CodeSearchMixin()
+    service.qdrant_client = client
+    service._collection_or_alias_exists = MagicMock(return_value=True)
+    service._observe_branches = MagicMock()
+    return service
+
+
+def test_code_search_is_tenant_revision_bound_and_excludes_opaque_state():
+    service = _service_with_points()
+    response = service.search_code(
+        query="UserService",
+        workspace="ws",
+        project="project",
+        branch="main",
+        repository_revision="revision",
+        collection_target="generation",
+        limit=None,
+    )
+    results = response["results"]
+
+    assert [result["path"] for result in results] == ["src/UserService.py"]
+    assert response["coverage"]["complete"] is True
+    assert "score" not in results[0]
+    assert "max_score" not in results[0]
+    assert "_ordering_key" not in results[0]
+    assert results[0]["match_reasons"] == [
+        "exact indexed token: service, user, userservice",
+        "identifier token: service, user, userservice",
+        "path token: service, user, userservice",
+        "exact identifier",
+        "exact query substring in path",
+        "exact query substring in source",
+    ]
+
+
+def test_code_search_returns_no_probability_for_missing_exact_token():
+    service = _service_with_points()
+    response = service.search_code(
+        query="OrderRepository",
+        workspace="ws",
+        project="project",
+        branch="main",
+        repository_revision="revision",
+        collection_target="generation",
+        limit=None,
+    )
+    assert response["results"] == []
+    assert response["coverage"]["complete"] is True
+
+
+def test_code_search_omitted_limit_returns_every_matching_record_once():
+    service = _service_with_many_matching_points(150)
+
+    response = service.search_code(
+        query="shared identifier",
+        workspace="ws",
+        project="project",
+        branch="main",
+        repository_revision="revision",
+        collection_target="generation",
+        limit=None,
+    )
+
+    assert response["coverage"]["complete"] is True
+    assert response["coverage"]["matching_results"] == 150
+    assert response["coverage"]["returned_results"] == 150
+    assert len(response["results"]) == 150
+    assert len({result["id"] for result in response["results"]}) == 150
+    assert {result["path"] for result in response["results"]} == {
+        f"src/match_{index:03d}.py" for index in range(150)
+    }
+
+
+def test_code_search_explicit_limit_is_observable_as_partial():
+    service = _service_with_many_matching_points(20)
+
+    response = service.search_code(
+        query="shared identifier",
+        workspace="ws",
+        project="project",
+        branch="main",
+        repository_revision="revision",
+        collection_target="generation",
+        limit=8,
+    )
+
+    assert len(response["results"]) == 8
+    assert response["coverage"]["complete"] is False
+    assert response["coverage"]["matching_results"] == 20
+    assert response["coverage"]["returned_results"] == 8
+    assert response["coverage"]["partial_reasons"] == [
+        "explicit_result_limit"
+    ]
+
+
+def test_code_search_deduplicates_point_identity_across_pages(monkeypatch):
+    monkeypatch.setattr(
+        code_search_module,
+        "DETERMINISTIC_MAX_MATCHING_POINTS",
+        5,
+    )
+    shared_payload = {
+        "workspace": "ws",
+        "project": "project",
+        "branch": "main",
+        "commit": "revision",
+        "search_terms": ["shared"],
+        "structural_record_type": "source_chunk",
+    }
+    first = Record(
+        id=1,
+        payload={**shared_payload, "path": "src/first.py", "text": "shared"},
+    )
+    second = Record(
+        id=2,
+        payload={**shared_payload, "path": "src/second.py", "text": "shared"},
+    )
+    third = Record(
+        id=3,
+        payload={**shared_payload, "path": "src/third.py", "text": "shared"},
+    )
+    service = CodeSearchMixin()
+    service.qdrant_client = MagicMock()
+    service.qdrant_client.scroll.side_effect = [
+        ([first, second], "next"),
+        ([second, third], None),
+    ]
+    service._collection_or_alias_exists = MagicMock(return_value=True)
+    service._observe_branches = MagicMock()
+
+    response = service.search_code(
+        query="shared",
+        workspace="ws",
+        project="project",
+        branch="main",
+        repository_revision="revision",
+        collection_target="generation",
+        limit=None,
+    )
+
+    assert [result["id"] for result in response["results"]] == ["1", "2", "3"]
+    assert response["coverage"]["complete"] is True
+    assert response["coverage"]["matching_points_scanned"] == 4
+    assert response["coverage"]["unique_matching_points"] == 3
+
+
+def test_code_search_never_admits_more_than_global_point_budget(monkeypatch):
+    monkeypatch.setattr(
+        code_search_module,
+        "DETERMINISTIC_MAX_MATCHING_POINTS",
+        3,
+    )
+    payload = {
+        "workspace": "ws",
+        "project": "project",
+        "branch": "main",
+        "commit": "revision",
+        "search_terms": ["shared"],
+        "structural_record_type": "source_chunk",
+        "text": "shared",
+    }
+    records = [
+        Record(id=index, payload={**payload, "path": f"src/{index}.py"})
+        for index in range(1, 5)
+    ]
+    service = CodeSearchMixin()
+    service.qdrant_client = MagicMock()
+    # The second page deliberately violates its requested one-record page size.
+    # Admission still stops at the global matching-point budget.
+    service.qdrant_client.scroll.side_effect = [
+        (records[:2], "next"),
+        (records[2:], "more"),
+    ]
+    service._collection_or_alias_exists = MagicMock(return_value=True)
+    service._observe_branches = MagicMock()
+
+    response = service.search_code(
+        query="shared",
+        workspace="ws",
+        project="project",
+        branch="main",
+        repository_revision="revision",
+        collection_target="generation",
+        limit=None,
+    )
+
+    assert len(response["results"]) == 3
+    assert response["coverage"]["matching_points_scanned"] == 3
+    assert response["coverage"]["unique_matching_points"] == 3
+    assert response["coverage"]["complete"] is False
+    assert response["coverage"]["partial_reasons"] == [
+        "global_matching_point_limit"
+    ]
+    assert [call.kwargs["limit"] for call in service.qdrant_client.scroll.call_args_list] == [
+        3,
+        1,
+    ]
+
+
+def test_code_search_batches_and_processes_every_query_term_without_duplication():
+    terms = [f"q{index:03d}" for index in range(150)]
+    client = QdrantClient(":memory:")
+    client.create_collection(
+        "generation",
+        vectors_config=VectorParams(size=1, distance=Distance.DOT),
+    )
+    base_payload = {
+        "workspace": "ws",
+        "project": "project",
+        "branch": "main",
+        "commit": "revision",
+        "structural_record_type": "source_chunk",
+    }
+    client.upsert("generation", points=[
+        PointStruct(id=1, vector=[1.0], payload={
+            **base_payload,
+            "path": "src/重复_界.py",
+            "text": "q000 q149 完整证据",
+            # This point is returned by both disjoint term batches and must be
+            # admitted only once by point identity.
+            "search_terms": [terms[0], terms[-1]],
+        }),
+        PointStruct(id=2, vector=[1.0], payload={
+            **base_payload,
+            "path": "src/末尾_界.py",
+            "text": "q149 尾部证据",
+            "search_terms": [terms[-1]],
+        }),
+    ], wait=True)
+    service = CodeSearchMixin()
+    service.qdrant_client = client
+    service.qdrant_client.scroll = MagicMock(wraps=client.scroll)
+    service._collection_or_alias_exists = MagicMock(return_value=True)
+    service._observe_branches = MagicMock()
+
+    response = service.search_code(
+        query=" ".join(terms),
+        workspace="ws",
+        project="project",
+        branch="main",
+        repository_revision="revision",
+        collection_target="generation",
+        limit=None,
+    )
+
+    assert response["coverage"] == {
+        "complete": True,
+        "partial_reasons": [],
+        "matching_points_scanned": 3,
+        "unique_matching_points": 2,
+        "global_matching_point_limit": min(
+            5000, code_search_module.DETERMINISTIC_MAX_MATCHING_POINTS
+        ),
+        "query_term_count": 150,
+        "query_term_batch_size": 128,
+        "query_term_batches": 2,
+        "processed_query_term_batches": 2,
+        "completed_query_term_batches": 2,
+        "matching_results": 2,
+        "returned_results": 2,
+    }
+    assert [result["id"] for result in response["results"]] == ["1", "2"]
+
+    filtered_batches = []
+    for call in service.qdrant_client.scroll.call_args_list:
+        search_filter = call.kwargs["scroll_filter"]
+        term_condition = next(
+            condition
+            for condition in search_filter.must
+            if condition.key == "search_terms"
         )
-        architecture_node = SimpleNamespace(
-            node=SimpleNamespace(text="opaque snapshot", metadata={
-                "path": "__architecture__/spring",
-                "branch": "main",
-                "repository_snapshot": True,
-            }),
-            score=1.0,
-        )
-        retriever = MagicMock()
-        retriever.retrieve.return_value = [architecture_node, semantic_node]
-        index = MagicMock()
-        index.as_retriever.return_value = retriever
-        mixin = SemanticSearchMixin()
-        mixin._get_project_collection_name = MagicMock(return_value="rag_ws__project")
-        mixin._collection_or_alias_exists = MagicMock(return_value=True)
-        mixin._get_or_create_index = MagicMock(return_value=index)
-        mixin._observe_branches = MagicMock()
-        mixin._supports_instructions = False
-        results = mixin.semantic_search_multi_branch(
-            query="service",
-            workspace="ws",
-            project="project",
-            branches=["main"],
-            top_k=2,
-        )
-
-        assert [result["metadata"]["path"] for result in results] == [
-            "src/Service.java"
-        ]
-        assert index.as_retriever.call_args.kwargs["similarity_top_k"] == 8
-        filters = index.as_retriever.call_args.kwargs["filters"].filters
-        assert [metadata_filter.key for metadata_filter in filters] == ["branch"]
-
-    def test_search_does_not_filter_results_by_plugin_build_identity(self):
-        from rag_pipeline.services.semantic_search import SemanticSearchMixin
-
-        stale_node = SimpleNamespace(
-            node=SimpleNamespace(text="stale", metadata={
-                "path": "src/Stale.py",
-                "branch": "feature",
-                "compatible": False,
-            }),
-            score=1.0,
-        )
-        current_node = SimpleNamespace(
-            node=SimpleNamespace(text="current", metadata={
-                "path": "src/Current.py",
-                "branch": "main",
-                "compatible": True,
-            }),
-            score=0.9,
-        )
-        retriever = MagicMock()
-        retriever.retrieve.return_value = [stale_node, current_node]
-        index = MagicMock()
-        index.as_retriever.return_value = retriever
-        mixin = SemanticSearchMixin()
-        mixin._get_project_collection_name = MagicMock(return_value="rag_ws__project")
-        mixin._collection_or_alias_exists = MagicMock(return_value=True)
-        mixin._get_or_create_index = MagicMock(return_value=index)
-        mixin._observe_branches = MagicMock()
-        mixin._supports_instructions = False
-        results = mixin.semantic_search_multi_branch(
-            query="service",
-            workspace="ws",
-            project="project",
-            branches=["feature", "main"],
-            top_k=1,
-        )
-
-        assert [result["text"] for result in results] == ["stale", "current"]
+        filtered_batches.append(list(term_condition.match.any))
+    assert [len(batch) for batch in filtered_batches] == [128, 22]
+    assert [term for batch in filtered_batches for term in batch] == terms
 
 
-# ─────────────────────────────────────────────────────────────
-# PRContextMixin — _infer_primary_ecosystem (module-level function)
-# ─────────────────────────────────────────────────────────────
-class TestInferPrimaryEcosystem:
+def test_code_search_reports_global_safety_before_unprocessed_term_batches(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        code_search_module,
+        "DETERMINISTIC_MAX_MATCHING_POINTS",
+        1,
+    )
+    terms = [f"q{index:03d}" for index in range(150)]
+    record = Record(id=1, payload={
+        "workspace": "ws",
+        "project": "project",
+        "branch": "main",
+        "commit": "revision",
+        "path": "src/完整_界.py",
+        "text": terms[0],
+        "search_terms": [terms[0]],
+        "structural_record_type": "source_chunk",
+    })
+    service = CodeSearchMixin()
+    service.qdrant_client = MagicMock()
+    service.qdrant_client.scroll.return_value = ([record], None)
+    service._collection_or_alias_exists = MagicMock(return_value=True)
+    service._observe_branches = MagicMock()
 
-    def test_python_ecosystem(self):
-        from rag_pipeline.services.pr_context import _infer_primary_ecosystem
+    response = service.search_code(
+        query=" ".join(terms),
+        workspace="ws",
+        project="project",
+        branch="main",
+        repository_revision="revision",
+        collection_target="generation",
+        limit=None,
+    )
 
-        files = ["src/main.py", "src/utils.py", "tests/test_main.py"]
-        result = _infer_primary_ecosystem(files)
-        assert result == "python"
-
-    def test_mixed_ecosystem_returns_none(self):
-        from rag_pipeline.services.pr_context import _infer_primary_ecosystem
-
-        files = ["Main.java", "app.py", "index.ts"]
-        result = _infer_primary_ecosystem(files)
-        # Mixed — no dominant ecosystem (< 70%)
-        assert result is None
-
-    def test_jvm_ecosystem(self):
-        from rag_pipeline.services.pr_context import _infer_primary_ecosystem
-
-        files = ["src/Main.java", "src/Service.java", "src/Repo.java", "build.gradle"]
-        result = _infer_primary_ecosystem(files)
-        assert result == "jvm"
-
-    def test_empty_files(self):
-        from rag_pipeline.services.pr_context import _infer_primary_ecosystem
-
-        assert _infer_primary_ecosystem([]) is None
+    assert response["coverage"]["complete"] is False
+    assert response["coverage"]["partial_reasons"] == [
+        "global_matching_point_limit"
+    ]
+    assert response["coverage"]["query_term_batches"] == 2
+    assert response["coverage"]["processed_query_term_batches"] == 1
+    assert response["coverage"]["completed_query_term_batches"] == 1
+    service.qdrant_client.scroll.assert_called_once()

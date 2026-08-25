@@ -21,7 +21,7 @@ PROMPT_LOG_MAX_FILES = int(os.environ.get("PROMPT_LOG_MAX_FILES", "50"))
 class PromptLogger:
     """
     Logger for debugging full prompts sent to LLM.
-    Useful for debugging RAG context, reranking, and Lost-in-Middle protection.
+    Useful for debugging repository context and Lost-in-Middle protection.
     """
     
     @classmethod
@@ -37,7 +37,7 @@ class PromptLogger:
         Args:
             prompt: The full prompt text
             metadata: Optional metadata (workspace, repo, PR, model, etc.)
-            stage: Stage identifier (e.g., "full_prompt", "rag_context", "reranked")
+            stage: Stage identifier (e.g., "full_prompt", "repository_context")
             
         Returns:
             Path to log file if written, None otherwise
@@ -139,17 +139,15 @@ class PromptLogger:
         
         for i, chunk in enumerate(relevant_code):
             path = chunk.get("metadata", {}).get("path", "unknown")
-            score = chunk.get("score", 0)
-            priority = chunk.get("_priority", "MEDIUM")
-            boost_reason = chunk.get("_boost_reason", "none")
+            match_type = chunk.get("_match_type", "structural")
+            source = chunk.get("_source", "repository_index")
             text_preview = chunk.get("text", "")[:200].replace("\n", "\\n")
             
             lines.extend([
                 f"\n--- Chunk {i+1} ---",
                 f"  Path: {path}",
-                f"  Score: {score:.4f}",
-                f"  Priority: {priority}",
-                f"  Boost reason: {boost_reason}",
+                f"  Match type: {match_type}",
+                f"  Source: {source}",
                 f"  Preview: {text_preview}...",
             ])
         

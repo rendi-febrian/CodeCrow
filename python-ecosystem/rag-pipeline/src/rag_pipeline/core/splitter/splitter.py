@@ -5,7 +5,7 @@ This module provides true AST-aware code chunking that:
 1. Uses Tree-sitter queries for efficient pattern matching (15+ languages)
 2. Splits code into semantic units (classes, functions, methods)
 3. Uses RecursiveCharacterTextSplitter for oversized chunks
-4. Enriches metadata for better RAG retrieval
+4. Enriches metadata for deterministic structural retrieval
 5. Maintains parent context ("breadcrumbs") for nested structures
 6. Uses deterministic IDs for Qdrant deduplication
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
-from llama_index.core.schema import Document as LlamaDocument, TextNode
+from ..documents import Document, TextNode
 
 from .languages import (
     EXTENSION_TO_LANGUAGE, AST_SUPPORTED_LANGUAGES, LANGUAGE_TO_TREESITTER,
@@ -30,10 +30,22 @@ from .metadata import MetadataExtractor, ContentType, ChunkMetadata
 logger = logging.getLogger(__name__)
 
 
+def _stable_unique_strings(values: List[str]) -> List[str]:
+    """Deduplicate metadata values while retaining AST/query source order."""
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
 def generate_deterministic_id(path: str, content: str, chunk_index: int = 0) -> str:
     """
     Generate a deterministic ID for a chunk based on file path and content.
-    
+
     This ensures the same code chunk always gets the same ID, preventing
     duplicates in Qdrant during re-indexing.
     """
@@ -53,158 +65,196 @@ class ASTChunk:
     content_type: ContentType
     language: str
     path: str
-    
+
     # Identity
-    semantic_names: List[str] = field(default_factory=list)
+    symbol_names: List[str] = field(default_factory=list)
     node_type: Optional[str] = None
     namespace: Optional[str] = None
-    
+
     # Location
     start_line: int = 0
     end_line: int = 0
-    
+
     # Hierarchy & Context
     parent_context: List[str] = field(default_factory=list)  # Breadcrumb path
-    
+
     # Documentation
     docstring: Optional[str] = None
     signature: Optional[str] = None
-    
+
     # Type relationships
     extends: List[str] = field(default_factory=list)
     implements: List[str] = field(default_factory=list)
-    
+
     # Dependencies
     imports: List[str] = field(default_factory=list)
-    
+
     # --- RICH AST FIELDS (extracted from tree-sitter) ---
-    
+
     # Methods/functions within this chunk (for classes)
     methods: List[str] = field(default_factory=list)
-    
+
     # Properties/fields within this chunk (for classes)
     properties: List[str] = field(default_factory=list)
-    
+
     # Parameters (for functions/methods)
     parameters: List[str] = field(default_factory=list)
-    
+
     # Return type (for functions/methods)
     return_type: Optional[str] = None
-    
+
     # Decorators/annotations
     decorators: List[str] = field(default_factory=list)
-    
+
     # Modifiers (public, private, static, async, abstract, etc.)
     modifiers: List[str] = field(default_factory=list)
-    
+
     # Called functions/methods (dependencies)
     calls: List[str] = field(default_factory=list)
-    
+
     # Referenced types (type annotations, generics)
     referenced_types: List[str] = field(default_factory=list)
-    
+
     # Variables declared in this chunk
     variables: List[str] = field(default_factory=list)
-    
+
     # Constants defined
     constants: List[str] = field(default_factory=list)
-    
+
     # Generic type parameters (e.g., <T, U>)
     type_parameters: List[str] = field(default_factory=list)
+
+    # Explicit signal that structural metadata was admitted only partially.
+    metadata_partial_reasons: List[str] = field(default_factory=list)
 
 
 class ASTCodeSplitter:
     """
     AST-based code splitter using Tree-sitter queries for accurate parsing.
-    
+
     Features:
     - Uses .scm query files for declarative pattern matching
     - Splits code into semantic units (classes, functions, methods)
     - Falls back to RecursiveCharacterTextSplitter when needed
     - Uses deterministic IDs for Qdrant deduplication
-    - Enriches metadata for improved RAG retrieval
-    - Prepares embedding-optimized text with semantic context
-    
-    Chunk Size Strategy:
-    - text-embedding-3-small supports ~8191 tokens (~32K chars)
-    - We use 8000 chars as default to keep semantic units intact
-    - Only truly massive classes/functions get split
-    - Splitting loses AST benefits, so we avoid it when possible
-    
+    - Enriches metadata for deterministic structural retrieval
+
+    Chunk Size Strategy keeps most semantic units intact and splits only
+    unusually large classes or functions.
+
     Usage:
         splitter = ASTCodeSplitter(max_chunk_size=8000)
         nodes = splitter.split_documents(documents)
     """
-    
-    # Chunk size considerations:
-    # - Embedding models (text-embedding-3-small): ~8191 tokens = ~32K chars
-    # - Most classes/functions: 500-5000 chars
-    # - Keeping semantic units whole improves retrieval quality
-    # - Only split when absolutely necessary
+
+    # Most classes/functions are 500-5000 characters. Keep semantic units
+    # whole and split only when required by storage and prompt-size bounds.
     DEFAULT_MAX_CHUNK_SIZE = 8000  # ~2000 tokens, fits most semantic units
     DEFAULT_MIN_CHUNK_SIZE = 100
     DEFAULT_CHUNK_OVERLAP = 200
     DEFAULT_PARSER_THRESHOLD = 3  # Low threshold - AST benefits even small files
     RICH_AST_TRAVERSAL_UNSAFE_LANGUAGES = {"java"}
-    
+    RICH_AST_MAX_DEPTH = 10
+    METADATA_LIST_LIMITS = {
+        "symbol_names": 30,
+        "extends": 20,
+        "implements": 30,
+        "imports": 50,
+        "methods": 50,
+        "properties": 50,
+        "parameters": 30,
+        "decorators": 20,
+        "calls": 80,
+        "referenced_types": 50,
+        "variables": 50,
+        "constants": 50,
+        "type_parameters": 20,
+    }
+
     def __init__(
         self,
         max_chunk_size: int = DEFAULT_MAX_CHUNK_SIZE,
         min_chunk_size: int = DEFAULT_MIN_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
         parser_threshold: int = DEFAULT_PARSER_THRESHOLD,
-        enrich_embedding_text: bool = True,
         plugin_runtime: Any = None,
     ):
         """
         Initialize AST code splitter.
-        
+
         Args:
             max_chunk_size: Maximum characters per chunk
             min_chunk_size: Minimum characters for a valid chunk
             chunk_overlap: Overlap between chunks when splitting oversized content
             parser_threshold: Minimum lines for AST parsing (3 recommended)
-            enrich_embedding_text: Whether to prepend semantic context to chunk text
-                                   for better embedding quality
         """
         self.max_chunk_size = max_chunk_size
         self.min_chunk_size = min_chunk_size
         self.chunk_overlap = chunk_overlap
         self.parser_threshold = parser_threshold
-        self.enrich_embedding_text = enrich_embedding_text
         self._plugin_runtime = plugin_runtime
-        
+
         # Components
         self._parser = get_parser()
         self._query_runner = get_query_runner()
         self._metadata_extractor = MetadataExtractor()
-        
+
         # Cache text splitters
         self._splitter_cache: Dict[Language, RecursiveCharacterTextSplitter] = {}
-        
+
         # Default splitter
         self._default_splitter = RecursiveCharacterTextSplitter(
             chunk_size=max_chunk_size,
             chunk_overlap=chunk_overlap,
             length_function=len,
         )
-    
+
+    @staticmethod
+    def _add_partial_reason(chunk: ASTChunk, reason: str) -> None:
+        if reason not in chunk.metadata_partial_reasons:
+            chunk.metadata_partial_reasons.append(reason)
+
+    def _bound_chunk_metadata(self, chunk: ASTChunk) -> None:
+        """Bound persisted structural inventories and record every omission."""
+        for field_name, limit in self.METADATA_LIST_LIMITS.items():
+            values = _stable_unique_strings(list(getattr(chunk, field_name)))
+            if len(values) > limit:
+                self._add_partial_reason(chunk, f"{field_name}_limit")
+            setattr(chunk, field_name, values[:limit])
+
+    def _bound_metadata_dict(self, metadata: Dict[str, Any]) -> None:
+        """Apply the same admission to fallback metadata dictionaries."""
+        partial_reasons = list(metadata.get("structural_metadata_partial_reasons", ()))
+        for field_name, limit in self.METADATA_LIST_LIMITS.items():
+            values = metadata.get(field_name)
+            if not isinstance(values, list):
+                continue
+            unique_values = _stable_unique_strings(values)
+            if len(unique_values) > limit:
+                reason = f"{field_name}_limit"
+                if reason not in partial_reasons:
+                    partial_reasons.append(reason)
+            metadata[field_name] = unique_values[:limit]
+        if partial_reasons:
+            metadata["structural_metadata_complete"] = False
+            metadata["structural_metadata_partial_reasons"] = sorted(partial_reasons)
+
     def split_documents(
         self,
-        documents: List[LlamaDocument],
+        documents: List[Document],
         capabilities: Any = None,
     ) -> List[TextNode]:
         """
-        Split LlamaIndex documents using AST-based parsing.
-        
+        Split repository documents using AST-based parsing.
+
         Args:
-            documents: List of LlamaIndex Document objects
-            
+            documents: Repository source documents
+
         Returns:
             List of TextNode objects with enriched metadata
         """
         all_nodes = []
-        
+
         for doc in documents:
             path = doc.metadata.get('path', 'unknown')
             language = get_language_from_path(path)
@@ -229,7 +279,7 @@ class ASTCodeSplitter:
                     and line_count >= self.parser_threshold
                     and self._parser.is_available()
                 )
-            
+
             if use_ast:
                 nodes = self._split_with_ast(doc, language, syntax)
             else:
@@ -246,17 +296,14 @@ class ASTCodeSplitter:
                     syntax_diagnostics,
                 )
 
-            if self._plugin_runtime is not None and capabilities is not None:
-                self._enrich_with_plugin_facts(doc, nodes, capabilities)
-            
             all_nodes.extend(nodes)
             logger.debug(f"Split {path} into {len(nodes)} chunks (AST={use_ast})")
-        
+
         return all_nodes
 
     def split_documents_resilient(
         self,
-        documents: List[LlamaDocument],
+        documents: List[Document],
         capabilities: Any = None,
     ) -> tuple[List[TextNode], tuple[str, ...]]:
         """Split documents independently and quarantine file-local failures."""
@@ -301,43 +348,9 @@ class ASTCodeSplitter:
                     for diagnostic in diagnostics
                 ]
 
-    def _enrich_with_plugin_facts(
-        self,
-        document: LlamaDocument,
-        nodes: List[TextNode],
-        capabilities: Any,
-    ) -> None:
-        """Attach bounded typed facts without giving plugins storage or embedding access."""
-        if not nodes:
-            return
-        from codecrow_plugins import FileArtifact
-
-        path = document.metadata.get("path", "unknown")
-        facts, diagnostics = self._plugin_runtime.graph_facts(
-            FileArtifact(path=path, content=document.text),
-            capabilities,
-        )
-        bounded_facts = facts[:40]
-        fact_payload = [dict(fact.as_metadata()) for fact in bounded_facts]
-
-        active_ids = list(capabilities.repository_plugins)
-        for node in nodes:
-            node.metadata["plugin_ids"] = active_ids
-            node.metadata["plugin_fingerprint"] = capabilities.fingerprint
-            if fact_payload:
-                node.metadata["plugin_graph_facts"] = fact_payload
-                node.metadata["plugin_fact_kinds"] = sorted({fact.kind for fact in bounded_facts})
-                node.metadata["plugin_fact_sources"] = sorted({fact.source for fact in bounded_facts})
-                node.metadata["plugin_fact_targets"] = sorted({fact.target for fact in bounded_facts})
-            if diagnostics:
-                node.metadata["plugin_diagnostics"] = [
-                    {"code": diagnostic.code, "plugin": diagnostic.plugin_id}
-                    for diagnostic in diagnostics
-                ]
-    
     def _split_with_ast(
         self,
-        doc: LlamaDocument,
+        doc: Document,
         language: Optional[Language],
         syntax: Any = None,
     ) -> List[TextNode]:
@@ -349,21 +362,21 @@ class ASTCodeSplitter:
             if syntax is not None
             else get_treesitter_name(language)
         )
-        
+
         if not ts_lang:
             return self._split_fallback(
                 doc,
                 language if syntax is None else None,
                 extract_language_metadata=syntax is None,
             )
-        
+
         # Try query-based extraction first
         chunks = self._extract_with_queries(text, ts_lang, path, syntax)
-        
+
         # If no queries available, fall back to traversal-based extraction
         if not chunks and self._is_rich_ast_traversal_safe(ts_lang, syntax):
             chunks = self._extract_with_traversal(text, ts_lang, path, syntax)
-        
+
         # Still no chunks? Use fallback
         if not chunks:
             return self._split_fallback(
@@ -371,9 +384,9 @@ class ASTCodeSplitter:
                 language if syntax is None else None,
                 extract_language_metadata=syntax is None,
             )
-        
+
         return self._process_chunks(chunks, doc, language, path)
-    
+
     def _extract_with_queries(
         self,
         text: str,
@@ -384,7 +397,7 @@ class ASTCodeSplitter:
         """Extract chunks using tree-sitter query files with rich metadata."""
         if not self._query_runner.has_query(lang_name, syntax):
             return []
-        
+
         tree = (
             self._parser.parse_plugin(text, syntax)
             if syntax is not None
@@ -392,7 +405,7 @@ class ASTCodeSplitter:
         )
         if not tree:
             return []
-        
+
         matches = self._query_runner.run_query(
             text,
             lang_name,
@@ -401,23 +414,23 @@ class ASTCodeSplitter:
         )
         if not matches:
             return []
-        
+
         source_bytes = text.encode('utf-8')
         chunks = []
         chunk_ranges: List[tuple[int, int, ASTChunk]] = []
         chunk_by_range: Dict[tuple, ASTChunk] = {}
         processed_ranges: Set[tuple] = set()
-        
+
         # Collect file-level metadata from all matches
         imports = []
         namespace = None
         decorators_map: Dict[int, List[str]] = {}  # line -> decorators
-        
+
         for match in matches:
             # Handle imports (multiple capture variations)
             if match.pattern_name in ('import', 'use'):
                 import_path = (
-                    match.get('import.path') or 
+                    match.get('import.path') or
                     match.get('import') or
                     match.get('use.path') or
                     match.get('use')
@@ -425,14 +438,14 @@ class ASTCodeSplitter:
                 if import_path:
                     imports.append(import_path.text.strip().strip('"\''))
                 continue
-            
+
             # Handle namespace/package/module
             if match.pattern_name in ('namespace', 'package', 'module'):
                 ns_cap = match.get(f'{match.pattern_name}.name') or match.get(match.pattern_name)
                 if ns_cap:
                     namespace = ns_cap.text.strip()
                 continue
-            
+
             # Handle standalone decorators/attributes
             if match.pattern_name in ('decorator', 'attribute', 'annotation'):
                 dec_cap = match.get(f'{match.pattern_name}.name') or match.get(match.pattern_name)
@@ -442,40 +455,40 @@ class ASTCodeSplitter:
                         decorators_map[line] = []
                     decorators_map[line].append(dec_cap.text.strip())
                 continue
-            
+
             # Handle main constructs: functions, classes, methods, etc.
             semantic_patterns = (
-                'function', 'method', 'class', 'interface', 'struct', 'trait', 
-                'enum', 'impl', 'constructor', 'closure', 'arrow', 'const', 
+                'function', 'method', 'class', 'interface', 'struct', 'trait',
+                'enum', 'impl', 'constructor', 'closure', 'arrow', 'const',
                 'var', 'static', 'type', 'record'
             )
             if match.pattern_name in semantic_patterns:
                 main_cap = match.get(match.pattern_name)
                 if not main_cap:
                     continue
-                
+
                 range_key = (main_cap.start_byte, main_cap.end_byte)
                 if range_key in processed_ranges:
                     self._merge_query_definition_metadata(chunk_by_range[range_key], match)
                     continue
                 processed_ranges.add(range_key)
-                
+
                 # Get name from various capture patterns
                 name_cap = (
                     match.get(f'{match.pattern_name}.name') or
                     match.get('name')
                 )
                 name = name_cap.text if name_cap else None
-                
+
                 # Get inheritance (extends/implements/embeds/supertrait)
                 extends = []
                 implements = []
-                
+
                 for ext_capture in ('extends', 'embeds', 'supertrait', 'base_type'):
                     cap = match.get(f'{match.pattern_name}.{ext_capture}')
                     if cap:
                         extends.extend(self._parse_type_list(cap.text))
-                
+
                 for impl_capture in ('implements', 'trait'):
                     cap = match.get(f'{match.pattern_name}.{impl_capture}')
                     if cap:
@@ -485,23 +498,23 @@ class ASTCodeSplitter:
                     inheritance = self._metadata_extractor.extract_inheritance(main_cap.text, lang_name)
                     extends = inheritance.get('extends', [])
                     implements = inheritance.get('implements', [])
-                
+
                 # Get additional metadata from captures
                 visibility = match.get(f'{match.pattern_name}.visibility')
                 return_type = match.get(f'{match.pattern_name}.return_type')
                 params = match.get(f'{match.pattern_name}.params')
                 modifiers = []
-                
+
                 for mod in ('static', 'abstract', 'final', 'async', 'readonly', 'const', 'unsafe'):
                     if match.get(f'{match.pattern_name}.{mod}'):
                         modifiers.append(mod)
-                
+
                 chunk = ASTChunk(
                     content=main_cap.text,
                     content_type=ContentType.FUNCTIONS_CLASSES,
                     language=lang_name,
                     path=path,
-                    semantic_names=[name] if name else [],
+                    symbol_names=[name] if name else [],
                     parent_context=[],
                     start_line=main_cap.start_line,
                     end_line=main_cap.end_line,
@@ -510,33 +523,36 @@ class ASTCodeSplitter:
                     implements=implements,
                     modifiers=modifiers,
                 )
-                
+
                 # Extract docstring and signature — prefer AST traversal over regex
                 ts_node = self._find_node_at_position(
                     tree.root_node, main_cap.start_byte, main_cap.end_byte
                 ) if tree else None
                 chunk.docstring = self._metadata_extractor.extract_docstring(main_cap.text, lang_name, ts_node=ts_node)
                 chunk.signature = self._metadata_extractor.extract_signature(main_cap.text, lang_name, ts_node=ts_node)
-                
+
                 # Extract rich AST details (methods, properties, params, calls, etc.).
                 # Some native tree-sitter bindings can segfault while walking large
                 # Java trees, so keep this optional and only run it for known-safe
                 # languages. Query captures still provide semantic Java chunks.
                 if self._is_rich_ast_traversal_safe(lang_name, syntax):
                     self._extract_rich_ast_details(chunk, tree, main_cap, lang_name)
-                
+
                 chunks.append(chunk)
                 chunk_ranges.append((main_cap.start_byte, main_cap.end_byte, chunk))
                 chunk_by_range[range_key] = chunk
 
         self._attach_query_relationship_metadata(matches, chunk_ranges)
         self._attach_query_parent_context(chunk_ranges)
-        
-        # Add imports and namespace to all chunks
+
+        # Admit source-ordered imports and other structural inventories within
+        # the per-chunk payload limits used by deterministic retrieval.
+        imports = _stable_unique_strings(imports)
         for chunk in chunks:
-            chunk.imports = imports[:50]
+            chunk.imports = list(imports)
             chunk.namespace = namespace
-        
+            self._bound_chunk_metadata(chunk)
+
         # Create simplified code chunk
         if chunks:
             simplified = self._create_simplified_code(text, chunks, lang_name)
@@ -549,35 +565,33 @@ class ASTCodeSplitter:
                     start_line=1,
                     end_line=text.count('\n') + 1,
                     node_type='simplified',
-                    imports=imports[:50],
+                    imports=list(imports),
                     namespace=namespace,
                 ))
-        
+
         return chunks
 
     def _merge_query_definition_metadata(self, chunk: ASTChunk, match: QueryMatch) -> None:
         """Merge metadata from duplicate query matches for the same definition."""
-        def add_unique(values: List[str], value: str, limit: int) -> None:
+        def add_unique(values: List[str], value: str) -> None:
             for item in self._parse_type_list(value):
                 if item and item not in values:
                     values.append(item)
-                    if len(values) >= limit:
-                        break
-            del values[limit:]
 
         for ext_capture in ('extends', 'embeds', 'supertrait', 'base_type'):
             cap = match.get(f'{match.pattern_name}.{ext_capture}')
             if cap:
-                add_unique(chunk.extends, cap.text, 20)
+                add_unique(chunk.extends, cap.text)
 
         for impl_capture in ('implements', 'trait'):
             cap = match.get(f'{match.pattern_name}.{impl_capture}')
             if cap:
-                add_unique(chunk.implements, cap.text, 30)
+                add_unique(chunk.implements, cap.text)
 
         return_type = match.get(f'{match.pattern_name}.return_type')
         if return_type:
             chunk.return_type = return_type.text.strip()
+        self._bound_chunk_metadata(chunk)
 
     def _attach_query_relationship_metadata(
         self,
@@ -588,14 +602,13 @@ class ASTCodeSplitter:
         if not chunk_ranges:
             return
 
-        def add_unique(values: List[str], value: Optional[str], limit: int) -> None:
+        def add_unique(values: List[str], value: Optional[str]) -> None:
             if not value:
                 return
             value = value.strip().strip('"\'`;')
             if not value or value in values:
                 return
             values.append(value)
-            del values[limit:]
 
         def best_chunk(start: int, end: int) -> Optional[ASTChunk]:
             containing = [
@@ -619,35 +632,38 @@ class ASTCodeSplitter:
             if match.pattern_name == 'call':
                 call_name = match.get('call.name')
                 call_object = match.get('call.object')
-                add_unique(chunk.calls, call_name.text if call_name else main_cap.text, 80)
+                add_unique(chunk.calls, call_name.text if call_name else main_cap.text)
                 if call_object and call_object.text[:1].isupper():
-                    add_unique(chunk.referenced_types, call_object.text, 50)
+                    add_unique(chunk.referenced_types, call_object.text)
                 continue
 
             if match.pattern_name == 'type_reference':
                 type_name = match.get('type_reference.name') or main_cap
-                add_unique(chunk.referenced_types, type_name.text, 50)
+                add_unique(chunk.referenced_types, type_name.text)
                 continue
 
             if match.pattern_name == 'parameter':
                 parameter_name = match.get('parameter.name')
                 parameter_type = match.get('parameter.type')
-                add_unique(chunk.parameters, parameter_name.text if parameter_name else None, 30)
-                add_unique(chunk.referenced_types, parameter_type.text if parameter_type else None, 50)
+                add_unique(chunk.parameters, parameter_name.text if parameter_name else None)
+                add_unique(chunk.referenced_types, parameter_type.text if parameter_type else None)
                 continue
 
             if match.pattern_name == 'field':
                 field_name = match.get('field.name') or match.get('name')
                 field_type = match.get('field.type')
-                add_unique(chunk.properties, field_name.text if field_name else None, 50)
-                add_unique(chunk.referenced_types, field_type.text if field_type else None, 50)
+                add_unique(chunk.properties, field_name.text if field_name else None)
+                add_unique(chunk.referenced_types, field_type.text if field_type else None)
                 continue
 
             if match.pattern_name == 'variable':
                 variable_name = match.get('variable.name')
                 variable_type = match.get('variable.type')
-                add_unique(chunk.variables, variable_name.text if variable_name else None, 50)
-                add_unique(chunk.referenced_types, variable_type.text if variable_type else None, 50)
+                add_unique(chunk.variables, variable_name.text if variable_name else None)
+                add_unique(chunk.referenced_types, variable_type.text if variable_type else None)
+
+        for chunk in {id(item[2]): item[2] for item in chunk_ranges}.values():
+            self._bound_chunk_metadata(chunk)
 
     def _attach_query_parent_context(
         self,
@@ -663,7 +679,7 @@ class ASTCodeSplitter:
         parents = [
             (start, end, chunk)
             for start, end, chunk in chunk_ranges
-            if chunk.node_type in class_like and chunk.semantic_names
+            if chunk.node_type in class_like and chunk.symbol_names
         ]
         if not parents:
             return
@@ -679,19 +695,19 @@ class ASTCodeSplitter:
             if not containing:
                 continue
             parent = min(containing, key=lambda item: item[0])[1]
-            parent_name = parent.semantic_names[0]
+            parent_name = parent.symbol_names[0]
             chunk.parent_context = [*parent.parent_context, parent_name]
 
-            child_name = chunk.semantic_names[0] if chunk.semantic_names else None
+            child_name = chunk.symbol_names[0] if chunk.symbol_names else None
             if not child_name:
                 continue
             if chunk.node_type in member_like and child_name not in parent.methods:
                 parent.methods.append(child_name)
-                del parent.methods[50:]
+                self._bound_chunk_metadata(parent)
             elif chunk.node_type in property_like and child_name not in parent.properties:
                 parent.properties.append(child_name)
-                del parent.properties[50:]
-    
+                self._bound_chunk_metadata(parent)
+
     def _extract_with_traversal(
         self,
         text: str,
@@ -707,75 +723,75 @@ class ASTCodeSplitter:
         )
         if not tree:
             return []
-        
+
         source_bytes = text.encode('utf-8')
         chunks = []
         processed_ranges: Set[tuple] = set()
-        
+
         # Node types for semantic chunking
         semantic_types = self._get_semantic_node_types(lang_name)
         class_types = set(semantic_types.get('class', []))
         function_types = set(semantic_types.get('function', []))
         all_types = class_types | function_types
-        
+
         def get_node_text(node) -> str:
             return source_bytes[node.start_byte:node.end_byte].decode('utf-8', errors='replace')
-        
+
         def get_node_name(node) -> Optional[str]:
             for child in node.children:
                 if child.type in ('identifier', 'name', 'type_identifier', 'property_identifier'):
                     return get_node_text(child)
             return None
-        
+
         def traverse(node, parent_context: List[str]):
             node_range = (node.start_byte, node.end_byte)
-            
+
             if node.type in all_types:
                 if node_range in processed_ranges:
                     return
-                
+
                 content = get_node_text(node)
                 start_line = source_bytes[:node.start_byte].count(b'\n') + 1
                 end_line = start_line + content.count('\n')
                 node_name = get_node_name(node)
                 is_class = node.type in class_types
-                
+
                 chunk = ASTChunk(
                     content=content,
                     content_type=ContentType.FUNCTIONS_CLASSES,
                     language=lang_name,
                     path=path,
-                    semantic_names=[node_name] if node_name else [],
+                    symbol_names=[node_name] if node_name else [],
                     parent_context=list(parent_context),
                     start_line=start_line,
                     end_line=end_line,
                     node_type=node.type,
                 )
-                
+
                 chunk.docstring = self._metadata_extractor.extract_docstring(content, lang_name, ts_node=node)
                 chunk.signature = self._metadata_extractor.extract_signature(content, lang_name, ts_node=node)
-                
+
                 # Extract inheritance via regex
                 inheritance = self._metadata_extractor.extract_inheritance(content, lang_name)
                 chunk.extends = inheritance.get('extends', [])
                 chunk.implements = inheritance.get('implements', [])
                 chunk.imports = inheritance.get('imports', [])
-                
+
                 # Extract rich AST details directly from this node
                 self._extract_rich_details_from_node(chunk, node, source_bytes, lang_name)
-                
+
                 chunks.append(chunk)
                 processed_ranges.add(node_range)
-                
+
                 if is_class and node_name:
                     for child in node.children:
                         traverse(child, parent_context + [node_name])
             else:
                 for child in node.children:
                     traverse(child, parent_context)
-        
+
         traverse(tree.root_node, [])
-        
+
         # Create simplified code
         if chunks:
             simplified = self._create_simplified_code(text, chunks, lang_name)
@@ -789,9 +805,9 @@ class ASTCodeSplitter:
                     end_line=text.count('\n') + 1,
                     node_type='simplified',
                 ))
-        
+
         return chunks
-    
+
     def _extract_rich_ast_details(
         self,
         chunk: ASTChunk,
@@ -801,7 +817,7 @@ class ASTCodeSplitter:
     ) -> None:
         """
         Extract rich AST details from tree-sitter node by traversing its children.
-        
+
         This extracts:
         - Methods (for classes)
         - Properties/fields (for classes)
@@ -814,19 +830,19 @@ class ASTCodeSplitter:
         - Type parameters (generics)
         """
         source_bytes = chunk.content.encode('utf-8')
-        
+
         # Find the actual tree-sitter node for this capture
         node = self._find_node_at_position(
-            tree.root_node, 
-            captured_node.start_byte, 
+            tree.root_node,
+            captured_node.start_byte,
             captured_node.end_byte
         )
         if not node:
             return
-        
+
         # Language-specific node type mappings
         node_types = self._get_rich_node_types(lang_name)
-        
+
         def get_text(n) -> str:
             """Get text for a node relative to chunk content."""
             start = n.start_byte - captured_node.start_byte
@@ -834,97 +850,93 @@ class ASTCodeSplitter:
             if 0 <= start < len(source_bytes) and start < end <= len(source_bytes):
                 return source_bytes[start:end].decode('utf-8', errors='replace')
             return ''
-        
+
         def extract_identifier(n) -> Optional[str]:
             """Extract identifier name from a node."""
             for child in n.children:
                 if child.type in node_types['identifier']:
                     return get_text(child)
             return None
-        
-        def traverse_for_details(n, depth: int = 0):
-            """Recursively traverse to extract details."""
-            if depth > 10:  # Prevent infinite recursion
-                return
-            
+
+        def record_details(n):
+            """Record metadata for one AST node."""
             node_type = n.type
-            
+
             # Extract methods (for classes)
             if node_type in node_types['method']:
                 method_name = extract_identifier(n)
                 if method_name and method_name not in chunk.methods:
                     chunk.methods.append(method_name)
-            
+
             # Extract properties/fields
             if node_type in node_types['property']:
                 prop_name = extract_identifier(n)
                 if prop_name and prop_name not in chunk.properties:
                     chunk.properties.append(prop_name)
-            
+
             # Extract parameters
             if node_type in node_types['parameter']:
                 param_name = extract_identifier(n)
                 if param_name and param_name not in chunk.parameters:
                     chunk.parameters.append(param_name)
-            
+
             # Extract decorators/annotations
             if node_type in node_types['decorator']:
                 dec_text = get_text(n).strip()
+                # Normalize before checking membership so equivalent capture
+                # spellings do not create duplicate semantic records.
+                if dec_text.startswith('@'):
+                    dec_text = dec_text[1:]
+                if '(' in dec_text:
+                    dec_text = dec_text.split('(')[0]
                 if dec_text and dec_text not in chunk.decorators:
-                    # Clean up decorator text
-                    if dec_text.startswith('@'):
-                        dec_text = dec_text[1:]
-                    if '(' in dec_text:
-                        dec_text = dec_text.split('(')[0]
                     chunk.decorators.append(dec_text)
-            
+
             # Extract function calls
             if node_type in node_types['call']:
                 call_name = extract_identifier(n)
                 if call_name and call_name not in chunk.calls:
                     chunk.calls.append(call_name)
-            
+
             # Extract type references
             if node_type in node_types['type_ref']:
                 type_text = get_text(n).strip()
+                if '<' in type_text:
+                    type_text = type_text.split('<')[0]
                 if type_text and type_text not in chunk.referenced_types:
-                    # Clean generic params
-                    if '<' in type_text:
-                        type_text = type_text.split('<')[0]
                     chunk.referenced_types.append(type_text)
-            
+
             # Extract return type
             if node_type in node_types['return_type'] and not chunk.return_type:
                 chunk.return_type = get_text(n).strip()
-            
+
             # Extract type parameters (generics)
             if node_type in node_types['type_param']:
                 param_text = get_text(n).strip()
                 if param_text and param_text not in chunk.type_parameters:
                     chunk.type_parameters.append(param_text)
-            
+
             # Extract variables
             if node_type in node_types['variable']:
                 var_name = extract_identifier(n)
                 if var_name and var_name not in chunk.variables:
                     chunk.variables.append(var_name)
-            
-            # Recurse into children
-            for child in n.children:
-                traverse_for_details(child, depth + 1)
-        
-        traverse_for_details(node)
-        
-        # Limit list sizes to prevent bloat
-        chunk.methods = chunk.methods[:50]
-        chunk.properties = chunk.properties[:50]
-        chunk.parameters = chunk.parameters[:30]
-        chunk.decorators = chunk.decorators[:20]
-        chunk.calls = chunk.calls[:80]
-        chunk.referenced_types = chunk.referenced_types[:50]
-        chunk.variables = chunk.variables[:50]
-        chunk.type_parameters = chunk.type_parameters[:20]
-    
+
+        # Iterative traversal avoids Python recursion limits while bounding
+        # pathological nesting that otherwise multiplies CPU and metadata.
+        pending = [(node, 0)]
+        while pending:
+            current, depth = pending.pop()
+            record_details(current)
+            if depth >= self.RICH_AST_MAX_DEPTH:
+                if current.children:
+                    self._add_partial_reason(chunk, "ast_depth_limit")
+                continue
+            pending.extend(
+                (child, depth + 1) for child in reversed(current.children)
+            )
+        self._bound_chunk_metadata(chunk)
+
     def _find_node_at_position(self, root, start_byte: int, end_byte: int) -> Optional[Any]:
         """Find the tree-sitter node at the given byte position."""
         def find(node):
@@ -947,7 +959,7 @@ class ASTCodeSplitter:
         if syntax is not None:
             return syntax.rich_traversal_safe
         return language not in self.RICH_AST_TRAVERSAL_UNSAFE_LANGUAGES
-    
+
     def _get_rich_node_types(self, language: str) -> Dict[str, List[str]]:
         """Get tree-sitter node types for extracting rich details."""
         # Common patterns across languages
@@ -957,7 +969,7 @@ class ASTCodeSplitter:
             'type_ref': ['type_identifier', 'generic_type', 'type_annotation', 'type'],
             'type_param': ['type_parameter', 'type_parameters', 'generic_parameter'],
         }
-        
+
         types = {
             'python': {
                 **common,
@@ -1032,7 +1044,7 @@ class ASTCodeSplitter:
                 'variable': ['property_declaration', 'simple_variable'],
             },
         }
-        
+
         return types.get(language, {
             **common,
             'method': [],
@@ -1042,7 +1054,7 @@ class ASTCodeSplitter:
             'return_type': [],
             'variable': [],
         })
-    
+
     def _extract_rich_details_from_node(
         self,
         chunk: ASTChunk,
@@ -1055,97 +1067,92 @@ class ASTCodeSplitter:
         Used by traversal-based extraction when we already have the node.
         """
         node_types = self._get_rich_node_types(lang_name)
-        
+
         def get_text(n) -> str:
             return source_bytes[n.start_byte:n.end_byte].decode('utf-8', errors='replace')
-        
+
         def extract_identifier(n) -> Optional[str]:
             for child in n.children:
                 if child.type in node_types['identifier']:
                     return get_text(child)
             return None
-        
-        def traverse(n, depth: int = 0):
-            if depth > 10:
-                return
-            
+
+        def record_details(n):
             node_type = n.type
-            
+
             if node_type in node_types['method']:
                 name = extract_identifier(n)
                 if name and name not in chunk.methods:
                     chunk.methods.append(name)
-            
+
             if node_type in node_types['property']:
                 name = extract_identifier(n)
                 if name and name not in chunk.properties:
                     chunk.properties.append(name)
-            
+
             if node_type in node_types['parameter']:
                 name = extract_identifier(n)
                 if name and name not in chunk.parameters:
                     chunk.parameters.append(name)
-            
+
             if node_type in node_types['decorator']:
                 dec_text = get_text(n).strip()
+                if dec_text.startswith('@'):
+                    dec_text = dec_text[1:]
+                if '(' in dec_text:
+                    dec_text = dec_text.split('(')[0]
                 if dec_text and dec_text not in chunk.decorators:
-                    if dec_text.startswith('@'):
-                        dec_text = dec_text[1:]
-                    if '(' in dec_text:
-                        dec_text = dec_text.split('(')[0]
                     chunk.decorators.append(dec_text)
-            
+
             if node_type in node_types['call']:
                 name = extract_identifier(n)
                 if name and name not in chunk.calls:
                     chunk.calls.append(name)
-            
+
             if node_type in node_types['type_ref']:
                 type_text = get_text(n).strip()
+                if '<' in type_text:
+                    type_text = type_text.split('<')[0]
                 if type_text and type_text not in chunk.referenced_types:
-                    if '<' in type_text:
-                        type_text = type_text.split('<')[0]
                     chunk.referenced_types.append(type_text)
-            
+
             if node_type in node_types['return_type'] and not chunk.return_type:
                 chunk.return_type = get_text(n).strip()
-            
+
             if node_type in node_types['type_param']:
                 param_text = get_text(n).strip()
                 if param_text and param_text not in chunk.type_parameters:
                     chunk.type_parameters.append(param_text)
-            
+
             if node_type in node_types['variable']:
                 name = extract_identifier(n)
                 if name and name not in chunk.variables:
                     chunk.variables.append(name)
-            
-            for child in n.children:
-                traverse(child, depth + 1)
-        
-        traverse(node)
-        
-        # Limit sizes
-        chunk.methods = chunk.methods[:50]
-        chunk.properties = chunk.properties[:50]
-        chunk.parameters = chunk.parameters[:30]
-        chunk.decorators = chunk.decorators[:20]
-        chunk.calls = chunk.calls[:80]
-        chunk.referenced_types = chunk.referenced_types[:50]
-        chunk.variables = chunk.variables[:50]
-        chunk.type_parameters = chunk.type_parameters[:20]
-    
+
+        pending = [(node, 0)]
+        while pending:
+            current, depth = pending.pop()
+            record_details(current)
+            if depth >= self.RICH_AST_MAX_DEPTH:
+                if current.children:
+                    self._add_partial_reason(chunk, "ast_depth_limit")
+                continue
+            pending.extend(
+                (child, depth + 1) for child in reversed(current.children)
+            )
+        self._bound_chunk_metadata(chunk)
+
     def _process_chunks(
         self,
         chunks: List[ASTChunk],
-        doc: LlamaDocument,
+        doc: Document,
         language: Optional[Language],
         path: str
     ) -> List[TextNode]:
         """Process AST chunks into TextNodes, handling oversized chunks."""
         nodes = []
         chunk_counter = 0
-        
+
         for ast_chunk in chunks:
             if len(ast_chunk.content) > self.max_chunk_size:
                 sub_nodes = self._split_oversized_chunk(ast_chunk, language, doc.metadata, path)
@@ -1154,20 +1161,17 @@ class ASTCodeSplitter:
             else:
                 metadata = self._build_metadata(ast_chunk, doc.metadata, chunk_counter, len(chunks))
                 chunk_id = generate_deterministic_id(path, ast_chunk.content, chunk_counter)
-                
-                # Create embedding-enriched text with semantic context
-                enriched_text = self._create_embedding_text(ast_chunk.content, metadata)
-                
+
                 node = TextNode(
                     id_=chunk_id,
-                    text=enriched_text,
+                    text=ast_chunk.content,
                     metadata=metadata
                 )
                 nodes.append(node)
                 chunk_counter += 1
-        
+
         return nodes
-    
+
     def _split_oversized_chunk(
         self,
         chunk: ASTChunk,
@@ -1177,42 +1181,28 @@ class ASTCodeSplitter:
     ) -> List[TextNode]:
         """
         Split an oversized chunk using RecursiveCharacterTextSplitter.
-        
+
         IMPORTANT: Splitting an AST chunk loses semantic integrity.
         We try to preserve what we can:
         - Parent context and primary name are kept (they're still relevant)
         - Detailed lists (methods, properties, calls) are NOT copied to sub-chunks
           because they describe the whole unit, not the fragment
-        - A summary of the original unit is prepended to help embeddings
+        Fragment ownership remains in metadata; stored text stays raw source.
         """
         splitter = self._get_text_splitter(language) if language else self._default_splitter
         sub_chunks = splitter.split_text(chunk.content)
-        
+
         nodes = []
         parent_id = generate_deterministic_id(path, chunk.content, 0)
         total_sub = len([s for s in sub_chunks if s and s.strip()])
-        
-        # Build a brief summary of the original semantic unit
-        # This helps embeddings understand context even in fragments
-        unit_summary_parts = []
-        if chunk.semantic_names:
-            unit_summary_parts.append(f"{chunk.node_type or 'code'}: {chunk.semantic_names[0]}")
-        if chunk.extends:
-            unit_summary_parts.append(f"extends {', '.join(chunk.extends[:3])}")
-        if chunk.implements:
-            unit_summary_parts.append(f"implements {', '.join(chunk.implements[:3])}")
-        if chunk.methods:
-            unit_summary_parts.append(f"has {len(chunk.methods)} methods")
-        
-        unit_summary = " | ".join(unit_summary_parts) if unit_summary_parts else None
-        
+
         sub_idx = 0
         for i, sub_chunk in enumerate(sub_chunks):
             if not sub_chunk or not sub_chunk.strip():
                 continue
             if len(sub_chunk.strip()) < self.min_chunk_size and total_sub > 1:
                 continue
-            
+
             # Build metadata for this fragment
             # DO NOT copy detailed lists - they don't apply to fragments
             metadata = dict(base_metadata)
@@ -1223,95 +1213,80 @@ class ASTCodeSplitter:
             metadata['total_sub_chunks'] = total_sub
             metadata['start_line'] = chunk.start_line
             metadata['end_line'] = chunk.end_line
-            
+
             # Keep parent context - still relevant
             if chunk.parent_context:
                 metadata['parent_context'] = chunk.parent_context
                 metadata['parent_class'] = chunk.parent_context[-1]
-            
+
             # Keep primary name - this fragment belongs to this unit
-            if chunk.semantic_names:
-                metadata['semantic_names'] = chunk.semantic_names[:1]  # Just the main name
-                metadata['primary_name'] = chunk.semantic_names[0]
-            
+            if chunk.symbol_names:
+                # A fragment carries its owning unit's primary identity only;
+                # unit-wide inventories belong to the intact semantic chunk.
+                metadata['symbol_names'] = [chunk.symbol_names[0]]
+                metadata['primary_name'] = chunk.symbol_names[0]
+
             # Add note that this is a fragment
             metadata['is_fragment'] = True
-            metadata['fragment_of'] = chunk.semantic_names[0] if chunk.semantic_names else None
-            
+            metadata['fragment_of'] = chunk.symbol_names[0] if chunk.symbol_names else None
+
             # Compute information density for fragment
             metadata['information_density'] = self._compute_information_density(metadata)
-            
-            # For embedding: prepend fragment context
-            if unit_summary:
-                fragment_header = f"[Fragment {sub_idx + 1}/{total_sub} of {unit_summary}]"
-                enriched_text = f"{fragment_header}\n\n{sub_chunk}"
-            else:
-                enriched_text = sub_chunk
-            
+
             chunk_id = generate_deterministic_id(path, sub_chunk, sub_idx)
-            nodes.append(TextNode(id_=chunk_id, text=enriched_text, metadata=metadata))
+            nodes.append(TextNode(id_=chunk_id, text=sub_chunk, metadata=metadata))
             sub_idx += 1
-        
+
         # Log when splitting happens - it's a signal the chunk_size might need adjustment
         if nodes:
             logger.info(
                 f"Split oversized {chunk.node_type or 'chunk'} "
-                f"'{chunk.semantic_names[0] if chunk.semantic_names else 'unknown'}' "
+                f"'{chunk.symbol_names[0] if chunk.symbol_names else 'unknown'}' "
                 f"({len(chunk.content)} chars) into {len(nodes)} fragments"
             )
-        
+
         return nodes
-    
+
     def _split_fallback(
         self,
-        doc: LlamaDocument,
+        doc: Document,
         language: Optional[Language] = None,
         extract_language_metadata: bool = True,
     ) -> List[TextNode]:
-        """Fallback splitting using RecursiveCharacterTextSplitter."""
+        """Fallback splitting that preserves every source character exactly."""
         text = doc.text
         path = doc.metadata.get('path', 'unknown')
-        
-        if not text or not text.strip():
+
+        if not text:
             return []
-        
-        splitter = self._get_text_splitter(language) if language else self._default_splitter
-        chunks = splitter.split_text(text)
-        
+
+        chunks = self._split_fallback_text_losslessly(text)
+
         nodes = []
         lang_str = doc.metadata.get('language', 'text')
         text_offset = 0
-        
+
         for i, chunk in enumerate(chunks):
-            if not chunk or not chunk.strip():
-                continue
-            if len(chunk.strip()) < self.min_chunk_size and len(chunks) > 1:
-                continue
-            if len(chunk) > 30000:
-                chunk = chunk[:30000]
-            
             # Calculate line numbers
             start_line = text[:text_offset].count('\n') + 1 if text_offset > 0 else 1
-            chunk_pos = text.find(chunk, text_offset)
-            if chunk_pos >= 0:
-                text_offset = chunk_pos + len(chunk)
+            text_offset += len(chunk)
             end_line = start_line + chunk.count('\n')
-            
+
             metadata = dict(doc.metadata)
             metadata['content_type'] = ContentType.FALLBACK.value
             metadata['chunk_index'] = i
             metadata['total_chunks'] = len(chunks)
             metadata['start_line'] = start_line
             metadata['end_line'] = end_line
-            
+
             if extract_language_metadata:
-                # Legacy generic fallback when no selected plugin owns syntax.
+                # Generic fallback when no selected plugin owns syntax.
                 names = self._metadata_extractor.extract_names_from_content(
                     chunk,
                     lang_str,
                 )
                 if names:
-                    metadata['semantic_names'] = names
+                    metadata['symbol_names'] = names
                     metadata['primary_name'] = names[0]
 
                 inheritance = self._metadata_extractor.extract_inheritance(
@@ -1325,18 +1300,63 @@ class ASTCodeSplitter:
                     metadata['implements'] = inheritance['implements']
                 if inheritance.get('imports'):
                     metadata['imports'] = inheritance['imports']
-            
+
+                self._bound_metadata_dict(metadata)
+
             # Compute information density for fallback chunks too
             metadata['information_density'] = self._compute_information_density(metadata)
-            
-            # Create embedding-enriched text with semantic context
-            enriched_text = self._create_embedding_text(chunk, metadata)
-            
+
             chunk_id = generate_deterministic_id(path, chunk, i)
-            nodes.append(TextNode(id_=chunk_id, text=enriched_text, metadata=metadata))
-        
+            nodes.append(TextNode(id_=chunk_id, text=chunk, metadata=metadata))
+
         return nodes
-    
+
+    def _split_fallback_text_losslessly(self, text: str) -> List[str]:
+        """Partition fallback text at boundaries with exact reconstruction."""
+        if not text:
+            return []
+        max_size = min(
+            max(1, int(self.max_chunk_size)),
+            self.DEFAULT_MAX_CHUNK_SIZE,
+        )
+        fragments: List[str] = []
+        start = 0
+        text_length = len(text)
+
+        while start < text_length:
+            hard_end = min(text_length, start + max_size)
+            if hard_end == text_length:
+                fragments.append(text[start:hard_end])
+                break
+
+            window = text[start:hard_end]
+            preferred_floor = max(1, len(window) // 2)
+            boundary = 0
+
+            # Prefer paragraph and line boundaries in the latter half of the
+            # window, then any whitespace boundary. If an atom itself exceeds
+            # max_size, the hard boundary preserves it across exact fragments.
+            paragraph = window.rfind("\n\n")
+            if paragraph >= 0 and paragraph + 2 >= preferred_floor:
+                boundary = paragraph + 2
+            if not boundary:
+                newline = window.rfind("\n")
+                if newline >= 0 and newline + 1 >= preferred_floor:
+                    boundary = newline + 1
+            if not boundary:
+                for index in range(len(window), 0, -1):
+                    if window[index - 1].isspace():
+                        boundary = index
+                        break
+            if not boundary:
+                boundary = len(window)
+
+            end = start + boundary
+            fragments.append(text[start:end])
+            start = end
+
+        return fragments
+
     def _build_metadata(
         self,
         chunk: ASTChunk,
@@ -1345,135 +1365,145 @@ class ASTCodeSplitter:
         total_chunks: int
     ) -> Dict[str, Any]:
         """Build metadata dictionary from ASTChunk."""
+        self._bound_chunk_metadata(chunk)
         metadata = dict(base_metadata)
-        
+
         metadata['content_type'] = chunk.content_type.value
         metadata['node_type'] = chunk.node_type
         metadata['chunk_index'] = chunk_index
         metadata['total_chunks'] = total_chunks
         metadata['start_line'] = chunk.start_line
         metadata['end_line'] = chunk.end_line
-        
+
         if chunk.parent_context:
             metadata['parent_context'] = chunk.parent_context
             metadata['parent_class'] = chunk.parent_context[-1]
-            metadata['full_path'] = '.'.join(chunk.parent_context + chunk.semantic_names[:1])
-        
-        if chunk.semantic_names:
-            metadata['semantic_names'] = chunk.semantic_names
-            metadata['primary_name'] = chunk.semantic_names[0]
-        
+            # ``full_path`` is the breadcrumb plus the primary symbol.  The
+            # complete inventory is stored independently in ``symbol_names``.
+            primary_leaf = [chunk.symbol_names[0]] if chunk.symbol_names else []
+            metadata['full_path'] = '.'.join(chunk.parent_context + primary_leaf)
+
+        if chunk.symbol_names:
+            metadata['symbol_names'] = chunk.symbol_names
+            metadata['primary_name'] = chunk.symbol_names[0]
+
         if chunk.docstring:
-            metadata['docstring'] = chunk.docstring[:1000]
-        
+            metadata['docstring'] = chunk.docstring
+
         if chunk.signature:
             metadata['signature'] = chunk.signature
-        
+
         if chunk.extends:
             metadata['extends'] = chunk.extends
             metadata['parent_types'] = chunk.extends
-        
+
         if chunk.implements:
             metadata['implements'] = chunk.implements
-        
+
         if chunk.imports:
             metadata['imports'] = chunk.imports
-        
+
         if chunk.namespace:
             metadata['namespace'] = chunk.namespace
-        
+
         # --- RICH AST METADATA ---
-        
+
         if chunk.methods:
             metadata['methods'] = chunk.methods
-        
+
         if chunk.properties:
             metadata['properties'] = chunk.properties
-        
+
         if chunk.parameters:
             metadata['parameters'] = chunk.parameters
-        
+
         if chunk.return_type:
             metadata['return_type'] = chunk.return_type
-        
+
         if chunk.decorators:
             metadata['decorators'] = chunk.decorators
-        
+
         if chunk.modifiers:
             metadata['modifiers'] = chunk.modifiers
-        
+
         if chunk.calls:
             metadata['calls'] = chunk.calls
-        
+
         if chunk.referenced_types:
             metadata['referenced_types'] = chunk.referenced_types
-        
+
         if chunk.variables:
             metadata['variables'] = chunk.variables
-        
+
         if chunk.constants:
             metadata['constants'] = chunk.constants
-        
+
         if chunk.type_parameters:
             metadata['type_parameters'] = chunk.type_parameters
-        
+
+        if chunk.metadata_partial_reasons:
+            metadata['structural_metadata_complete'] = False
+            metadata['structural_metadata_partial_reasons'] = sorted(
+                chunk.metadata_partial_reasons
+            )
+
         # Compute information density — ratio of meaningful AST signals per line
         metadata['information_density'] = self._compute_information_density(metadata)
-        
+
         return metadata
-    
+
     @staticmethod
     def _compute_information_density(metadata: Dict[str, Any]) -> float:
         """
         Compute information density for a chunk based on its AST metadata.
-        
+
         Measures how much meaningful structure a chunk contains per line of code.
         Low-density chunks (e.g., import-only files, blank boilerplate, config dumps)
         contribute noise to RAG results and should be scored lower.
-        
+
         The metric counts distinct categories of AST signal present in the chunk:
-        - Structural: semantic_names, signature, methods, properties
+        - Structural: symbol_names, signature, methods, properties
         - Relational: extends, implements, calls, referenced_types
         - Documentation: docstring
         - Declarations: parameters, variables, constants, decorators
-        
+
         Returns a float in [0.0, 1.0] representing the density.
         """
         line_span = max(metadata.get('end_line', 1) - metadata.get('start_line', 0), 1)
-        
+
         # Count distinct meaningful signals (not their individual items —
         # a 200-line class with 50 methods is dense, but so is a 10-line
         # class with 3 methods. We care about signals-per-line.)
         signal_count = 0
-        
+
         # Structural identity signals (high value)
-        if metadata.get('semantic_names'):
-            signal_count += len(metadata['semantic_names'])
+        if metadata.get('symbol_names'):
+            signal_count += len(metadata['symbol_names'])
         if metadata.get('signature'):
             signal_count += 1
-        
+
         # Contained definitions (high value — indicates the chunk defines things)
         signal_count += len(metadata.get('methods', []))
         signal_count += len(metadata.get('properties', []))
         signal_count += len(metadata.get('constants', []))
-        
+
         # Type relationships (medium value — indicates structural connections)
         signal_count += len(metadata.get('extends', []))
         signal_count += len(metadata.get('implements', []))
-        
+
         # Dependencies & usage (medium value)
         # Cap calls/referenced_types to avoid inflating density for huge call-heavy functions
         signal_count += min(len(metadata.get('calls', [])), 10)
         signal_count += min(len(metadata.get('referenced_types', [])), 10)
-        
+
         # Documentation (small bonus)
         if metadata.get('docstring'):
             signal_count += 1
-        
+
         # Parameters and decorators (small bonus)
         signal_count += min(len(metadata.get('parameters', [])), 5)
         signal_count += min(len(metadata.get('decorators', [])), 3)
-        
+
         # Density = signals per line, capped at 1.0
         # A well-structured 20-line function typically has:
         #   name(1) + signature(1) + params(2-3) + calls(3-5) + types(1-2) = ~10 signals
@@ -1484,117 +1514,6 @@ class ASTCodeSplitter:
         density = signal_count / line_span
         return round(min(density, 1.0), 4)
 
-    def _create_embedding_text(self, content: str, metadata: Dict[str, Any]) -> str:
-        """
-        Create embedding-optimized text by prepending concise semantic context.
-        
-        Design principles:
-        1. Keep it SHORT - long headers can skew embeddings for small code chunks
-        2. Avoid redundancy - don't repeat info that's obvious from the code
-        3. Clean paths - strip commit hashes and archive prefixes
-        4. Add VALUE - include info that helps semantic matching
-        
-        What we include (selectively):
-        - Clean file path (without commit/archive prefixes)
-        - Parent context (for nested structures - very valuable)
-        - Extends/implements (inheritance is critical for understanding)
-        - Docstring (helps semantic matching)
-        - For CLASSES: method count (helps identify scope)
-        - For METHODS: skip redundant method list
-        """
-        if not self.enrich_embedding_text:
-            return content
-        
-        context_parts = []
-        
-        # Clean file path - remove commit hash prefixes and archive structure
-        path = metadata.get('path', '')
-        if path:
-            path = self._clean_path(path)
-            context_parts.append(f"File: {path}")
-        
-        # Parent context - valuable for nested structures
-        parent_context = metadata.get('parent_context', [])
-        if parent_context:
-            context_parts.append(f"In: {'.'.join(parent_context)}")
-        
-        # Clean namespace - strip keyword if present
-        namespace = metadata.get('namespace', '')
-        if namespace:
-            ns_clean = namespace.replace('namespace ', '').replace('package ', '').strip().rstrip(';')
-            if ns_clean:
-                context_parts.append(f"Namespace: {ns_clean}")
-        
-        # Type relationships - very valuable for understanding code structure
-        extends = metadata.get('extends', [])
-        implements = metadata.get('implements', [])
-        if extends:
-            context_parts.append(f"Extends: {', '.join(extends[:3])}")
-        if implements:
-            context_parts.append(f"Implements: {', '.join(implements[:3])}")
-        
-        # For CLASSES: show method/property counts (helps understand scope)
-        # For METHODS/FUNCTIONS: skip - it's redundant
-        node_type = metadata.get('node_type', '')
-        is_container = node_type in ('class', 'interface', 'struct', 'trait', 'enum', 'impl')
-        
-        if is_container:
-            methods = metadata.get('methods', [])
-            properties = metadata.get('properties', [])
-            if methods and len(methods) > 1:
-                # Only show if there are multiple methods
-                context_parts.append(f"Methods({len(methods)}): {', '.join(methods[:8])}")
-            if properties and len(properties) > 1:
-                context_parts.append(f"Fields({len(properties)}): {', '.join(properties[:5])}")
-        
-        # Docstring - valuable for semantic matching
-        docstring = metadata.get('docstring', '')
-        if docstring:
-            # Take just the first sentence or 100 chars
-            brief = docstring.split('.')[0][:100].strip()
-            if brief:
-                context_parts.append(f"Desc: {brief}")
-        
-        # Build final text - only if we have meaningful context
-        if context_parts:
-            context_header = " | ".join(context_parts)
-            return f"[{context_header}]\n\n{content}"
-        
-        return content
-    
-    def _clean_path(self, path: str) -> str:
-        """
-        Clean file path for embedding text.
-        
-        Removes:
-        - Commit hash prefixes (e.g., 'owner-repo-abc123def/')
-        - Archive extraction paths
-        - Redundant path components
-        """
-        if not path:
-            return path
-        
-        # Split by '/' and look for src/, lib/, app/ etc as anchor points
-        parts = path.split('/')
-        
-        # Common source directory markers
-        source_markers = {'src', 'lib', 'app', 'source', 'main', 'test', 'tests', 'pkg', 'cmd', 'internal'}
-        
-        # Find the first source marker and start from there
-        for i, part in enumerate(parts):
-            if part.lower() in source_markers:
-                return '/'.join(parts[i:])
-        
-        # If no marker found but path has commit-hash-like prefix (40 hex chars or similar)
-        if parts and len(parts) > 1:
-            first_part = parts[0]
-            # Check if first part looks like "owner-repo-commithash" pattern
-            if '-' in first_part and len(first_part) > 40:
-                # Skip the first part
-                return '/'.join(parts[1:])
-        
-        return path
-    
     def _get_text_splitter(self, language: Language) -> RecursiveCharacterTextSplitter:
         """Get language-specific text splitter."""
         if language not in self._splitter_cache:
@@ -1607,7 +1526,7 @@ class ASTCodeSplitter:
             except Exception:
                 self._splitter_cache[language] = self._default_splitter
         return self._splitter_cache[language]
-    
+
     def _create_simplified_code(
         self,
         source_code: str,
@@ -1652,18 +1571,18 @@ class ASTCodeSplitter:
             lines[start:end] = [placeholder]
 
         return '\n'.join(lines).strip()
-    
+
     def _parse_type_list(self, text: str) -> List[str]:
         """Parse a comma-separated list of types."""
         if not text:
             return []
-        
+
         text = text.strip().strip('()[]')
-        
+
         # Remove keywords
         for kw in ('extends', 'implements', 'with', ':'):
             text = text.replace(kw, ' ')
-        
+
         types = []
         for part in text.split(','):
             name = part.strip()
@@ -1673,9 +1592,9 @@ class ASTCodeSplitter:
                 name = name.split('(')[0].strip()
             if name:
                 types.append(name)
-        
+
         return types
-    
+
     def _get_semantic_node_types(self, language: str) -> Dict[str, List[str]]:
         """Get semantic node types for manual traversal fallback."""
         types = {
@@ -1713,12 +1632,12 @@ class ASTCodeSplitter:
             },
         }
         return types.get(language, {'class': [], 'function': []})
-    
+
     @staticmethod
     def get_supported_languages() -> List[str]:
         """Return list of languages with AST support."""
         return list(LANGUAGE_TO_TREESITTER.values())
-    
+
     @staticmethod
     def is_ast_supported(path: str) -> bool:
         """Check if AST parsing is supported for a file."""

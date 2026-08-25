@@ -28,16 +28,15 @@ COPY python-ecosystem/rag-pipeline/main.py .
 COPY analysis-plugins/ ./plugins/
 
 # Shared repository workspaces are created by the Java services as UID/GID
-# 1001.  RAG owns queued work after handoff, so it must use the same numeric
+# 1001. RAG owns indexing workspaces after handoff, so it must use the same numeric
 # identity to remove the producer-created top-level directory under /tmp's
 # sticky-bit protection.
 RUN groupadd --gid 1001 appgroup && \
     useradd --uid 1001 --gid appgroup --no-create-home \
         --shell /usr/sbin/nologin appuser
 
-# Create cache directories with proper permissions
-RUN mkdir -p /tmp/.tiktoken_cache /tmp/.transformers_cache /tmp/.huggingface /tmp/.llama_index && \
-    chmod -R 777 /tmp && \
+# Prepare the shared temporary workspace.
+RUN chmod -R 777 /tmp && \
     chown -R appuser:appgroup /app
 
 USER appuser
@@ -46,19 +45,8 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app/src:/app/plugins/contracts/python
 ENV CODECROW_PLUGINS_ROOT=/app/plugins
 ENV HOME=/tmp
-ENV TIKTOKEN_CACHE_DIR=/tmp/.tiktoken_cache
-ENV TRANSFORMERS_CACHE=/tmp/.transformers_cache
-ENV HF_HOME=/tmp/.huggingface
-ENV LLAMA_INDEX_CACHE_DIR=/tmp/.llama_index
 # Allow concurrent indexing by running multiple Uvicorn workers
 ENV UVICORN_WORKERS=1
-
-# CPU Threading Optimization (can be overridden via .env)
-# These control parallelism for numerical operations
-ENV OMP_NUM_THREADS=4
-ENV MKL_NUM_THREADS=4
-ENV OPENBLAS_NUM_THREADS=4
-ENV NUMEXPR_NUM_THREADS=4
 
 EXPOSE 8001
 

@@ -216,38 +216,6 @@ def test_line_only_movement_does_not_publish_removed_relation():
     )
 
 
-def test_persistent_incremental_does_not_store_pr_transition_facts():
-    files = {
-        "app/policy.py": "def allowed(user):\n    return user.active\n",
-        "app/service.py": (
-            "from app.policy import allowed\n"
-            "def can_run(user):\n"
-            "    return allowed(user)\n"
-        ),
-    }
-    _, runtime, capabilities, analysis = _analyze(files)
-    restored = runtime.start_repository_analysis(
-        capabilities,
-        "fedcba9876543210",
-        snapshots=analysis.snapshots,
-        mode=RepositoryAnalysisMode.PERSISTENT_INCREMENTAL,
-    )
-    restored.ingest((FileArtifact(
-        "app/service.py",
-        "def can_run(user):\n    return user.active\n",
-    ),))
-
-    updated, diagnostics = restored.finish()
-
-    assert diagnostics == ()
-    assert not any(
-        fact.kind.endswith("-pr-removed-relation")
-        or packet.kind.endswith("-import-graph-delta")
-        for packet in updated.packets
-        for fact in packet.facts
-    )
-
-
 def test_typescript_import_and_call_resolve_to_exported_policy():
     files = {
         "src/downloadPolicy.ts": (

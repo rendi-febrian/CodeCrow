@@ -195,8 +195,6 @@ def _capture(
         ],
         "retrieval": {
             "deterministicStates": ["complete"],
-            "semanticFailures": 0,
-            "semanticDisabled": False,
             "exactEvidenceIds": reviewable_hunks,
         },
     }
@@ -553,7 +551,7 @@ def _certified_inventory():
             "id": "defect-a",
             "file": "app/code/Vendor/Module/Model/Example.php",
             "line": 10,
-            "summary": "Candidate-blind semantic regression",
+            "summary": "Candidate-blind behavioral regression",
             "evidenceFiles": ["app/code/Vendor/Module/Policy.php"],
         }],
         "certification": {
@@ -610,7 +608,7 @@ def test_binds_candidate_blind_inventory_to_exact_capture_identity(tmp_path):
         "id": "defect-a",
         "file": "app/code/Vendor/Module/Model/Example.php",
         "line": 10,
-        "summary": "Candidate-blind semantic regression",
+        "summary": "Candidate-blind behavioral regression",
         "evidenceFiles": ["app/code/Vendor/Module/Policy.php"],
     }]
     assert template["cases"][0]["groundTruth"]["status"] == "unreviewed"

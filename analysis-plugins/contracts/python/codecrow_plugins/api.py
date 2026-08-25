@@ -54,7 +54,6 @@ class RepositoryAnalysisMode(str, Enum):
     """Describe how repository state will be consumed by the host."""
 
     FULL_INDEX = "full-index"
-    PERSISTENT_INCREMENTAL = "persistent-incremental"
     PR_OVERLAY = "pr-overlay"
 
 
@@ -427,7 +426,7 @@ class SyntaxContribution:
 
 @dataclass(frozen=True, order=True)
 class RepositorySnapshot:
-    """Opaque, plugin-owned state used for exact incremental graph overlays."""
+    """Opaque plugin state used to project exact PR architecture overlays."""
 
     plugin_id: str
     kind: str
@@ -441,7 +440,7 @@ class RepositorySnapshot:
 
 @dataclass(frozen=True, order=True)
 class RepositoryContext:
-    """Exact plugin-selected source kept outside semantic embedding."""
+    """Exact plugin-selected source stored as a standalone structural record."""
 
     plugin_id: str
     kind: str

@@ -83,7 +83,7 @@ async def lifespan(app: FastAPI):
     """Manage startup and shutdown lifecycle of the application.
 
     Creates shared singletons (config, index_manager, query_service) on
-    startup and tears them down on shutdown — closing Qdrant + HTTP clients.
+    startup and tears them down on shutdown.
     """
     global config, index_manager, query_service
     logger.info("Starting RAG Pipeline API...")
@@ -105,11 +105,6 @@ async def lifespan(app: FastAPI):
             cleaned_stream_workspaces,
         )
 
-    # Initialize and start the Redis Queue Consumer
-    from ..server.rag_queue_consumer import RAGQueueConsumer
-    rag_queue_consumer = RAGQueueConsumer(index_manager)
-    app.state.rag_queue_consumer = rag_queue_consumer
-    await rag_queue_consumer.start()
     app.state.pending_collection_janitor = asyncio.create_task(
         _pending_collection_janitor(index_manager)
     )
@@ -123,18 +118,11 @@ async def lifespan(app: FastAPI):
             await app.state.pending_collection_janitor
         except asyncio.CancelledError:
             pass
-    if hasattr(app.state, 'rag_queue_consumer'):
-        await app.state.rag_queue_consumer.stop()
     # HTTP streaming requests run synchronous indexing in dedicated workers.
     # A disconnected response task can be gone before that call returns, so
-    # drain the independently tracked workers before closing shared embedding
-    # and Qdrant clients.
+    # drain the independently tracked workers before closing Qdrant clients.
     from .routers.index import drain_index_repository_stream_workers
     await drain_index_repository_stream_workers()
-    if hasattr(index_manager, 'embed_model') and hasattr(index_manager.embed_model, 'close'):
-        index_manager.embed_model.close()
-    if hasattr(query_service, 'embed_model') and hasattr(query_service.embed_model, 'close'):
-        query_service.embed_model.close()
     if query_service is not None:
         query_service.close()
     if index_manager is not None:
@@ -143,7 +131,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="CodeCrow RAG API",
+    title="CodeCrow Repository Index API",
     version="unreleased",
     lifespan=lifespan,
 )

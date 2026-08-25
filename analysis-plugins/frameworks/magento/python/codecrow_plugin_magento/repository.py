@@ -28,23 +28,43 @@ from codecrow_plugins.graphql import (
 )
 
 from .architecture import (
+    MAGENTO_GRAPHQL_CLIENT_SUFFIXES,
     MAGENTO_AREAS,
+    MAGENTO_VIEW_SOURCE_SUFFIXES,
     ModuleRecord,
     PacketGraph,
     attrs,
     config_area,
     is_magento_config_xml,
+    is_magento_view_xml,
     line,
     safe_xml,
     tag,
     view_area,
 )
+from .events import (
+    EventDispatch,
+    EventEntrypoint,
+    decode_event_dispatches,
+    resolve_dispatch_area,
+)
+from .frontend_init import extract_frontend_initializers
 from .javascript import (
+    OptionalJavaScriptEnrichmentError,
     TemplateEventReference,
     TemplateGlobalReference,
     extract_requirejs_relations,
     extract_template_event_references,
     extract_template_global_references,
+)
+from .layout import LayoutArgument, merge_layout, parse_layout_document
+from .requirejs import (
+    EffectiveRequireJsConfig,
+    RequireJsResolution,
+    build_effective_requirejs_config,
+    extract_amd_dependencies,
+    extract_template_amd_dependencies,
+    normalize_amd_dependency,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,9 +83,7 @@ _REGISTRATION = re.compile(
 _THEME_REGISTRATION = re.compile(
     r"ComponentRegistrar::THEME\s*,\s*['\"](?P<name>[^'\"]+)['\"]"
 )
-_PHTML_BLOCK_CALL = re.compile(
-    r"\$block\s*->\s*(?P<method>[A-Za-z_][A-Za-z0-9_]*)\s*\("
-)
+_PHP_TEMPLATE_CALL_REFERENCE = "php-template-instance-call-reference:"
 _DEPLOYMENT_DEFAULT_CONNECTION = "deployment-default"
 _BROKER_DEFAULT_EXCHANGE = "broker-default-exchange"
 _DEFAULT_MESSAGE_CONSUMER = (
@@ -162,6 +180,14 @@ class ThemeRecord:
     parent: str = ""
 
 
+@dataclass(frozen=True, order=True)
+class TemplatePhpCall:
+    receiver: str
+    method: str
+    line: int
+    literal_arguments: tuple[tuple[int, str], ...] = ()
+
+
 def _module_root(path: str) -> str:
     suffix = "/etc/module.xml"
     if path == "etc/module.xml":
@@ -212,8 +238,31 @@ class MagentoRepositoryResolver:
         self._roots: dict[str, object] = {}
         self._diagnostics: list[PluginDiagnostic] = []
         self.invalid_paths: set[str] = set()
+        self._optional_enrichment_diagnostics: set[tuple[str, str | None]] = set()
+        self._template_metadata_diagnostics: set[tuple[str, str]] = set()
+        self._template_php_call_cache: dict[
+            tuple[str, str],
+            tuple[TemplatePhpCall, ...],
+        ] = {}
+        self._ui_component_paths_by_name: dict[str, tuple[str, ...]] = {}
+        for path in artifacts:
+            if "/ui_component/" not in f"/{path}" or not path.endswith(
+                ".xml"
+            ):
+                continue
+            name = PurePosixPath(path).stem
+            self._ui_component_paths_by_name.setdefault(name, tuple())
+            self._ui_component_paths_by_name[name] += (path,)
+        self._requirejs_configs: dict[
+            tuple[str, str],
+            EffectiveRequireJsConfig,
+        ] = {}
         self._effective_di_arguments: dict[str, dict[str, dict]] = {}
         self._template_layout_sources: dict[
+            str,
+            set[tuple[str, str, str]],
+        ] = {}
+        self._conditional_template_layout_sources: dict[
             str,
             set[tuple[str, str, str]],
         ] = {}
@@ -291,7 +340,56 @@ class MagentoRepositoryResolver:
         started = time.monotonic()
         modules = self._run_stage("module discovery", self._modules)
         if not modules:
-            return RepositoryAnalysis(), tuple(self._diagnostics)
+            themes = self._run_stage(
+                "theme discovery",
+                lambda: self._themes(modules),
+            )
+            if not themes:
+                return RepositoryAnalysis(), tuple(self._diagnostics)
+            theme_stages = (
+                ("routes/layouts", lambda: self._routes_and_layouts(
+                    modules,
+                    themes,
+                )),
+                ("template globals", self._template_globals),
+                ("template events", lambda: self._template_events(themes)),
+                ("UI components", lambda: self._ui_components(
+                    modules,
+                    themes,
+                )),
+                ("RequireJS", lambda: self._requirejs(modules, themes)),
+                ("frontend initializers", lambda: (
+                    self._frontend_initializers(modules, themes)
+                )),
+                ("AMD consumers", lambda: self._amd_consumers(
+                    modules,
+                    themes,
+                )),
+            )
+            for stage_name, stage in theme_stages:
+                try:
+                    self._run_stage(stage_name, stage)
+                except TimeoutError:
+                    raise
+                except OptionalJavaScriptEnrichmentError as exception:
+                    self._record_optional_enrichment_failure(
+                        stage_name,
+                        exception,
+                    )
+                    continue
+                except Exception as exception:
+                    raise RuntimeError(
+                        f"Magento {stage_name} enrichment failed: "
+                        f"{type(exception).__name__}: {exception}"
+                    ) from exception
+            packets = self._run_stage("packet materialization", self.graph.build)
+            logger.info(
+                "Magento theme repository resolution: themes=%s packets=%s elapsed=%.3fs",
+                len(themes),
+                len(packets),
+                time.monotonic() - started,
+            )
+            return RepositoryAnalysis(packets=packets), tuple(self._diagnostics)
         try:
             self._run_stage(
                 "module packets",
@@ -316,13 +414,14 @@ class MagentoRepositoryResolver:
                 ("generated proxies", lambda: (
                     self._generated_proxy_packets(modules, di_states)
                 )),
-                ("events", lambda: self._events(modules)),
+                ("events", lambda: self._events(modules, di_states)),
                 ("system configuration", lambda: (
                     self._system_configuration(modules)
                 )),
                 ("routes/layouts", lambda: self._routes_and_layouts(
                     modules,
                     themes,
+                    di_states,
                 )),
                 ("Admin menu", lambda: self._admin_menu(modules)),
                 ("template globals", self._template_globals),
@@ -336,6 +435,13 @@ class MagentoRepositoryResolver:
                     themes,
                 )),
                 ("RequireJS", lambda: self._requirejs(modules, themes)),
+                ("frontend initializers", lambda: (
+                    self._frontend_initializers(modules, themes)
+                )),
+                ("AMD consumers", lambda: self._amd_consumers(
+                    modules,
+                    themes,
+                )),
                 ("Web API/ACL", lambda: self._webapi_and_acl(
                     modules,
                     di_states,
@@ -360,6 +466,12 @@ class MagentoRepositoryResolver:
                     self._run_stage(stage_name, stage)
                 except TimeoutError:
                     raise
+                except OptionalJavaScriptEnrichmentError as exception:
+                    self._record_optional_enrichment_failure(
+                        stage_name,
+                        exception,
+                    )
+                    continue
                 except Exception as exception:
                     raise RuntimeError(
                         f"Magento {stage_name} enrichment failed: "
@@ -375,6 +487,51 @@ class MagentoRepositoryResolver:
             time.monotonic() - started,
         )
         return RepositoryAnalysis(packets=packets), tuple(self._diagnostics)
+
+    def _record_optional_enrichment_failure(
+        self,
+        stage_name: str,
+        exception: OptionalJavaScriptEnrichmentError,
+        path: str | None = None,
+    ) -> None:
+        """Record an expected optional frontend degradation once per source."""
+
+        diagnostic_path = path if exception.source_specific else None
+        identity = (exception.diagnostic_code, diagnostic_path)
+        if identity in self._optional_enrichment_diagnostics:
+            return
+        self._optional_enrichment_diagnostics.add(identity)
+        location = f" for {path}" if path else ""
+        self._diagnostics.append(PluginDiagnostic(
+            exception.diagnostic_code,
+            (
+                f"Magento {stage_name} enrichment skipped{location}: "
+                f"{exception}"
+            ),
+            self.plugin_id,
+            diagnostic_path,
+            recoverable=True,
+        ))
+
+    def _optional_frontend_source(
+        self,
+        stage_name: str,
+        path: str,
+        extractor,
+    ):
+        """Skip only malformed sources; propagate stage-wide unavailability."""
+
+        try:
+            return extractor(self.artifacts[path])
+        except OptionalJavaScriptEnrichmentError as exception:
+            if not exception.source_specific:
+                raise
+            self._record_optional_enrichment_failure(
+                stage_name,
+                exception,
+                path,
+            )
+            return ()
 
     def _xml(self, path: str):
         if path in self._roots:
@@ -2155,10 +2312,165 @@ class MagentoRepositoryResolver:
             result[parent] = descendants
         return result
 
-    def _events(self, modules: tuple[ModuleRecord, ...]) -> None:
+    def _event_entrypoints(
+        self,
+        modules: tuple[ModuleRecord, ...],
+        states: dict[str, DiState],
+        dispatches: tuple[EventDispatch, ...],
+    ) -> tuple[EventEntrypoint, ...]:
+        """Collect exact runtime-area evidence for dispatching callables."""
+        entrypoints: set[EventEntrypoint] = set()
+        global_state = states.get("global", DiState())
+
+        routed_modules: dict[tuple[str, str], set[str]] = {}
+        for area in ("adminhtml", "frontend"):
+            for path, _, _ in self._ordered_configs(
+                "routes.xml",
+                modules,
+                area,
+            ):
+                root = self._xml(path)
+                if root is None:
+                    continue
+                for route_module in (
+                    node
+                    for route in root.iter()
+                    if tag(route) == "route"
+                    for node in route
+                    if tag(node) == "module" and node.get("name")
+                ):
+                    routed_modules.setdefault(
+                        (area, route_module.get("name")),
+                        set(),
+                    ).add(path)
+
+        for dispatch in dispatches:
+            if dispatch.caller.casefold() != "execute":
+                continue
+            module = self._module_for_path(dispatch.path, modules)
+            if module is None or not module.enabled:
+                continue
+            relative = (
+                dispatch.path[len(module.root):].lstrip("/")
+                if module.root
+                else dispatch.path
+            )
+            normalized = "/" + relative.casefold().strip("/")
+            candidate_area = ""
+            if "/controller/adminhtml/" in normalized:
+                candidate_area = "adminhtml"
+            elif "/controller/" in normalized:
+                candidate_area = "frontend"
+            for path in sorted(routed_modules.get(
+                (candidate_area, module.name),
+                (),
+            )):
+                entrypoints.add(EventEntrypoint(
+                    candidate_area,
+                    dispatch.owner,
+                    dispatch.caller,
+                    path,
+                ))
+
+        for path, _, _ in self._ordered_configs(
+            "crontab.xml",
+            modules,
+            "global",
+        ):
+            root = self._xml(path)
+            if root is None:
+                continue
+            state = states.get("crontab", global_state)
+            for job in (
+                node
+                for node in root.iter()
+                if tag(node) == "job" and node.get("instance")
+            ):
+                target = self._resolve_type(job.get("instance"), state)
+                entrypoints.add(EventEntrypoint(
+                    "crontab",
+                    target,
+                    job.get("method", "execute"),
+                    path,
+                ))
+
+        for path, content in sorted(self.artifacts.items()):
+            if not path.casefold().endswith(".graphqls"):
+                continue
+            module = self._module_for_path(path, modules)
+            if module is None or not module.enabled:
+                continue
+            state = states.get("graphql", global_state)
+            for declaration in parse_schema(content):
+                directives = [
+                    *declaration.directives,
+                    *(
+                        directive
+                        for field in declaration.fields
+                        for directive in field.directives
+                    ),
+                ]
+                for directive in directives:
+                    target = directive.argument("class")
+                    if (
+                        directive.name not in {"resolver", "typeResolver"}
+                        or not target
+                    ):
+                        continue
+                    entrypoints.add(EventEntrypoint(
+                        "graphql",
+                        self._resolve_type(target, state),
+                        (
+                            "resolveType"
+                            if directive.name == "typeResolver"
+                            else "resolve"
+                        ),
+                        path,
+                    ))
+
+        for path, _, _ in self._ordered_configs(
+            "webapi.xml",
+            modules,
+            "global",
+        ):
+            root = self._xml(path)
+            if root is None:
+                continue
+            for service in (
+                node
+                for node in root.iter()
+                if tag(node) == "service"
+                and node.get("class")
+                and node.get("method")
+            ):
+                for area in ("webapi_rest", "webapi_soap"):
+                    state = states.get(area, global_state)
+                    entrypoints.add(EventEntrypoint(
+                        area,
+                        self._resolve_type(service.get("class"), state),
+                        service.get("method"),
+                        path,
+                    ))
+        return tuple(sorted(entrypoints))
+
+    def _events(
+        self,
+        modules: tuple[ModuleRecord, ...],
+        states: dict[str, DiState],
+    ) -> None:
         areas = {"global", *MAGENTO_AREAS}
+        effective_by_area: dict[
+            str,
+            dict[tuple[str, str], ConfigValue],
+        ] = {}
+        provenance_by_area: dict[
+            str,
+            dict[tuple[str, str], tuple[ConfigValue, ...]],
+        ] = {}
+        global_state = states.get("global", DiState())
         for area in sorted(areas):
             observers: dict[tuple[str, str], ConfigValue] = {}
+            provenance: dict[tuple[str, str], list[ConfigValue]] = {}
             for path, module, order in self._ordered_configs("events.xml", modules, area):
                 root = self._xml(path)
                 if root is None:
@@ -2174,13 +2486,42 @@ class MagentoRepositoryResolver:
                             key: value for key, value in observer.attrib.items()
                             if key not in {"instance", "name"}
                         })
-                        observers[(event.get("name"), observer.get("name"))] = ConfigValue(
+                        key = (event.get("name"), observer.get("name"))
+                        declaration = ConfigValue(
+                            observer.get("instance", ""),
+                            path,
+                            line(content, observer.get("name")),
+                            module_name,
+                            order,
+                            tuple(sorted({
+                                name: value
+                                for name, value in observer.attrib.items()
+                                if name not in {"instance", "name"}
+                            }.items())),
+                        )
+                        provenance.setdefault(key, []).append(declaration)
+                        observers[key] = ConfigValue(
                             instance, path, line(content, observer.get("name")), module_name, order,
                             tuple(sorted(merged.items())),
                         )
+            effective_by_area[area] = observers
+            provenance_by_area[area] = {
+                key: tuple(values)
+                for key, values in provenance.items()
+            }
+            state = states.get(area, global_state)
             for (event_name, observer_name), observer in sorted(observers.items()):
                 observer_attrs = dict(observer.attributes)
                 disabled = observer_attrs.get("disabled", "false").casefold() in {"1", "true"}
+                resolved_instance = (
+                    self._resolve_type(observer.value, state)
+                    if observer.value
+                    else ""
+                )
+                declaration_paths = tuple(sorted({
+                    declaration.path
+                    for declaration in provenance[(event_name, observer_name)]
+                }))
                 packet = self.graph.packet("magento-event", f"{area}:{event_name}", area=area)
                 packet.add(GraphFact(
                     "magento-effective-observer",
@@ -2194,13 +2535,190 @@ class MagentoRepositoryResolver:
                         "module": observer.module,
                         **observer_attrs,
                         "name": observer_name,
+                        "resolvedInstance": resolved_instance,
+                        "declarationCount": len(
+                            provenance[(event_name, observer_name)]
+                        ),
                     }),
-                ), self._symbol_path(observer.value))
+                ),
+                    self._symbol_path(observer.value),
+                    self._symbol_path(resolved_instance),
+                    *self._resolution_paths(observer.value, state),
+                    *declaration_paths,
+                )
+                for declaration in provenance[(event_name, observer_name)][:-1]:
+                    packet.add(GraphFact(
+                        "magento-observer-override",
+                        f"{event_name}:{observer_name}",
+                        "overridden-by-observer-config",
+                        observer.path,
+                        declaration.path,
+                        declaration.line,
+                        attrs(
+                            area=area,
+                            disabled=disabled,
+                            effectiveInstance=observer.value,
+                            effectiveModule=observer.module,
+                        ),
+                    ), observer.path)
+
+        dispatches = decode_event_dispatches(self.symbols)
+        entrypoints = self._event_entrypoints(
+            modules,
+            states,
+            dispatches,
+        )
+        for dispatch in dispatches:
+            area_resolution = resolve_dispatch_area(dispatch, entrypoints)
+            packet = self.graph.packet(
+                "magento-event-dispatch",
+                f"{dispatch.path}:{dispatch.line}:{dispatch.event_name}",
+                event=dispatch.event_name,
+            )
+            packet.add(GraphFact(
+                "magento-event-dispatch",
+                dispatch.callable,
+                "dispatches-event",
+                dispatch.event_name,
+                dispatch.path,
+                dispatch.line,
+                attrs(
+                    area=area_resolution.area,
+                    areaCandidates=",".join(area_resolution.candidate_areas),
+                    areaResolution=area_resolution.status,
+                    literalResolution=dispatch.literal_resolution,
+                    receiverResolution=dispatch.receiver_resolution,
+                    receiverType=dispatch.receiver_type,
+                    semanticRole="topology",
+                ),
+            ), *area_resolution.paths)
+
+            observer_area = (
+                area_resolution.area
+                if area_resolution.status == "proven"
+                else "global"
+            )
+            possible_areas = (
+                area_resolution.candidate_areas
+                if area_resolution.candidate_areas
+                else tuple(sorted(MAGENTO_AREAS))
+            )
+            for key, observer in sorted(
+                effective_by_area.get(observer_area, {}).items()
+            ):
+                event_name, observer_name = key
+                if event_name != dispatch.event_name:
+                    continue
+                observer_attrs = dict(observer.attributes)
+                if observer_attrs.get("disabled", "false").casefold() in {
+                    "1",
+                    "true",
+                }:
+                    continue
+
+                candidate_observers = (
+                    (observer,)
+                    if area_resolution.status == "proven"
+                    else tuple(
+                        effective_by_area.get(area, {}).get(key)
+                        for area in possible_areas
+                    )
+                )
+                if (
+                    any(candidate is None for candidate in candidate_observers)
+                    or len(set(candidate_observers)) != 1
+                ):
+                    continue
+                resolved_candidates = {
+                    self._resolve_type(
+                        observer.value,
+                        states.get(area, global_state),
+                    )
+                    for area in (
+                        (observer_area,)
+                        if area_resolution.status == "proven"
+                        else possible_areas
+                    )
+                    if observer.value
+                }
+                if len(resolved_candidates) != 1:
+                    continue
+                resolved_instance = next(iter(resolved_candidates))
+                configured_symbol = self._unique_symbol_casefold(
+                    observer.value
+                )
+                resolved_symbol = self._unique_symbol_casefold(
+                    resolved_instance
+                )
+                execution = (
+                    self._method_symbol(resolved_symbol, "execute")
+                    if resolved_symbol is not None
+                    else None
+                )
+                if execution is not None:
+                    declaring_symbol, execute_method = execution
+                    target = (
+                        f"{declaring_symbol.qualified_name}::{execute_method}"
+                    )
+                    relation = "dispatches-to-observer-execute"
+                    execution_path = declaring_symbol.path
+                else:
+                    target = resolved_instance
+                    relation = "dispatches-to-observer-class"
+                    execution_path = (
+                        resolved_symbol.path if resolved_symbol else ""
+                    )
+                declaration_paths = tuple(sorted({
+                    declaration.path
+                    for declaration in provenance_by_area[
+                        observer_area
+                    ][key]
+                }))
+                resolution_areas = (
+                    (observer_area,)
+                    if area_resolution.status == "proven"
+                    else possible_areas
+                )
+                resolution_paths = tuple(sorted({
+                    path
+                    for area in resolution_areas
+                    for path in self._resolution_paths(
+                        observer.value,
+                        states.get(area, global_state),
+                    )
+                }))
+                packet.add(GraphFact(
+                    "magento-event-dispatch-observer",
+                    dispatch.callable,
+                    relation,
+                    target,
+                    dispatch.path,
+                    dispatch.line,
+                    attrs(
+                        area=area_resolution.area,
+                        areaResolution=area_resolution.status,
+                        configuredObserver=observer.value,
+                        event=dispatch.event_name,
+                        observerArea=observer_area,
+                        observerName=observer_name,
+                        resolvedObserver=resolved_instance,
+                        semanticRole="topology",
+                    ),
+                ),
+                    observer.path,
+                    configured_symbol.path if configured_symbol else "",
+                    resolved_symbol.path if resolved_symbol else "",
+                    execution_path,
+                    *resolution_paths,
+                    *declaration_paths,
+                    *area_resolution.paths,
+                )
 
     def _routes_and_layouts(
         self,
         modules: tuple[ModuleRecord, ...],
         themes: tuple[ThemeRecord, ...],
+        di_states: dict[str, DiState] | None = None,
     ) -> None:
         route_modules: dict[tuple[str, str], dict[str, ConfigValue]] = {}
         route_front_names: dict[tuple[str, str], str] = {}
@@ -2253,14 +2771,15 @@ class MagentoRepositoryResolver:
 
         def layout_identity(
             path: str,
+            directory: str = "layout",
         ) -> tuple[str, str, str, ThemeRecord | None] | None:
-            """Mirror Magento's View File identifier for collected layout XML."""
+            """Mirror Magento's View File identifier for either layout kind."""
             filename = PurePosixPath(path).name
             theme = self._theme_for_path(path, themes)
             if theme is not None:
                 relative = path[len(theme.root):].lstrip("/")
                 parts = relative.split("/")
-                if len(parts) < 3 or parts[1] != "layout":
+                if len(parts) < 3 or parts[1] != directory:
                     return None
                 module_name = parts[0]
                 if (
@@ -2300,7 +2819,7 @@ class MagentoRepositoryResolver:
                 else path
             )
             match = re.match(
-                r"view/(?P<area>[^/]+)/layout/.+\.xml$",
+                rf"view/(?P<area>[^/]+)/{re.escape(directory)}/.+\.xml$",
                 relative,
             )
             if match is None:
@@ -2581,15 +3100,10 @@ class MagentoRepositoryResolver:
                                 theme,
                             )
                         )
-                        if selected_template_path:
-                            self._template_layout_sources.setdefault(
-                                selected_template_path,
-                                set(),
-                            ).add((path, area, handle))
                         packet.add(GraphFact(
                             "magento-layout-block",
                             handle,
-                            "renders-block",
+                            "declares-block",
                             target,
                             path,
                             line(content, target),
@@ -2622,7 +3136,7 @@ class MagentoRepositoryResolver:
                             packet.add(GraphFact(
                                 "magento-template-block-binding",
                                 selected_template_path,
-                                "rendered-by-block-class",
+                                "declared-with-block-class",
                                 block_class,
                                 selected_template_path,
                                 1,
@@ -2633,28 +3147,27 @@ class MagentoRepositoryResolver:
                                 ),
                                 related_paths=related,
                             ))
-                            if block_symbol is not None:
-                                template_content = self.artifacts.get(
-                                    selected_template_path, ""
-                                )
-                                for call in _PHTML_BLOCK_CALL.finditer(
-                                    template_content
-                                ):
-                                    declaration = self._method_symbol(
-                                        block_symbol, call.group("method")
+                            for call in self._template_php_calls(
+                                selected_template_path,
+                                "block",
+                            ):
+                                declaration = (
+                                    self._method_symbol(
+                                        block_symbol,
+                                        call.method,
                                     )
-                                    if declaration is None:
-                                        continue
+                                    if block_symbol is not None
+                                    else None
+                                )
+                                if declaration is not None:
                                     declaring_symbol, declared_method = declaration
                                     packet.add(GraphFact(
                                         "magento-template-block-method-call",
                                         selected_template_path,
-                                        "calls-block-method",
+                                        "declares-block-method-call",
                                         f"{declaring_symbol.qualified_name}::{declared_method}",
                                         selected_template_path,
-                                        template_content.count(
-                                            "\n", 0, call.start()
-                                        ) + 1,
+                                        call.line,
                                         attrs(
                                             area=area,
                                             blockClass=block_class,
@@ -2688,7 +3201,7 @@ class MagentoRepositoryResolver:
                                     packet.add(GraphFact(
                                         "magento-template-view-model-binding",
                                         selected_template_path,
-                                        "receives-layout-object",
+                                        "declares-layout-object",
                                         object_class,
                                         selected_template_path,
                                         1,
@@ -2703,6 +3216,15 @@ class MagentoRepositoryResolver:
                                             object_symbol.path if object_symbol else "",
                                         )))),
                                     ))
+
+        self._effective_layouts(
+            modules,
+            themes,
+            layout_by_handle,
+            effective_layout_paths,
+            layout_identity,
+            di_states,
+        )
 
         for (area, route_id), entries_by_module in sorted(route_modules.items()):
             entries, route_order_complete = self._ordered_route_modules(
@@ -2844,6 +3366,1693 @@ class MagentoRepositoryResolver:
                             routeModule=shadowed_entry.value,
                         ),
                     ), winner.path)
+
+    def _effective_layouts(
+        self,
+        modules: tuple[ModuleRecord, ...],
+        themes: tuple[ThemeRecord, ...],
+        layout_by_handle: dict[tuple[str, str], list[str]],
+        effective_layout_paths: Callable[
+            [str, str, ThemeRecord | None], tuple[str, ...]
+        ],
+        layout_identity: Callable[
+            [str, str],
+            tuple[str, str, str, ThemeRecord | None] | None,
+        ],
+        di_states: dict[str, DiState] | None,
+    ) -> None:
+        """Emit the effective Magento layout for every provable theme selection.
+
+        Module/theme file collection remains repository-aware here. Instruction
+        parsing and mutation semantics live in ``layout.py`` so the large
+        repository resolver only supplies ordered, runtime-compatible inputs.
+        """
+
+        module_order = {
+            module.name: module.order
+            for module in modules
+            if module.enabled
+        }
+        parsed_documents = {}
+
+        def parse_document(path: str, area: str, handle: str):
+            identity = (path, area, handle)
+            if identity in parsed_documents:
+                return parsed_documents[identity]
+            root = self._xml(path)
+            if root is None:
+                parsed_documents[identity] = None
+                return None
+            document = parse_layout_document(
+                path=path,
+                area=area,
+                handle=handle,
+                content=self.artifacts[path],
+                root=root,
+            )
+            parsed_documents[identity] = document
+            return document
+
+        def selection_load_key(
+            path: str,
+            area: str,
+            selected_theme: ThemeRecord | None,
+        ) -> tuple[int, int, int, str]:
+            theme = self._theme_for_path(path, themes)
+            if theme is None:
+                module = self._module_for_path(path, modules)
+                source_area = view_area(path, "layout") or view_area(
+                    path,
+                    "page_layout",
+                )
+                return (
+                    0 if source_area == "base" else 1,
+                    module.order if module is not None else -1,
+                    0,
+                    path,
+                )
+            chain = (
+                tuple(reversed(self._theme_chain(selected_theme, themes)))
+                if selected_theme is not None
+                else ()
+            )
+            theme_position = next(
+                (
+                    index
+                    for index, candidate in enumerate(chain)
+                    if candidate == theme
+                ),
+                len(chain),
+            )
+            theme_module = self._theme_module(path, theme)
+            return (
+                2,
+                theme_position,
+                module_order.get(theme_module, -1),
+                path,
+            )
+
+        def selection_layout_paths(
+            area: str,
+            handle: str,
+            selected_theme: ThemeRecord | None,
+        ) -> tuple[str, ...]:
+            candidates = effective_layout_paths(
+                area,
+                handle,
+                selected_theme,
+            )
+            if selected_theme is None:
+                candidates = tuple(
+                    path
+                    for path in candidates
+                    if self._theme_for_path(path, themes) is None
+                )
+            return tuple(sorted(
+                candidates,
+                key=lambda path: selection_load_key(
+                    path,
+                    area,
+                    selected_theme,
+                ),
+            ))
+
+        page_layout_by_id: dict[tuple[str, str], list[str]] = {}
+        page_layout_identities: dict[
+            str,
+            tuple[str, str, str, ThemeRecord | None],
+        ] = {}
+        layout_declarations: dict[tuple[str, str], set[str]] = {}
+        for path in sorted(self.artifacts):
+            theme = self._theme_for_path(path, themes)
+            if not self._is_deployed_view_source(path, modules, themes):
+                continue
+            normalized = f"/{path}"
+            if "/page_layout/" in normalized and path.endswith(".xml"):
+                area = view_area(path, "page_layout") or (
+                    theme.area if theme else None
+                )
+                if area is not None:
+                    page_layout_by_id.setdefault(
+                        (area, PurePosixPath(path).stem),
+                        [],
+                    ).append(path)
+                    identity = layout_identity(path, "page_layout")
+                    if identity is not None:
+                        page_layout_identities[path] = identity
+                continue
+            if (
+                PurePosixPath(path).name != "layouts.xml"
+                or "/page_layout/" in normalized
+            ):
+                continue
+            area_match = re.search(
+                r"/view/(base|frontend|adminhtml)/layouts\.xml$",
+                normalized,
+            )
+            area = (
+                area_match.group(1)
+                if area_match is not None
+                else (theme.area if theme else None)
+            )
+            if area is None:
+                continue
+            root = self._xml(path)
+            if root is None:
+                continue
+            content = self.artifacts[path]
+            for element in root.iter():
+                if tag(element) != "layout" or not element.get("id"):
+                    continue
+                layout_id = element.get("id", "").strip()
+                if not layout_id:
+                    continue
+                layout_declarations.setdefault((area, layout_id), set()).add(
+                    path
+                )
+                packet = self.graph.packet(
+                    "magento-page-layout",
+                    f"{area}:{layout_id}",
+                    area=area,
+                    pageLayout=layout_id,
+                )
+                packet.add(GraphFact(
+                    "magento-page-layout-declaration",
+                    layout_id,
+                    "declared-in",
+                    path,
+                    path,
+                    line(content, layout_id),
+                    attrs(
+                        area=area,
+                        label=next(
+                            (
+                                (child.text or "").strip()
+                                for child in element
+                                if tag(child) == "label"
+                            ),
+                            element.get("label", ""),
+                        ),
+                        theme=theme.name if theme else "",
+                    ),
+                ), theme.theme_xml if theme else "")
+
+        def selection_page_layout_paths(
+            area: str,
+            layout_id: str,
+            selected_theme: ThemeRecord | None,
+        ) -> tuple[str, ...]:
+            allowed_theme_roots = (
+                {
+                    candidate.root
+                    for candidate in self._theme_chain(
+                        selected_theme,
+                        themes,
+                    )
+                }
+                if selected_theme is not None
+                else set()
+            )
+            paths = {
+                path
+                for candidate_area in (
+                    ("base", area) if area != "base" else ("base",)
+                )
+                for path in page_layout_by_id.get(
+                    (candidate_area, layout_id),
+                    (),
+                )
+                if (
+                    (candidate_theme := self._theme_for_path(path, themes))
+                    is None
+                    or (
+                        selected_theme is not None
+                        and candidate_theme.root in allowed_theme_roots
+                    )
+                )
+            }
+            if selected_theme is not None:
+                effective_by_identity = {
+                    identity[0]: path
+                    for path in sorted(paths)
+                    if (
+                        (identity := page_layout_identities.get(path))
+                        is not None
+                        and identity[3] is None
+                    )
+                }
+                for current_theme in reversed(
+                    self._theme_chain(selected_theme, themes)
+                ):
+                    theme_paths = tuple(sorted(
+                        path
+                        for path in paths
+                        if (
+                            (identity := page_layout_identities.get(path))
+                            is not None
+                            and identity[3] == current_theme
+                        )
+                    ))
+                    for path in theme_paths:
+                        identity = page_layout_identities[path]
+                        if not identity[1].startswith("override-"):
+                            effective_by_identity[identity[0]] = path
+                    for path in theme_paths:
+                        identity = page_layout_identities[path]
+                        if (
+                            identity[1].startswith("override-")
+                            and identity[0] in effective_by_identity
+                        ):
+                            effective_by_identity[identity[0]] = path
+                paths = set(effective_by_identity.values())
+            return tuple(sorted(
+                paths,
+                key=lambda path: selection_load_key(
+                    path,
+                    area,
+                    selected_theme,
+                ),
+            ))
+
+        runtime_areas = {
+            area
+            for area, _ in layout_by_handle
+            if area != "base"
+        }
+        runtime_areas.update(theme.area for theme in themes)
+        if not runtime_areas and any(
+            area == "base" for area, _ in layout_by_handle
+        ):
+            runtime_areas.add("base")
+
+        emitted_diagnostics: set[tuple[str, str, int]] = set()
+        for area in sorted(runtime_areas):
+            global_di_state = (di_states or {}).get("global", DiState())
+            area_di_state = (di_states or {}).get(area, global_di_state)
+            area_themes = tuple(
+                theme for theme in themes if theme.area == area
+            )
+            selections: tuple[ThemeRecord | None, ...] = (
+                (None, *area_themes)
+                if modules
+                else area_themes
+            )
+            for selected_theme in selections:
+                selection_name = (
+                    selected_theme.name
+                    if selected_theme is not None
+                    else "module-only"
+                )
+                selection_theme_roots = (
+                    {
+                        candidate.root
+                        for candidate in self._theme_chain(
+                            selected_theme,
+                            themes,
+                        )
+                    }
+                    if selected_theme is not None
+                    else set()
+                )
+
+                def selection_compatible_path(path: str) -> bool:
+                    candidate_theme = self._theme_for_path(path, themes)
+                    return (
+                        candidate_theme is None
+                        or (
+                            selected_theme is not None
+                            and candidate_theme.root in selection_theme_roots
+                        )
+                    )
+
+                handles = sorted({
+                    handle
+                    for candidate_area in (
+                        ("base", area) if area != "base" else ("base",)
+                    )
+                    for handle in (
+                        candidate_handle
+                        for source_area, candidate_handle in layout_by_handle
+                        if source_area == candidate_area
+                    )
+                }, key=lambda candidate: (
+                    candidate != "default",
+                    candidate,
+                ))
+                documents_by_handle = {}
+                default_nodes_by_name = {}
+                default_missing_parents: set[str] = set()
+                default_assets_by_src = {}
+                default_unresolved_operations = set()
+                for handle in handles:
+                    documents = tuple(filter(None, (
+                        parse_document(path, area, handle)
+                        for path in selection_layout_paths(
+                            area,
+                            handle,
+                            selected_theme,
+                        )
+                    )))
+                    if documents:
+                        documents_by_handle[handle] = documents
+
+                page_documents_by_handle = {}
+                page_layout_ids = sorted({
+                    layout_id
+                    for candidate_area in (
+                        ("base", area) if area != "base" else ("base",)
+                    )
+                    for source_area, layout_id in page_layout_by_id
+                    if source_area == candidate_area
+                })
+                for layout_id in page_layout_ids:
+                    page_handle = f"page_layout:{layout_id}"
+                    page_documents = []
+                    for path in selection_page_layout_paths(
+                        area,
+                        layout_id,
+                        selected_theme,
+                    ):
+                        document = parse_document(
+                            path,
+                            area,
+                            page_handle,
+                        )
+                        if document is None:
+                            continue
+                        # Page-layout <update> instructions inherit another
+                        # page-layout wireframe, not an ordinary page
+                        # configuration handle with the same basename.
+                        page_documents.append(replace(
+                            document,
+                            operations=tuple(
+                                replace(
+                                    operation,
+                                    name=f"page_layout:{operation.name}",
+                                )
+                                if operation.kind == "update"
+                                else operation
+                                for operation in document.operations
+                            ),
+                        ))
+                    if page_documents:
+                        page_documents_by_handle[page_handle] = tuple(
+                            page_documents
+                        )
+
+                for handle in handles:
+                    if handle not in documents_by_handle:
+                        continue
+                    generic_layout = all(
+                        document.root_kind == "layout"
+                        for document in documents_by_handle[handle]
+                    )
+                    requested_handles = (
+                        (handle,)
+                        if handle == "default" or generic_layout
+                        else ("default", handle)
+                    )
+                    effective = merge_layout(
+                        documents_by_handle,
+                        requested_handles,
+                    )
+                    page_layout_id = effective.root_layout
+                    page_layout_paths: tuple[str, ...] = ()
+                    if page_layout_id:
+                        page_handle = f"page_layout:{page_layout_id}"
+                        page_documents = page_documents_by_handle.get(
+                            page_handle,
+                            (),
+                        )
+                        if page_documents:
+                            effective = merge_layout(
+                                {
+                                    **documents_by_handle,
+                                    **page_documents_by_handle,
+                                },
+                                (page_handle, *requested_handles),
+                            )
+                            page_layout_paths = tuple(sorted({
+                                path
+                                for path in effective.document_paths
+                                if path in page_layout_identities
+                            }))
+
+                    if not effective.document_paths:
+                        continue
+                    current_nodes_by_name = {
+                        node.name: node for node in effective.nodes
+                    }
+                    suppressed_inherited_names = (
+                        set()
+                        if generic_layout
+                        else (
+                            set(default_nodes_by_name)
+                            - set(current_nodes_by_name)
+                        )
+                    )
+                    inherited_node_changed = any(
+                        current_nodes_by_name.get(name) != baseline
+                        for name, baseline in default_nodes_by_name.items()
+                    )
+                    newly_resolved_parent = bool(
+                        (
+                            set(current_nodes_by_name)
+                            - set(default_nodes_by_name)
+                        ).intersection(default_missing_parents)
+                    )
+                    emit_full_projection = (
+                        handle == "default"
+                        or generic_layout
+                        or not default_nodes_by_name
+                        or inherited_node_changed
+                        or newly_resolved_parent
+                    )
+                    packet = self.graph.packet(
+                        "magento-effective-layout",
+                        f"{area}:{selection_name}:{handle}",
+                        area=area,
+                        handle=handle,
+                        themeSelection=selection_name,
+                    )
+                    primary_path = effective.document_paths[-1]
+                    related_documents = tuple(sorted(
+                        set(effective.document_paths) - {primary_path}
+                    ))
+                    packet.add(GraphFact(
+                        "magento-effective-layout",
+                        handle,
+                        "composes-handles",
+                        ",".join(effective.expanded_handles),
+                        primary_path,
+                        1,
+                        attrs(
+                            area=area,
+                            documentKind=(
+                                "generic-layout"
+                                if generic_layout
+                                else "page-configuration"
+                            ),
+                            rootLayout=effective.root_layout,
+                            emissionMode=(
+                                "full"
+                                if emit_full_projection
+                                else "delta-from-default"
+                            ),
+                            semanticRole="topology",
+                            themeSelection=selection_name,
+                        ),
+                    ), *related_documents)
+
+                    if page_layout_id:
+                        page_source = next(
+                            (
+                                document
+                                for source_handle in reversed(
+                                    requested_handles
+                                )
+                                for document in reversed(
+                                    documents_by_handle.get(
+                                        source_handle,
+                                        (),
+                                    )
+                                )
+                                if document.root_layout == page_layout_id
+                            ),
+                            None,
+                        )
+                        page_source_path = (
+                            page_source.path if page_source else primary_path
+                        )
+                        declaration_paths = tuple(sorted({
+                            path
+                            for candidate_area in {"base", area}
+                            for path in layout_declarations.get(
+                                (candidate_area, page_layout_id),
+                                (),
+                            )
+                            if selection_compatible_path(path)
+                        }))
+                        packet.add(GraphFact(
+                            "magento-page-layout-selection",
+                            handle,
+                            "selects-page-layout",
+                            page_layout_id,
+                            page_source_path,
+                            line(
+                                self.artifacts[page_source_path],
+                                page_layout_id,
+                            ),
+                            attrs(
+                                area=area,
+                                resolved=str(bool(page_layout_paths)).lower(),
+                                themeSelection=selection_name,
+                            ),
+                        ), *page_layout_paths, *declaration_paths)
+
+                    nodes_by_name = current_nodes_by_name
+                    rendering_state_by_name = {}
+                    for candidate_name in nodes_by_name:
+                        current_name = candidate_name
+                        visited: set[str] = set()
+                        rendering_state = "rendered"
+                        has_ifconfig = False
+                        has_acl = False
+                        while current_name:
+                            if current_name in visited:
+                                rendering_state = "unresolved-parent-cycle"
+                                break
+                            visited.add(current_name)
+                            candidate = nodes_by_name.get(current_name)
+                            if candidate is None:
+                                rendering_state = "unresolved-parent"
+                                break
+                            if candidate.removed:
+                                rendering_state = (
+                                    "removed"
+                                    if current_name == candidate_name
+                                    else "ancestor-removed"
+                                )
+                                break
+                            if candidate.display is False:
+                                rendering_state = (
+                                    "display-disabled"
+                                    if current_name == candidate_name
+                                    else "ancestor-display-disabled"
+                                )
+                                break
+                            candidate_attributes = dict(
+                                candidate.attributes
+                            )
+                            has_ifconfig = has_ifconfig or bool(
+                                candidate_attributes.get("ifconfig", "")
+                            )
+                            has_acl = has_acl or bool(
+                                candidate_attributes.get("aclResource", "")
+                            )
+                            current_name = candidate.parent
+                        if rendering_state == "rendered":
+                            if has_ifconfig and has_acl:
+                                rendering_state = "conditional-ifconfig-acl"
+                            elif has_ifconfig:
+                                rendering_state = "conditional-ifconfig"
+                            elif has_acl:
+                                rendering_state = "conditional-acl"
+                        rendering_state_by_name[candidate_name] = (
+                            rendering_state
+                        )
+
+                    for suppressed_name in sorted(
+                        suppressed_inherited_names
+                    ):
+                        baseline = default_nodes_by_name[suppressed_name]
+                        suppression_path = primary_path
+                        suppression_line = 1
+                        ancestor_name = baseline.parent
+                        visited_ancestors: set[str] = set()
+                        while (
+                            ancestor_name
+                            and ancestor_name not in visited_ancestors
+                        ):
+                            visited_ancestors.add(ancestor_name)
+                            current_ancestor = current_nodes_by_name.get(
+                                ancestor_name
+                            )
+                            baseline_ancestor = default_nodes_by_name.get(
+                                ancestor_name
+                            )
+                            if current_ancestor != baseline_ancestor:
+                                if current_ancestor is not None:
+                                    suppression_path = (
+                                        current_ancestor.source.path
+                                    )
+                                    suppression_line = (
+                                        current_ancestor.source.line
+                                    )
+                                break
+                            ancestor_name = (
+                                baseline_ancestor.parent
+                                if baseline_ancestor is not None
+                                else ""
+                            )
+                        baseline_paths = tuple(sorted({
+                            source.path for source in baseline.provenance
+                        }))
+                        packet.add(GraphFact(
+                            "magento-layout-effective-node",
+                            handle,
+                            "suppresses-inherited-node",
+                            suppressed_name,
+                            suppression_path,
+                            suppression_line,
+                            attrs(
+                                area=area,
+                                baselineHandle="default",
+                                blockClass=baseline.block_class,
+                                handle=handle,
+                                nodeKind=baseline.node_kind,
+                                parent=baseline.parent,
+                                renderingState=(
+                                    "suppressed-by-redeclaration"
+                                ),
+                                semanticRole="topology",
+                                template=baseline.template,
+                                themeSelection=selection_name,
+                            ),
+                        ), *baseline_paths)
+
+                        configured_class = baseline.block_class
+                        suppressed_class = (
+                            self._resolve_type(
+                                configured_class,
+                                area_di_state,
+                            )
+                            if configured_class
+                            else ""
+                        )
+                        if suppressed_class:
+                            packet.add(GraphFact(
+                                "magento-layout-effective-block-class",
+                                suppressed_name,
+                                "suppresses-inherited-block-class",
+                                suppressed_class,
+                                suppression_path,
+                                suppression_line,
+                                attrs(
+                                    area=area,
+                                    baselineHandle="default",
+                                    configuredBlockClass=configured_class,
+                                    handle=handle,
+                                    renderingState=(
+                                        "suppressed-by-redeclaration"
+                                    ),
+                                    themeSelection=selection_name,
+                                ),
+                            ), self._symbol_path(suppressed_class),
+                                *baseline_paths)
+
+                        baseline_property_sources = {
+                            item.property: item.source
+                            for item in baseline.property_sources
+                        }
+                        conditional_templates = []
+                        for baseline_action in baseline.actions:
+                            if (
+                                baseline_action.method.casefold()
+                                != "settemplate"
+                                or not baseline_action.arguments
+                            ):
+                                continue
+                            template_argument = (
+                                baseline_action.arguments[0]
+                            )
+                            if (
+                                not template_argument.value
+                                or template_argument.value_type
+                                not in {"", "string"}
+                            ):
+                                continue
+                            if baseline_action.ifconfig:
+                                conditional_templates.append((
+                                    template_argument.value,
+                                    baseline_action.ifconfig,
+                                    template_argument.source.path,
+                                ))
+                            else:
+                                conditional_templates.clear()
+                        template_variants = []
+                        if baseline.template:
+                            template_source = baseline_property_sources.get(
+                                "template",
+                                baseline.source,
+                            )
+                            template_variants.append((
+                                baseline.template,
+                                "",
+                                template_source.path,
+                            ))
+                        template_variants.extend(conditional_templates)
+                        selection_themes = (
+                            themes if selected_theme is not None else ()
+                        )
+                        for (
+                            suppressed_template,
+                            template_ifconfig,
+                            template_declaration_path,
+                        ) in dict.fromkeys(template_variants):
+                            template_paths = self._template_paths(
+                                suppressed_template,
+                                area,
+                                modules,
+                                selection_themes,
+                                selected_theme,
+                            )
+                            suppressed_template_path = (
+                                self._selected_template_path(
+                                    suppressed_template,
+                                    area,
+                                    modules,
+                                    selection_themes,
+                                    selected_theme,
+                                )
+                            )
+                            packet.add(GraphFact(
+                                "magento-layout-effective-template",
+                                suppressed_name,
+                                "suppresses-inherited-template",
+                                (
+                                    suppressed_template_path
+                                    or suppressed_template
+                                ),
+                                suppression_path,
+                                suppression_line,
+                                attrs(
+                                    area=area,
+                                    baselineHandle="default",
+                                    handle=handle,
+                                    ifconfig=template_ifconfig,
+                                    renderingState=(
+                                        "suppressed-by-redeclaration"
+                                    ),
+                                    template=suppressed_template,
+                                    themeSelection=selection_name,
+                                ),
+                            ), *template_paths, *baseline_paths,
+                                template_declaration_path)
+                            if suppressed_template_path and suppressed_class:
+                                packet.add(GraphFact(
+                                    "magento-template-effective-block-binding",
+                                    suppressed_template_path,
+                                    "suppressed-in-effective-layout",
+                                    suppressed_class,
+                                    suppressed_template_path,
+                                    1,
+                                    attrs(
+                                        activationCertainty="inactive",
+                                        area=area,
+                                        baselineHandle="default",
+                                        blockName=suppressed_name,
+                                        handle=handle,
+                                        ifconfig=template_ifconfig,
+                                        renderingState=(
+                                            "suppressed-by-redeclaration"
+                                        ),
+                                        themeSelection=selection_name,
+                                    ),
+                                    related_paths=tuple(sorted(set(filter(None, (
+                                        suppression_path,
+                                        template_declaration_path,
+                                        *baseline_paths,
+                                        self._symbol_path(suppressed_class),
+                                    ))))),
+                                ))
+
+                        for argument in baseline.arguments:
+                            if (
+                                argument.value_type != "object"
+                                or not argument.value
+                            ):
+                                continue
+                            object_class = argument.value.lstrip("\\")
+                            packet.add(GraphFact(
+                                "magento-layout-effective-object-argument",
+                                suppressed_name,
+                                "suppresses-inherited-layout-object",
+                                object_class,
+                                suppression_path,
+                                suppression_line,
+                                attrs(
+                                    area=area,
+                                    argument=argument.name,
+                                    baselineHandle="default",
+                                    handle=handle,
+                                    renderingState=(
+                                        "suppressed-by-redeclaration"
+                                    ),
+                                    themeSelection=selection_name,
+                                ),
+                            ), self._symbol_path(object_class),
+                                argument.source.path,
+                                *baseline_paths)
+
+                        for action in baseline.actions:
+                            action_target = (
+                                f"{suppressed_class}::{action.method}"
+                                if suppressed_class
+                                else action.method
+                            )
+                            packet.add(GraphFact(
+                                "magento-layout-effective-action",
+                                suppressed_name,
+                                "suppresses-inherited-layout-action",
+                                action_target,
+                                suppression_path,
+                                suppression_line,
+                                attrs(
+                                    area=area,
+                                    baselineHandle="default",
+                                    handle=handle,
+                                    method=action.method,
+                                    renderingState=(
+                                        "suppressed-by-redeclaration"
+                                    ),
+                                    themeSelection=selection_name,
+                                ),
+                            ), action.source.path, *baseline_paths)
+
+                        if baseline.node_kind == "uiComponent":
+                            ui_paths = tuple(sorted(
+                                path
+                                for path in self._ui_component_paths_by_name.get(
+                                    suppressed_name,
+                                    (),
+                                )
+                                if self._is_deployed_view_source(
+                                    path,
+                                    modules,
+                                    themes,
+                                )
+                                and (
+                                    (
+                                        self._theme_for_path(path, themes)
+                                        is not None
+                                        and selection_compatible_path(path)
+                                    )
+                                    or (
+                                        self._theme_for_path(path, themes)
+                                        is None
+                                        and view_area(
+                                            path,
+                                            "ui_component",
+                                        ) in {"base", area}
+                                    )
+                                )
+                            ))
+                            packet.add(GraphFact(
+                                "magento-layout-ui-component-activation",
+                                handle,
+                                "suppresses-inherited-ui-component",
+                                suppressed_name,
+                                suppression_path,
+                                suppression_line,
+                                attrs(
+                                    area=area,
+                                    baselineHandle="default",
+                                    renderingState=(
+                                        "suppressed-by-redeclaration"
+                                    ),
+                                    resolved=str(bool(ui_paths)).lower(),
+                                    themeSelection=selection_name,
+                                ),
+                            ), *ui_paths, *baseline_paths)
+
+                    for node in effective.nodes:
+                        property_sources = {
+                            item.property: item.source
+                            for item in node.property_sources
+                        }
+                        provenance_paths = tuple(sorted({
+                            source.path for source in node.provenance
+                        }))
+                        if (
+                            not emit_full_projection
+                            and node.name in default_nodes_by_name
+                        ):
+                            continue
+                        rendering_state = rendering_state_by_name[node.name]
+                        renders = rendering_state == "rendered"
+                        potentially_renders = renders or (
+                            rendering_state.startswith("conditional-")
+                        ) or (
+                            rendering_state == "unresolved-parent"
+                        )
+                        node_configuration = dict(node.attributes)
+                        configured_block_class = node.block_class
+                        effective_block_class = (
+                            self._resolve_type(
+                                configured_block_class,
+                                area_di_state,
+                            )
+                            if configured_block_class
+                            else ""
+                        )
+                        block_resolution_paths = (
+                            self._resolution_paths(
+                                configured_block_class,
+                                area_di_state,
+                            )
+                            if configured_block_class
+                            else ()
+                        )
+                        block_class_defaulted = (
+                            node_configuration.get(
+                                "blockClassDefaulted",
+                                "",
+                            ).casefold()
+                            == "true"
+                        )
+                        node_attributes = attrs(
+                            after=node.after,
+                            alias=node.alias,
+                            area=area,
+                            before=node.before,
+                            blockClass=effective_block_class,
+                            blockClassDefaulted=str(
+                                block_class_defaulted
+                            ).lower(),
+                            configuredBlockClass=configured_block_class,
+                            display=(
+                                str(node.display).lower()
+                                if node.display is not None
+                                else ""
+                            ),
+                            handle=handle,
+                            ifconfig=node_configuration.get("ifconfig", ""),
+                            nodeKind=node.node_kind,
+                            order=node.order,
+                            parent=node.parent,
+                            removed=str(node.removed).lower(),
+                            renderingState=rendering_state,
+                            aclResource=node_configuration.get(
+                                "aclResource",
+                                "",
+                            ),
+                            semanticRole=(
+                                "uncertainty"
+                                if rendering_state == "unresolved-parent"
+                                else "topology"
+                            ),
+                            template=node.template,
+                            themeSelection=selection_name,
+                        )
+                        packet.add(GraphFact(
+                            "magento-layout-effective-node",
+                            handle,
+                            (
+                                "removes-node"
+                                if node.removed
+                                else "contains-node"
+                            ),
+                            node.name,
+                            node.source.path,
+                            node.source.line,
+                            node_attributes,
+                        ), *(
+                            path for path in provenance_paths
+                            if path != node.source.path
+                        ))
+
+                        if node.parent:
+                            parent = nodes_by_name.get(node.parent)
+                            parent_paths = (
+                                tuple(
+                                    source.path
+                                    for source in parent.provenance
+                                )
+                                if parent is not None
+                                else ()
+                            )
+                            parent_source = property_sources.get(
+                                "parent",
+                                node.source,
+                            )
+                            packet.add(GraphFact(
+                                "magento-layout-effective-parent",
+                                node.name,
+                                "placed-in",
+                                node.parent,
+                                parent_source.path,
+                                parent_source.line,
+                                attrs(
+                                    alias=node.alias,
+                                    area=area,
+                                    handle=handle,
+                                    order=node.order,
+                                    resolved=str(parent is not None).lower(),
+                                    semanticRole=(
+                                        "topology"
+                                        if parent is not None
+                                        else "uncertainty"
+                                    ),
+                                    themeSelection=selection_name,
+                                ),
+                            ), *provenance_paths, *parent_paths)
+
+                        if effective_block_class:
+                            class_source = property_sources.get(
+                                "blockClass",
+                                node.source,
+                            )
+                            packet.add(GraphFact(
+                                "magento-layout-effective-block-class",
+                                node.name,
+                                (
+                                    "uses-block-class"
+                                    if rendering_state in {
+                                        "rendered",
+                                        "display-disabled",
+                                        "ancestor-display-disabled",
+                                    }
+                                    else (
+                                        "conditionally-uses-block-class"
+                                        if potentially_renders
+                                        else "declares-inactive-block-class"
+                                    )
+                                ),
+                                effective_block_class,
+                                class_source.path,
+                                class_source.line,
+                                attrs(
+                                    area=area,
+                                    blockClassDefaulted=str(
+                                        block_class_defaulted
+                                    ).lower(),
+                                    configuredBlockClass=(
+                                        configured_block_class
+                                    ),
+                                    handle=handle,
+                                    renderingState=rendering_state,
+                                    themeSelection=selection_name,
+                                ),
+                            ), self._symbol_path(effective_block_class),
+                                *block_resolution_paths,
+                                *provenance_paths)
+
+                        selected_template_path = ""
+                        template_paths: tuple[str, ...] = ()
+                        template_binding_candidates: list[
+                            tuple[str, bool]
+                        ] = []
+                        selection_themes = (
+                            themes if selected_theme is not None else ()
+                        )
+                        conditional_template_actions = []
+                        for candidate_action in node.actions:
+                            if (
+                                candidate_action.method.casefold()
+                                != "settemplate"
+                                or not candidate_action.arguments
+                            ):
+                                continue
+                            candidate_argument = (
+                                candidate_action.arguments[0]
+                            )
+                            if (
+                                not candidate_argument.value
+                                or candidate_argument.value_type
+                                not in {"", "string"}
+                            ):
+                                continue
+                            if candidate_action.ifconfig:
+                                conditional_template_actions.append((
+                                    candidate_action,
+                                    candidate_argument,
+                                ))
+                            else:
+                                # A later unconditional setTemplate call wins
+                                # over every earlier conditional candidate.
+                                conditional_template_actions.clear()
+                        has_conditional_template = bool(
+                            conditional_template_actions
+                        )
+                        if node.template:
+                            template_paths = self._template_paths(
+                                node.template,
+                                area,
+                                modules,
+                                selection_themes,
+                                selected_theme,
+                            )
+                            selected_template_path = self._selected_template_path(
+                                node.template,
+                                area,
+                                modules,
+                                selection_themes,
+                                selected_theme,
+                            )
+                            if selected_template_path and potentially_renders:
+                                template_binding_candidates.append((
+                                    selected_template_path,
+                                    renders and not has_conditional_template,
+                                ))
+                            template_source = property_sources.get(
+                                "template",
+                                node.source,
+                            )
+                            packet.add(GraphFact(
+                                "magento-layout-effective-template",
+                                node.name,
+                                (
+                                    "renders-template"
+                                    if renders and not has_conditional_template
+                                    else (
+                                        "conditionally-renders-template"
+                                        if potentially_renders
+                                        else "declares-inactive-template"
+                                    )
+                                ),
+                                selected_template_path or node.template,
+                                template_source.path,
+                                template_source.line,
+                                attrs(
+                                    area=area,
+                                    handle=handle,
+                                    template=node.template,
+                                    themeSelection=selection_name,
+                                    renderingState=rendering_state,
+                                    conditionalTemplateCandidate=(
+                                        node_configuration.get(
+                                            "conditionalTemplateCandidate",
+                                            "",
+                                        )
+                                    ),
+                                    conditionalTemplateIfconfig=(
+                                        node_configuration.get(
+                                            "conditionalTemplateIfconfig",
+                                            "",
+                                        )
+                                    ),
+                                ),
+                            ), *template_paths, *provenance_paths)
+                            if (
+                                selected_template_path
+                                and renders
+                                and not has_conditional_template
+                            ):
+                                self._template_layout_sources.setdefault(
+                                    selected_template_path,
+                                    set(),
+                                ).add((template_source.path, area, handle))
+                            elif selected_template_path and potentially_renders:
+                                self._conditional_template_layout_sources.setdefault(
+                                    selected_template_path,
+                                    set(),
+                                ).add((template_source.path, area, handle))
+
+                        for (
+                            candidate_action,
+                            candidate_argument,
+                        ) in conditional_template_actions:
+                            conditional_template = candidate_argument.value
+                            candidate_paths = self._template_paths(
+                                conditional_template,
+                                area,
+                                modules,
+                                selection_themes,
+                                selected_theme,
+                            )
+                            candidate_path = self._selected_template_path(
+                                conditional_template,
+                                area,
+                                modules,
+                                selection_themes,
+                                selected_theme,
+                            )
+                            if candidate_path and potentially_renders:
+                                template_binding_candidates.append((
+                                    candidate_path,
+                                    False,
+                                ))
+                                self._conditional_template_layout_sources.setdefault(
+                                    candidate_path,
+                                    set(),
+                                ).add((
+                                    candidate_argument.source.path,
+                                    area,
+                                    handle,
+                                ))
+                            packet.add(GraphFact(
+                                "magento-layout-effective-template",
+                                node.name,
+                                (
+                                    "conditionally-renders-template"
+                                    if potentially_renders
+                                    else "declares-inactive-template"
+                                ),
+                                candidate_path or conditional_template,
+                                candidate_argument.source.path,
+                                candidate_argument.source.line,
+                                attrs(
+                                    area=area,
+                                    handle=handle,
+                                    ifconfig=candidate_action.ifconfig,
+                                    renderingState=rendering_state,
+                                    template=conditional_template,
+                                    themeSelection=selection_name,
+                                ),
+                            ), *candidate_paths, *provenance_paths)
+
+                        for (
+                            binding_template_path,
+                            binding_is_exact,
+                        ) in dict.fromkeys(template_binding_candidates):
+                            if not effective_block_class:
+                                continue
+                            block_symbol = self._unique_symbol_casefold(
+                                effective_block_class
+                            )
+                            packet.add(GraphFact(
+                                "magento-template-effective-block-binding",
+                                binding_template_path,
+                                (
+                                    "rendered-by-effective-block"
+                                    if binding_is_exact
+                                    else (
+                                        "conditionally-rendered-by-"
+                                        "effective-block"
+                                    )
+                                ),
+                                effective_block_class,
+                                binding_template_path,
+                                1,
+                                attrs(
+                                    activationCertainty=(
+                                        "exact"
+                                        if binding_is_exact
+                                        else "conditional"
+                                    ),
+                                    area=area,
+                                    configuredBlockClass=(
+                                        configured_block_class
+                                    ),
+                                    blockName=node.name,
+                                    handle=handle,
+                                    themeSelection=selection_name,
+                                ),
+                                related_paths=tuple(sorted(filter(None, (
+                                    *provenance_paths,
+                                    *block_resolution_paths,
+                                    block_symbol.path if block_symbol else "",
+                                )))),
+                            ))
+                            for call in self._template_php_calls(
+                                binding_template_path,
+                                "block",
+                            ):
+                                argument_name = self._layout_argument_for_call(
+                                    call,
+                                    node.arguments,
+                                )
+                                if argument_name:
+                                    argument = next(
+                                        candidate
+                                        for candidate in node.arguments
+                                        if candidate.name == argument_name
+                                    )
+                                    packet.add(GraphFact(
+                                        "magento-template-effective-layout-argument-read",
+                                        binding_template_path,
+                                        (
+                                            "reads-effective-layout-argument"
+                                            if binding_is_exact
+                                            else (
+                                                "conditionally-reads-effective-"
+                                                "layout-argument"
+                                            )
+                                        ),
+                                        argument.value or argument.name,
+                                        binding_template_path,
+                                        call.line,
+                                        attrs(
+                                            activationCertainty=(
+                                                "exact"
+                                                if binding_is_exact
+                                                else "conditional"
+                                            ),
+                                            argument=argument.name,
+                                            area=area,
+                                            blockName=node.name,
+                                            handle=handle,
+                                            method=call.method,
+                                            valueType=argument.value_type,
+                                            themeSelection=selection_name,
+                                        ),
+                                        related_paths=tuple(sorted({
+                                            *provenance_paths,
+                                            argument.source.path,
+                                        })),
+                                    ))
+                                declaration = (
+                                    self._method_symbol(
+                                        block_symbol,
+                                        call.method,
+                                    )
+                                    if block_symbol is not None
+                                    else None
+                                )
+                                if declaration is not None:
+                                    declaring_symbol, declared_method = declaration
+                                    packet.add(GraphFact(
+                                        "magento-template-effective-block-method-call",
+                                        binding_template_path,
+                                        (
+                                            "calls-effective-block-method"
+                                            if binding_is_exact
+                                            else (
+                                                "conditionally-calls-effective-"
+                                                "block-method"
+                                            )
+                                        ),
+                                        (
+                                            f"{declaring_symbol.qualified_name}::"
+                                            f"{declared_method}"
+                                        ),
+                                        binding_template_path,
+                                        call.line,
+                                        attrs(
+                                            activationCertainty=(
+                                                "exact"
+                                                if binding_is_exact
+                                                else "conditional"
+                                            ),
+                                            area=area,
+                                            blockClass=effective_block_class,
+                                            blockName=node.name,
+                                            handle=handle,
+                                            themeSelection=selection_name,
+                                        ),
+                                        related_paths=tuple(sorted({
+                                            *provenance_paths,
+                                            *block_resolution_paths,
+                                            declaring_symbol.path,
+                                        })),
+                                    ))
+                                    continue
+                                packet.add(GraphFact(
+                                    "magento-template-effective-block-method-call-unresolved",
+                                    binding_template_path,
+                                    (
+                                        "calls-unresolved-effective-block-method"
+                                        if binding_is_exact
+                                        else (
+                                            "conditionally-calls-unresolved-"
+                                            "effective-block-method"
+                                        )
+                                    ),
+                                    f"{effective_block_class}::{call.method}",
+                                    binding_template_path,
+                                    call.line,
+                                    attrs(
+                                        activationCertainty=(
+                                            "exact"
+                                            if binding_is_exact
+                                            else "conditional"
+                                        ),
+                                        area=area,
+                                        blockClass=effective_block_class,
+                                        blockName=node.name,
+                                        handle=handle,
+                                        semanticRole="uncertainty",
+                                        themeSelection=selection_name,
+                                    ),
+                                    related_paths=tuple(sorted({
+                                        *provenance_paths,
+                                        *block_resolution_paths,
+                                    })),
+                                ))
+
+                        for argument in node.arguments:
+                            if argument.value_type != "object" or not argument.value:
+                                continue
+                            object_class = argument.value.lstrip("\\")
+                            object_symbol = self._unique_symbol_casefold(
+                                object_class
+                            )
+                            object_inactive = rendering_state in {
+                                "removed",
+                                "ancestor-removed",
+                                "unresolved-parent-cycle",
+                            }
+                            packet.add(GraphFact(
+                                "magento-layout-effective-object-argument",
+                                node.name,
+                                (
+                                    "declares-inactive-layout-object"
+                                    if object_inactive
+                                    else (
+                                        "conditionally-receives-layout-object"
+                                        if potentially_renders and not renders
+                                        else "receives-layout-object"
+                                    )
+                                ),
+                                object_class,
+                                argument.source.path,
+                                argument.source.line,
+                                attrs(
+                                    area=area,
+                                    argument=argument.name,
+                                    handle=handle,
+                                    renderingState=rendering_state,
+                                    themeSelection=selection_name,
+                                ),
+                            ), *provenance_paths, (
+                                object_symbol.path if object_symbol else ""
+                            ))
+                            if selected_template_path and potentially_renders:
+                                template_relation = (
+                                    "receives-layout-object"
+                                    if renders
+                                    else "conditionally-receives-layout-object"
+                                )
+                                packet.add(GraphFact(
+                                    "magento-template-effective-object-binding",
+                                    selected_template_path,
+                                    template_relation,
+                                    object_class,
+                                    selected_template_path,
+                                    1,
+                                    attrs(
+                                        argument=argument.name,
+                                        area=area,
+                                        blockName=node.name,
+                                        handle=handle,
+                                        renderingState=rendering_state,
+                                        themeSelection=selection_name,
+                                    ),
+                                    related_paths=tuple(sorted(filter(None, (
+                                        *provenance_paths,
+                                        object_symbol.path if object_symbol else "",
+                                    )))),
+                                ))
+                            if (
+                                selected_template_path
+                                and potentially_renders
+                                and self._is_view_model_argument(
+                                    argument.name,
+                                    object_symbol,
+                                )
+                            ):
+                                packet.add(GraphFact(
+                                    "magento-template-effective-view-model-binding",
+                                    selected_template_path,
+                                    (
+                                        "receives-view-model"
+                                        if renders
+                                        else "conditionally-receives-view-model"
+                                    ),
+                                    object_class,
+                                    selected_template_path,
+                                    1,
+                                    attrs(
+                                        argument=argument.name,
+                                        area=area,
+                                        blockName=node.name,
+                                        handle=handle,
+                                        renderingState=rendering_state,
+                                        themeSelection=selection_name,
+                                    ),
+                                    related_paths=tuple(sorted(filter(None, (
+                                        *provenance_paths,
+                                        object_symbol.path if object_symbol else "",
+                                    )))),
+                                ))
+
+                        for action in node.actions:
+                            target = (
+                                f"{effective_block_class}::{action.method}"
+                                if effective_block_class
+                                else action.method
+                            )
+                            method_paths: tuple[str, ...] = ()
+                            if effective_block_class:
+                                block_symbol = self._unique_symbol_casefold(
+                                    effective_block_class
+                                )
+                                declaration = (
+                                    self._method_symbol(
+                                        block_symbol,
+                                        action.method,
+                                    )
+                                    if block_symbol is not None
+                                    else None
+                                )
+                                if declaration is not None:
+                                    target = (
+                                        f"{declaration[0].qualified_name}::"
+                                        f"{declaration[1]}"
+                                    )
+                                    method_paths = (declaration[0].path,)
+                            action_inactive = rendering_state in {
+                                "removed",
+                                "ancestor-removed",
+                                "unresolved-parent-cycle",
+                            }
+                            action_conditional = bool(
+                                action.ifconfig
+                            ) or (potentially_renders and not renders)
+                            packet.add(GraphFact(
+                                "magento-layout-effective-action",
+                                node.name,
+                                (
+                                    "declares-inactive-layout-action"
+                                    if action_inactive
+                                    else (
+                                        "conditionally-calls-layout-action"
+                                        if action_conditional
+                                        else "calls-layout-action"
+                                    )
+                                ),
+                                target,
+                                action.source.path,
+                                action.source.line,
+                                attrs(
+                                    area=area,
+                                    handle=handle,
+                                    ifconfig=action.ifconfig,
+                                    method=action.method,
+                                    renderingState=rendering_state,
+                                    themeSelection=selection_name,
+                                ),
+                            ), *provenance_paths, *block_resolution_paths,
+                                *method_paths)
+
+                        if (
+                            node.node_kind == "uiComponent"
+                            and potentially_renders
+                        ):
+                            ui_paths = tuple(sorted(
+                                path
+                                for path in self._ui_component_paths_by_name.get(
+                                    node.name,
+                                    (),
+                                )
+                                if self._is_deployed_view_source(
+                                    path,
+                                    modules,
+                                    themes,
+                                )
+                                and (
+                                    (
+                                        self._theme_for_path(path, themes)
+                                        is not None
+                                        and selection_compatible_path(path)
+                                    )
+                                    or (
+                                        self._theme_for_path(path, themes)
+                                        is None
+                                        and view_area(
+                                            path,
+                                            "ui_component",
+                                        ) in {"base", area}
+                                    )
+                                )
+                            ))
+                            packet.add(GraphFact(
+                                "magento-layout-ui-component-activation",
+                                handle,
+                                (
+                                    "activates-ui-component"
+                                    if renders
+                                    else "conditionally-activates-ui-component"
+                                ),
+                                node.name,
+                                node.source.path,
+                                node.source.line,
+                                attrs(
+                                    area=area,
+                                    renderingState=rendering_state,
+                                    resolved=str(bool(ui_paths)).lower(),
+                                    themeSelection=selection_name,
+                                ),
+                            ), *ui_paths, *provenance_paths)
+
+                    for asset in effective.assets:
+                        if (
+                            not emit_full_projection
+                            and default_assets_by_src.get(asset.src) == asset
+                        ):
+                            continue
+                        packet.add(GraphFact(
+                            "magento-layout-effective-asset",
+                            handle,
+                            (
+                                "removes-asset"
+                                if asset.removed
+                                else "loads-asset"
+                            ),
+                            asset.src,
+                            asset.source.path,
+                            asset.source.line,
+                            attrs(
+                                area=area,
+                                assetKind=asset.asset_kind,
+                                themeSelection=selection_name,
+                            ),
+                        ), *(
+                            source.path for source in asset.provenance
+                            if source.path != asset.source.path
+                        ))
+
+                    for operation in effective.unresolved_operations:
+                        if (
+                            not emit_full_projection
+                            and operation in default_unresolved_operations
+                        ):
+                            continue
+                        packet.add(GraphFact(
+                            "magento-layout-unresolved-instruction",
+                            operation.name or handle,
+                            "has-unresolved-layout-instruction",
+                            operation.kind,
+                            operation.source.path,
+                            operation.source.line,
+                            attrs(
+                                area=area,
+                                semanticRole="uncertainty",
+                                themeSelection=selection_name,
+                            ),
+                        ))
+
+                    for diagnostic in effective.diagnostics:
+                        identity = (
+                            diagnostic.code,
+                            diagnostic.source.path,
+                            diagnostic.source.line,
+                        )
+                        if identity in emitted_diagnostics:
+                            continue
+                        emitted_diagnostics.add(identity)
+                        self._diagnostics.append(PluginDiagnostic(
+                            diagnostic.code,
+                            diagnostic.message,
+                            self.plugin_id,
+                            diagnostic.source.path,
+                            recoverable=True,
+                        ))
+                    if handle == "default":
+                        default_nodes_by_name = current_nodes_by_name
+                        default_missing_parents = {
+                            node.parent
+                            for node in effective.nodes
+                            if node.parent
+                            and node.parent not in current_nodes_by_name
+                        }
+                        default_assets_by_src = {
+                            asset.src: asset for asset in effective.assets
+                        }
+                        default_unresolved_operations = set(
+                            effective.unresolved_operations
+                        )
 
     def _admin_menu(
         self,
@@ -3166,7 +5375,11 @@ class MagentoRepositoryResolver:
         """
 
         references_by_path = {
-            path: extract_template_global_references(self.artifacts[path])
+            path: self._optional_frontend_source(
+                "template globals",
+                path,
+                extract_template_global_references,
+            )
             for path in sorted(self._template_layout_sources)
             if path.casefold().endswith(".phtml")
             and path in self.artifacts
@@ -3294,7 +5507,11 @@ class MagentoRepositoryResolver:
         """
 
         references_by_path = {
-            path: extract_template_event_references(self.artifacts[path])
+            path: self._optional_frontend_source(
+                "template events",
+                path,
+                extract_template_event_references,
+            )
             for path in sorted(self._template_layout_sources)
             if path.casefold().endswith(".phtml")
             and path in self.artifacts
@@ -3971,7 +6188,17 @@ class MagentoRepositoryResolver:
                     continue
                 area = area_match.group(1)
 
-            relations = extract_requirejs_relations(content)
+            try:
+                relations = extract_requirejs_relations(content)
+            except OptionalJavaScriptEnrichmentError as exception:
+                if not exception.source_specific:
+                    raise
+                self._record_optional_enrichment_failure(
+                    "RequireJS",
+                    exception,
+                    path,
+                )
+                continue
             records[path] = {
                 "path": path,
                 "area": area,
@@ -4052,8 +6279,10 @@ class MagentoRepositoryResolver:
             if record["area"] != "base"
         }
         runtime_areas.update(theme.area for theme in themes)
-        if not runtime_areas:
-            runtime_areas.add("base")
+        # Retain a base-only effective selection even when another area is
+        # present so consumers in an otherwise unconfigured area can still
+        # inherit Magento's base RequireJS configuration exactly.
+        runtime_areas.add("base")
 
         selections = [
             (area, theme)
@@ -4117,6 +6346,23 @@ class MagentoRepositoryResolver:
                         ),
                         key=lambda record: str(record["path"]),
                     ))
+
+            effective_theme = (
+                selected_theme.name if selected_theme is not None else ""
+            )
+            self._requirejs_configs[(area, effective_theme)] = (
+                build_effective_requirejs_config(
+                    area,
+                    effective_theme,
+                    tuple(
+                        (
+                            str(record["path"]),
+                            tuple(record["relations"]),
+                        )
+                        for record in ordered_records
+                    ),
+                )
+            )
 
             declarations: dict[
                 tuple[str, ...],
@@ -4196,6 +6442,522 @@ class MagentoRepositoryResolver:
                         theme=selection_theme,
                     )
                     packet.add(fact)
+
+    def _frontend_source_areas(
+        self,
+        path: str,
+        themes: tuple[ThemeRecord, ...],
+    ) -> tuple[str, ...]:
+        activated_areas = {
+            area
+            for sources in (
+                self._template_layout_sources,
+                self._conditional_template_layout_sources,
+            )
+            for _, area, _ in sources.get(path, ())
+        }
+        if activated_areas:
+            return tuple(sorted(activated_areas))
+        theme = self._theme_for_path(path, themes)
+        if theme is not None:
+            return (theme.area,)
+        match = re.search(
+            r"/view/([^/]+)/(?:templates|web)/",
+            f"/{path}",
+        )
+        return (match.group(1),) if match is not None else ()
+
+    def _requirejs_configs_for_source(
+        self,
+        area: str,
+        source_theme: ThemeRecord | None,
+    ) -> tuple[EffectiveRequireJsConfig, ...]:
+        if source_theme is not None:
+            selected = self._requirejs_configs.get((
+                area,
+                source_theme.name,
+            ))
+            if selected is not None:
+                return (selected,)
+        candidates = tuple(sorted(
+            (
+                config
+                for (config_area_name, _), config
+                in self._requirejs_configs.items()
+                if config_area_name == area
+            ),
+            key=lambda config: config.theme,
+        ))
+        if candidates:
+            return candidates
+        return tuple(sorted(
+            (
+                config
+                for (config_area_name, _), config
+                in self._requirejs_configs.items()
+                if config_area_name == "base"
+            ),
+            key=lambda config: config.theme,
+        ))
+
+    def _effective_frontend_dependency(
+        self,
+        requested: str,
+        consumer: str,
+        area: str,
+        source_theme: ThemeRecord | None,
+    ) -> tuple[
+        tuple[RequireJsResolution, ...],
+        EffectiveRequireJsConfig | None,
+        str,
+    ]:
+        normalized = normalize_amd_dependency(requested, consumer)
+        if not normalized:
+            return (), None, "dynamic-or-relative-unresolved"
+        configs = self._requirejs_configs_for_source(area, source_theme)
+        if not configs:
+            return (
+                (RequireJsResolution(normalized),),
+                None,
+                "literal-module-id",
+            )
+        candidate_resolutions = tuple(
+            config.resolve(requested, consumer)
+            for config in configs
+        )
+        if len(candidate_resolutions) == 1:
+            return (
+                candidate_resolutions[0],
+                configs[0],
+                "effective-requirejs",
+            )
+        first = candidate_resolutions[0]
+        if all(candidate == first for candidate in candidate_resolutions[1:]):
+            # The effective identifier and its provenance are invariant across
+            # every repository-known theme selection. Mixin activation still
+            # abstains because a sibling theme may change only its mixin set.
+            return first, None, "stable-across-theme-configs"
+        return (
+            (RequireJsResolution(normalized),),
+            None,
+            "theme-dependent-requirejs-abstained",
+        )
+
+    def _selected_frontend_asset_paths(
+        self,
+        identifier: str,
+        area: str,
+        modules: tuple[ModuleRecord, ...],
+        themes: tuple[ThemeRecord, ...],
+        source_theme: ThemeRecord | None,
+    ) -> tuple[str, ...]:
+        loader, marker, resource = identifier.partition("!")
+        if marker and loader != "text":
+            return ()
+        asset_identifier = resource if marker else loader
+        candidates = self._ui_asset_paths(
+            asset_identifier,
+            area,
+            marker and loader == "text",
+            modules,
+            themes,
+            source_theme,
+        )
+        if not candidates:
+            return ()
+        if source_theme is not None:
+            for theme in self._theme_chain(source_theme, themes):
+                selected = tuple(
+                    path
+                    for path in candidates
+                    if path == theme.root or path.startswith(theme.root + "/")
+                )
+                if selected:
+                    return tuple(sorted(selected))
+        elif any(
+            self._theme_for_path(path, themes) is not None
+            for path in candidates
+        ):
+            # A module-owned consumer can execute under any configured store
+            # theme. Do not connect it to sibling theme overrides without an
+            # active-theme selection.
+            return ()
+
+        module_candidates = tuple(
+            path
+            for path in candidates
+            if self._theme_for_path(path, themes) is None
+        )
+        area_marker = f"/view/{area}/web/"
+        selected = tuple(
+            path for path in module_candidates
+            if area_marker in f"/{path}"
+        )
+        if selected:
+            return tuple(sorted(selected))
+        base = tuple(
+            path for path in module_candidates
+            if "/view/base/web/" in f"/{path}"
+        )
+        return tuple(sorted(base or module_candidates))
+
+    def _emit_frontend_dependency(
+        self,
+        *,
+        packet_kind: str,
+        packet_key: str,
+        fact_kind: str,
+        source: str,
+        relation: str,
+        requested: str,
+        consumer: str,
+        path: str,
+        source_line: int,
+        position: int,
+        area: str,
+        modules: tuple[ModuleRecord, ...],
+        themes: tuple[ThemeRecord, ...],
+        source_theme: ThemeRecord | None,
+        activation_paths: tuple[str, ...] = (),
+        extra_attributes: dict[str, object] | None = None,
+    ) -> None:
+        resolutions, config, resolution_kind = (
+            self._effective_frontend_dependency(
+                requested,
+                consumer,
+                area,
+                source_theme,
+            )
+        )
+        if not resolutions:
+            return
+        packet = self.graph.packet(
+            packet_kind,
+            packet_key,
+            area=area,
+            theme=source_theme.name if source_theme else "",
+        )
+        normalized_requested = normalize_amd_dependency(
+            requested,
+            consumer,
+        )
+        for resolution in resolutions:
+            target_paths = self._selected_frontend_asset_paths(
+                resolution.identifier,
+                area,
+                modules,
+                themes,
+                source_theme,
+            )
+            loader, marker, _ = resolution.identifier.partition("!")
+            packet.add(GraphFact(
+                fact_kind,
+                source,
+                relation,
+                resolution.identifier,
+                path,
+                source_line,
+                attrs(**{
+                    "area": area,
+                    "fallbackPosition": resolution.fallback_position,
+                    "loaderPlugin": loader if marker else "",
+                    "mappedIdentifier": resolution.mapped_identifier,
+                    "position": position,
+                    "requestedIdentifier": requested,
+                    "requireJsConfigKinds": ",".join(
+                        resolution.config_kinds
+                    ),
+                    "requireJsConfigPaths": ",".join(
+                        resolution.config_paths
+                    ),
+                    "resolution": resolution_kind,
+                    "theme": source_theme.name if source_theme else "",
+                    **(extra_attributes or {}),
+                }),
+            ),
+                *target_paths,
+                *resolution.config_paths,
+                *activation_paths,
+                source_theme.theme_xml if source_theme else "",
+            )
+
+            if config is None or marker:
+                continue
+            activation_certainty = str(
+                (extra_attributes or {}).get(
+                    "activationCertainty",
+                    "exact",
+                )
+            )
+            for mixin in config.mixins_for(
+                normalized_requested,
+                resolution.mapped_identifier,
+                resolution.identifier,
+            ):
+                mixin_paths = self._selected_frontend_asset_paths(
+                    mixin.target,
+                    area,
+                    modules,
+                    themes,
+                    source_theme,
+                )
+                packet.add(GraphFact(
+                    "magento-requirejs-consumer-mixin",
+                    resolution.identifier,
+                    (
+                        "loads-effective-mixin"
+                        if activation_certainty == "exact"
+                        else "conditionally-loads-effective-mixin"
+                    ),
+                    mixin.target,
+                    path,
+                    source_line,
+                    attrs(
+                        activationCertainty=activation_certainty,
+                        area=area,
+                        configLine=mixin.line,
+                        configPath=mixin.path,
+                        position=position,
+                        theme=source_theme.name if source_theme else "",
+                    ),
+                ),
+                    mixin.path,
+                    *target_paths,
+                    *mixin_paths,
+                    *activation_paths,
+                )
+
+    def _frontend_initializers(
+        self,
+        modules: tuple[ModuleRecord, ...],
+        themes: tuple[ThemeRecord, ...],
+    ) -> None:
+        sources = {
+            path
+            for path in self._template_layout_sources
+            if path.casefold().endswith(".phtml")
+            and path in self.artifacts
+        }
+        sources.update(
+            path
+            for path in self._conditional_template_layout_sources
+            if path.casefold().endswith(".phtml")
+            and path in self.artifacts
+        )
+        sources.update(
+            path
+            for path in self.artifacts
+            if path.casefold().endswith(".html")
+            and "/web/" in f"/{path}"
+            and self._is_deployed_view_source(path, modules, themes)
+        )
+        for path in sorted(sources):
+            references = self._optional_frontend_source(
+                "frontend initializers",
+                path,
+                extract_frontend_initializers,
+            )
+            source_theme = self._theme_for_path(path, themes)
+            for area in self._frontend_source_areas(path, themes):
+                exact_layout_entries = tuple(sorted(
+                    entry
+                    for entry in self._template_layout_sources.get(path, ())
+                    if entry[1] == area
+                ))
+                conditional_layout_entries = tuple(sorted(
+                    entry
+                    for entry in self._conditional_template_layout_sources.get(
+                        path,
+                        (),
+                    )
+                    if entry[1] == area
+                ))
+                layout_entries = tuple(sorted({
+                    *exact_layout_entries,
+                    *conditional_layout_entries,
+                }))
+                activation_certainty = (
+                    "exact" if exact_layout_entries else "conditional"
+                )
+                activation_paths = tuple(sorted({
+                    layout_path for layout_path, _, _ in layout_entries
+                }))
+                handles = ",".join(sorted({
+                    handle for _, _, handle in layout_entries
+                }))
+                for reference in references:
+                    self._emit_frontend_dependency(
+                        packet_kind="magento-frontend-init",
+                        packet_key=f"{area}:{path}",
+                        fact_kind="magento-frontend-init",
+                        source=(
+                            f"{reference.source_kind}:{reference.selector}"
+                        ),
+                        relation=(
+                            "initializes-component"
+                            if activation_certainty == "exact"
+                            else "conditionally-initializes-component"
+                        ),
+                        requested=reference.component,
+                        consumer="",
+                        path=path,
+                        source_line=reference.line,
+                        position=reference.position,
+                        area=area,
+                        modules=modules,
+                        themes=themes,
+                        source_theme=source_theme,
+                        activation_paths=activation_paths,
+                        extra_attributes={
+                            "activationCertainty": activation_certainty,
+                            "handles": handles,
+                            "initKind": reference.source_kind,
+                            "selector": reference.selector,
+                        },
+                    )
+
+    def _amd_source_identifier(
+        self,
+        path: str,
+        modules: tuple[ModuleRecord, ...],
+        themes: tuple[ThemeRecord, ...],
+    ) -> str:
+        theme = self._theme_for_path(path, themes)
+        if theme is not None:
+            relative = path[len(theme.root):].lstrip("/")
+            parts = relative.split("/", 2)
+            if len(parts) != 3 or "_" not in parts[0] or parts[1] != "web":
+                return ""
+            module_name = parts[0]
+            asset = parts[2]
+        else:
+            module = self._module_for_path(path, modules)
+            if module is None:
+                return ""
+            relative = (
+                path[len(module.root):].lstrip("/")
+                if module.root
+                else path
+            )
+            match = re.fullmatch(r"view/[^/]+/web/(.+)", relative)
+            if match is None:
+                return ""
+            module_name = module.name
+            asset = match.group(1)
+        for suffix in (".jsx", ".mjs", ".js"):
+            if asset.casefold().endswith(suffix):
+                asset = asset[:-len(suffix)]
+                break
+        return f"{module_name}/{asset}" if asset else ""
+
+    def _amd_consumers(
+        self,
+        modules: tuple[ModuleRecord, ...],
+        themes: tuple[ThemeRecord, ...],
+    ) -> None:
+        sources = {
+            path
+            for path in self.artifacts
+            if path.casefold().endswith((".js", ".mjs", ".jsx"))
+            and "/web/" in f"/{path}"
+            and PurePosixPath(path).name != "requirejs-config.js"
+            and self._is_deployed_view_source(path, modules, themes)
+        }
+        sources.update(
+            path
+            for path in self._template_layout_sources
+            if path.casefold().endswith(".phtml")
+            and path in self.artifacts
+        )
+        sources.update(
+            path
+            for path in self._conditional_template_layout_sources
+            if path.casefold().endswith(".phtml")
+            and path in self.artifacts
+        )
+        for path in sorted(sources):
+            is_template = path.casefold().endswith(".phtml")
+            dependencies = self._optional_frontend_source(
+                "AMD consumers",
+                path,
+                (
+                    extract_template_amd_dependencies
+                    if is_template
+                    else extract_amd_dependencies
+                ),
+            )
+            source_theme = self._theme_for_path(path, themes)
+            source_identifier = (
+                ""
+                if is_template
+                else self._amd_source_identifier(path, modules, themes)
+            )
+            for area in self._frontend_source_areas(path, themes):
+                exact_layout_entries = tuple(sorted(
+                    entry
+                    for entry in self._template_layout_sources.get(path, ())
+                    if entry[1] == area
+                ))
+                conditional_layout_entries = tuple(sorted(
+                    entry
+                    for entry in self._conditional_template_layout_sources.get(
+                        path,
+                        (),
+                    )
+                    if entry[1] == area
+                ))
+                layout_entries = tuple(sorted({
+                    *exact_layout_entries,
+                    *conditional_layout_entries,
+                }))
+                activation_certainty = (
+                    "exact" if exact_layout_entries else "conditional"
+                )
+                activation_paths = tuple(sorted({
+                    layout_path for layout_path, _, _ in layout_entries
+                }))
+                for dependency in dependencies:
+                    consumer = dependency.named_module or source_identifier
+                    normalized = normalize_amd_dependency(
+                        dependency.dependency,
+                        consumer,
+                    )
+                    if not normalized:
+                        continue
+                    self._emit_frontend_dependency(
+                        packet_kind="magento-amd-consumer",
+                        packet_key=f"{area}:{path}",
+                        fact_kind="magento-amd-dependency",
+                        source=consumer or path,
+                        relation=(
+                            (
+                                "declares-dependency"
+                                if dependency.consumer_kind == "define"
+                                else "loads-module"
+                            )
+                            if activation_certainty == "exact"
+                            else (
+                                "conditionally-declares-dependency"
+                                if dependency.consumer_kind == "define"
+                                else "conditionally-loads-module"
+                            )
+                        ),
+                        requested=dependency.dependency,
+                        consumer=consumer,
+                        path=path,
+                        source_line=dependency.line,
+                        position=dependency.position,
+                        area=area,
+                        modules=modules,
+                        themes=themes,
+                        source_theme=source_theme,
+                        activation_paths=activation_paths,
+                        extra_attributes={
+                            "activationCertainty": activation_certainty,
+                            "callKind": dependency.consumer_kind,
+                            "namedModule": dependency.named_module,
+                        },
+                    )
 
     def _system_configuration(
         self,
@@ -6485,15 +9247,16 @@ class MagentoRepositoryResolver:
             if len(type_names) == 1
         }
 
-        client_suffixes = (
-            ".phtml", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".html",
-        )
         for client_path, content in sorted(self.artifacts.items()):
-            if not client_path.casefold().endswith(client_suffixes):
+            if not client_path.casefold().endswith(
+                MAGENTO_GRAPHQL_CLIENT_SUFFIXES
+            ):
                 continue
             for selection in parse_operations(
                 content,
-                embedded_only=True,
+                embedded_only=not client_path.casefold().endswith(
+                    (".gql", ".graphql")
+                ),
                 root_types=resolved_root_types,
             ):
                 owner = selection.root
@@ -6936,6 +9699,157 @@ class MagentoRepositoryResolver:
             )
         return None
 
+    def _is_view_model_argument(
+        self,
+        argument_name: str,
+        symbol: SymbolDefinition | None,
+    ) -> bool:
+        leaf_name = argument_name.rsplit(".", 1)[-1]
+        if re.sub(r"[^a-z0-9]", "", leaf_name.casefold()) == "viewmodel":
+            return True
+        expected = (
+            r"magento\framework\view\element\block\argumentinterface"
+        )
+        queue = [symbol] if symbol is not None else []
+        seen: set[str] = set()
+        while queue:
+            candidate = queue.pop(0)
+            normalized = candidate.qualified_name.lstrip("\\").casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            if normalized == expected:
+                return True
+            for parent_name in candidate.parents:
+                if parent_name.lstrip("\\").casefold() == expected:
+                    return True
+                parent = self._unique_symbol_casefold(parent_name)
+                if parent is not None:
+                    queue.append(parent)
+        return False
+
+    @staticmethod
+    def _layout_argument_for_call(
+        call: TemplatePhpCall,
+        arguments: tuple[LayoutArgument, ...],
+    ) -> str:
+        requested = ""
+        if call.method.casefold() in {"getdata", "hasdata"}:
+            requested = dict(call.literal_arguments).get(0, "")
+        else:
+            match = re.fullmatch(r"(?:get|has)([A-Z][A-Za-z0-9]*)", call.method)
+            if match is not None:
+                requested = re.sub(
+                    r"(?<!^)(?=[A-Z])",
+                    "_",
+                    match.group(1),
+                ).casefold()
+        if not requested:
+            return ""
+        matches = tuple(
+            argument.name
+            for argument in arguments
+            if argument.name == requested
+        )
+        return matches[0] if len(matches) == 1 else ""
+
+    def _template_php_calls(
+        self,
+        path: str,
+        receiver: str,
+    ) -> tuple[TemplatePhpCall, ...]:
+        """Read syntax-proven PHTML calls published by the neutral PHP plugin."""
+
+        cache_key = (path, receiver)
+        cached = self._template_php_call_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        records: set[TemplatePhpCall] = set()
+        for symbol in self.symbols:
+            if symbol.kind != "template" or symbol.path != path:
+                continue
+            for key, value in symbol.attributes:
+                if not key.startswith(_PHP_TEMPLATE_CALL_REFERENCE):
+                    continue
+                try:
+                    payload = json.loads(value)
+                except (TypeError, json.JSONDecodeError):
+                    self._record_template_metadata_diagnostic(
+                        path,
+                        key,
+                        "invalid JSON",
+                    )
+                    continue
+                if not isinstance(payload, dict):
+                    self._record_template_metadata_diagnostic(
+                        path,
+                        key,
+                        "value must be an object",
+                    )
+                    continue
+                call_receiver = payload.get("receiver")
+                method = payload.get("method")
+                call_line = payload.get("line")
+                literal_arguments = payload.get(
+                    "literalStringArguments",
+                    {},
+                )
+                if (
+                    not isinstance(call_receiver, str)
+                    or not isinstance(method, str)
+                    or not isinstance(call_line, int)
+                    or call_line < 1
+                    or not isinstance(literal_arguments, dict)
+                    or any(
+                        not isinstance(position, str)
+                        or not position.isdigit()
+                        or not isinstance(argument, str)
+                        for position, argument in literal_arguments.items()
+                    )
+                ):
+                    self._record_template_metadata_diagnostic(
+                        path,
+                        key,
+                        "object has invalid fields",
+                    )
+                    continue
+                if call_receiver != receiver:
+                    continue
+                records.add(TemplatePhpCall(
+                    receiver=call_receiver,
+                    method=method,
+                    line=call_line,
+                    literal_arguments=tuple(sorted(
+                        (int(position), argument)
+                        for position, argument
+                        in literal_arguments.items()
+                    )),
+                ))
+        result = tuple(sorted(records))
+        self._template_php_call_cache[cache_key] = result
+        return result
+
+    def _record_template_metadata_diagnostic(
+        self,
+        path: str,
+        key: str,
+        reason: str,
+    ) -> None:
+        identity = (path, key)
+        if identity in self._template_metadata_diagnostics:
+            return
+        self._template_metadata_diagnostics.add(identity)
+        self._diagnostics.append(PluginDiagnostic(
+            code="magento-invalid-php-template-call-metadata",
+            message=(
+                f"{path}: ignored PHP template call metadata {key!r}: "
+                f"{reason}"
+            ),
+            plugin_id=self.plugin_id,
+            path=path,
+            recoverable=True,
+        ))
+
     def _theme_for_path(
         self,
         path: str,
@@ -6944,7 +9858,11 @@ class MagentoRepositoryResolver:
         return max(
             (
                 theme for theme in themes
-                if path == theme.root or path.startswith(theme.root + "/")
+                if (
+                    not theme.root
+                    or path == theme.root
+                    or path.startswith(theme.root + "/")
+                )
             ),
             key=lambda theme: len(theme.root),
             default=None,
@@ -6971,7 +9889,13 @@ class MagentoRepositoryResolver:
                 )
                 if module is not None:
                     return module.enabled
-                return self.configured_modules.get(theme_module, False)
+                if theme_module in self.configured_modules:
+                    return self.configured_modules[theme_module]
+                # A standalone theme package has no deployment config from
+                # which to prove installed modules. Retain its explicitly
+                # named override directories without inventing ModuleRecords;
+                # exact module-dependent resolution continues to abstain.
+                return not modules and not self.configured_modules
             return True
         module = self._module_for_path(path, modules)
         return module is not None and module.enabled
@@ -7022,11 +9946,17 @@ class MagentoRepositoryResolver:
             return ()
         module_name, relative = template.split("::", 1)
         module = next((item for item in modules if item.name == module_name), None)
+        theme_only_selection = (
+            source_theme is not None
+            and not modules
+            and not self.configured_modules
+        )
         if module is not None and not module.enabled:
             return ()
         if (
             module is None
             and not self.configured_modules.get(module_name, False)
+            and not theme_only_selection
         ):
             return ()
         paths: set[str] = set()
@@ -7068,11 +9998,17 @@ class MagentoRepositoryResolver:
             (item for item in modules if item.name == module_name),
             None,
         )
+        theme_only_selection = (
+            source_theme is not None
+            and not modules
+            and not self.configured_modules
+        )
         if module is not None and not module.enabled:
             return ""
         if (
             module is None
             and not self.configured_modules.get(module_name, False)
+            and not theme_only_selection
         ):
             return ""
 
@@ -7128,11 +10064,17 @@ class MagentoRepositoryResolver:
         relative_path = relative if relative.endswith(extension) else relative + extension
         paths: set[str] = set()
         module = next((item for item in modules if item.name == module_name), None)
+        theme_only_selection = (
+            source_theme is not None
+            and not modules
+            and not self.configured_modules
+        )
         if module is not None and not module.enabled:
             return ()
         if (
             module is None
             and not self.configured_modules.get(module_name, False)
+            and not theme_only_selection
         ):
             return ()
         if module is not None:
@@ -7249,8 +10191,7 @@ class MagentoRepositorySession:
             is_component = filename in {
                 "composer.json", "module.xml", "registration.php", "theme.xml",
             }
-            is_layout = "/layout/" in f"/{path}" and path.endswith(".xml")
-            is_ui_component = "/ui_component/" in f"/{path}" and path.endswith(".xml")
+            is_view_configuration = is_magento_view_xml(path)
             is_template = (
                 "/templates/" in f"/{path}"
             )
@@ -7260,9 +10201,9 @@ class MagentoRepositorySession:
             )
             is_view_asset = (
                 "/web/" in f"/{path}"
-                and path.casefold().endswith((".js", ".html"))
+                and path.casefold().endswith(MAGENTO_VIEW_SOURCE_SUFFIXES)
             )
-            is_graphql = path.endswith(".graphqls")
+            is_graphql = path.casefold().endswith(".graphqls")
             is_requirejs = filename == "requirejs-config.js"
             is_app_config = path == "app/etc/config.php" or path.endswith(
                 "/app/etc/config.php"
@@ -7271,8 +10212,7 @@ class MagentoRepositorySession:
                 is_config
                 or is_schema_whitelist
                 or is_component
-                or is_layout
-                or is_ui_component
+                or is_view_configuration
                 or is_template
                 or is_email_template
                 or is_view_asset
@@ -7363,7 +10303,7 @@ class MagentoRepositorySession:
             )
             and path in related_paths
             and content.strip()
-            and path.casefold().endswith((".phtml", ".js", ".mjs", ".ts", ".html"))
+            and path.casefold().endswith(MAGENTO_VIEW_SOURCE_SUFFIXES)
         ))
         snapshot_started = time.monotonic()
         snapshot = self._snapshot()

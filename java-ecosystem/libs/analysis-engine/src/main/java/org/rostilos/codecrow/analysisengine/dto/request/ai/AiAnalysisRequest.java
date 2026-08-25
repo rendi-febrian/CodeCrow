@@ -93,6 +93,13 @@ public interface AiAnalysisRequest {
 
     String getCurrentCommitHash();
 
+    /**
+     * Immutable commit at the head of the PR target branch when its metadata
+     * was fetched. Older request implementations used the base commit for this
+     * purpose, so retain that as a compatibility fallback.
+     */
+    default String getTargetHeadCommitHash() { return getBaseCommitHash(); }
+
     default String getBaseCommitHash() { return null; }
 
     /**

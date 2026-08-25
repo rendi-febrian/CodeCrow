@@ -75,8 +75,8 @@ class ReviewRequestDto(BaseModel):
     accessToken: Optional[str] = Field(default=None, description="Bearer token for APP connections (used instead of oAuthClient/oAuthSecret)")
     mcpServerJar: Optional[str] = None
     analysisType: Optional[str] = None
-    prTitle: Optional[str] = Field(default=None, description="PR title for RAG context")
-    prDescription: Optional[str] = Field(default=None, description="PR description for RAG context")
+    prTitle: Optional[str] = Field(default=None, description="Pull request title")
+    prDescription: Optional[str] = Field(default=None, description="Pull request description")
     taskContext: Optional[Dict[str, Any]] = Field(
         default=None,
         validation_alias=AliasChoices("taskContext", "task_context"),
@@ -90,10 +90,15 @@ class ReviewRequestDto(BaseModel):
     prAuthor: Optional[str] = Field(default=None, description="PR author username")
     sourceBranchName: Optional[str] = Field(default=None, description="Source branch name of the PR")
     changedFiles: Optional[List[str]] = Field(default_factory=list, description="List of changed file paths from diff")
-    deletedFiles: Optional[List[str]] = Field(default_factory=list, description="Files deleted in this PR (excluded from review, used for RAG filtering)")
-    diffSnippets: Optional[List[str]] = Field(default_factory=list, description="Code snippets from diff for RAG semantic search")
+    deletedFiles: Optional[List[str]] = Field(default_factory=list, description="Files deleted in this PR and excluded from review context")
     rawDiff: Optional[str] = Field(default=None, description="Full raw diff content from PR for direct analysis without MCP tool call")
-    maxAllowedTokens: Optional[int] = Field(default=None, description="Optional per-request token limit enforced by the client before calling the AI. If provided and the estimated token count exceeds this value, the request will be rejected.")
+    maxAllowedTokens: Optional[int] = Field(
+        default=None,
+        description=(
+            "Optional model-context hint used to split complete review units; "
+            "generated output is bounded separately by the stage inference policy."
+        ),
+    )
     previousCodeAnalysisIssues: Optional[List[IssueDTO]] = Field(default_factory=list,
                                                                  description="List of issues from the previous CodeAnalysis version, if available.")
     vcsProvider: Optional[str] = Field(default=None, description="VCS provider type for MCP server selection (github, bitbucket_cloud, gitlab)")
@@ -103,7 +108,16 @@ class ReviewRequestDto(BaseModel):
     deltaDiff: Optional[str] = Field(default=None, description="Delta diff between previous and current commit (only for INCREMENTAL mode)")
     previousCommitHash: Optional[str] = Field(default=None, description="Previously analyzed commit hash")
     currentCommitHash: Optional[str] = Field(default=None, description="Current commit hash being analyzed")
-    baseCommitHash: Optional[str] = Field(default=None, description="Immutable pull-request base commit hash")
+    targetHeadCommitHash: Optional[str] = Field(
+        default=None,
+        description=(
+            "Immutable target-branch head commit captured with pull-request metadata"
+        ),
+    )
+    baseCommitHash: Optional[str] = Field(
+        default=None,
+        description="Immutable pull-request merge-base commit hash",
+    )
     ragCollectionTarget: Optional[str] = Field(
         default=None,
         exclude=True,
@@ -162,7 +176,27 @@ class ReviewRequestDto(BaseModel):
         description="Opaque job identifier used only to name a prompt dry-run artifact.",
     )
     # MCP tools for enhanced context in Stage 1 and issue verification in Stage 3
-    useMcpTools: Optional[bool] = Field(default=False, description="Enable LLM to call VCS tools for context gaps and issue verification")
+    useMcpTools: Optional[bool] = Field(
+        default=True,
+        description=(
+            "Enable agentic repository and RAG tools for Stage 1 context gaps "
+            "and exact-source tools for issue verification"
+        ),
+    )
+    localRepoPath: Optional[str] = Field(
+        default=None,
+        description=(
+            "Ephemeral target-branch snapshot path shared with the VCS MCP server"
+        ),
+    )
+    localRepoTargetBranch: Optional[str] = Field(
+        default=None,
+        description="Target branch represented by localRepoPath",
+    )
+    localRepoRevision: Optional[str] = Field(
+        default=None,
+        description="Immutable target-head revision represented by localRepoPath",
+    )
     ragEnabled: bool = Field(
         default=True,
         description=(
@@ -178,13 +212,20 @@ class ReviewRequestDto(BaseModel):
     def get_rag_branch(self) -> Optional[str]:
         # The indexed PR source branch is never repository truth. A review is
         # assembled from the immutable target branch plus the exact PR overlay;
-        # accepting source-branch vectors here can mix stale or rejected branch
+        # accepting source-branch index data here can mix stale or rejected branch
         # state into otherwise current changed-file evidence.
         return self.targetBranchName
 
     def get_rag_base_branch(self) -> Optional[str]:
         if self.pullRequestId:
             return self.targetBranchName
+        return None
+
+    def get_target_head_commit_hash(self) -> Optional[str]:
+        """Return the pinned target head, with legacy base-field fallback."""
+        for value in (self.targetHeadCommitHash, self.baseCommitHash):
+            if isinstance(value, str) and value.strip():
+                return value.strip()
         return None
 
 
@@ -217,17 +258,6 @@ class SummarizeRequestDto(BaseModel):
     vcsProvider: Optional[str] = Field(default=None, description="VCS provider type (github, bitbucket_cloud)")
     vcsBaseUrl: Optional[str] = Field(default=None, description="GitLab instance root for MCP API calls")
 
-    def get_rag_branch(self) -> Optional[str]:
-        if self.pullRequestId:
-            return self.sourceBranch or self.targetBranch
-        return self.targetBranch
-
-    def get_rag_base_branch(self) -> Optional[str]:
-        if self.pullRequestId:
-            return self.targetBranch
-        return None
-
-
 class SummarizeResponseDto(BaseModel):
     """Response model for PR summarization command."""
     summary: Optional[str] = None
@@ -249,7 +279,11 @@ class AskRequestDto(BaseModel):
     aiBaseUrl: Optional[str] = None
     question: str
     pullRequestId: Optional[int] = None
-    commitHash: Optional[str] = None
+    repositoryRevision: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        description="Exact indexed repository revision for code search",
+    )
     oAuthClient: Optional[str] = None
     oAuthSecret: Optional[str] = None
     accessToken: Optional[str] = Field(default=None, description="Bearer token for APP connections")
@@ -259,6 +293,26 @@ class AskRequestDto(BaseModel):
     # Context data that can be passed from the processor
     analysisContext: Optional[str] = Field(default=None, description="Existing analysis data for context")
     issueReferences: Optional[List[str]] = Field(default_factory=list, description="Issue IDs referenced in the question")
+    branch: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("branch", "targetBranch", "targetBranchName"),
+        description="Repository branch used for deterministic code search",
+    )
+    ragCollectionTarget: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        description="Internal opaque collection target for code search",
+    )
+    ragGenerationManifestSha256: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        validation_alias=AliasChoices(
+            "ragGenerationManifestSha256",
+            "repositoryGenerationManifestSha256",
+            "ragBaseGenerationManifestSha256",
+        ),
+        description="Internal sealed repository-generation receipt for code search",
+    )
 
 
 class AskResponseDto(BaseModel):

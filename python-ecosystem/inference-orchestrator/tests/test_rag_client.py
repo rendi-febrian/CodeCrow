@@ -24,23 +24,13 @@ def enabled_client():
 
 class TestRagClientDisabled:
     @pytest.mark.asyncio(loop_scope="function")
-    async def test_get_pr_context_disabled(self, disabled_client):
-        r = await disabled_client.get_pr_context("ws", "proj", "main", ["a.py"])
-        assert r == {"context": {"relevant_code": []}}
-
-    @pytest.mark.asyncio(loop_scope="function")
-    async def test_semantic_search_disabled(self, disabled_client):
-        r = await disabled_client.semantic_search("q", "ws", "proj", "main")
+    async def test_code_search_disabled(self, disabled_client):
+        r = await disabled_client.search_code("q", "ws", "proj", "main")
         assert r == {"results": []}
 
     @pytest.mark.asyncio(loop_scope="function")
     async def test_is_healthy_disabled(self, disabled_client):
         assert await disabled_client.is_healthy() is False
-
-    @pytest.mark.asyncio(loop_scope="function")
-    async def test_search_for_duplicates_disabled(self, disabled_client):
-        r = await disabled_client.search_for_duplicates("ws", "proj", "main", ["q"])
-        assert r == []
 
     @pytest.mark.asyncio(loop_scope="function")
     async def test_deterministic_context_disabled(self, disabled_client):
@@ -60,41 +50,69 @@ class TestRagClientDisabled:
 
 # ── No-branch short-circuit ──────────────────────────────────
 
-class TestRagClientNoBranch:
-    @pytest.mark.asyncio(loop_scope="function")
-    async def test_get_pr_context_no_branch(self, enabled_client):
-        r = await enabled_client.get_pr_context("ws", "proj", None, ["a.py"])
-        assert r == {"context": {"relevant_code": []}}
-
-
 # ── Successful HTTP calls (mocked with respx) ───────────────
 
 class TestRagClientSuccess:
     @pytest.mark.asyncio(loop_scope="function")
     @respx.mock
-    async def test_get_pr_context_ok(self):
-        respx.post("http://rag:8001/query/pr-context").mock(
+    async def test_code_search_ok(self):
+        route = respx.post("http://rag:8001/query/code-search").mock(
             return_value=httpx.Response(200, json={
-                "context": {
-                    "relevant_code": [{"text": "x"}],
-                    "_branches_searched": ["main"],
-                }
+                "results": [{
+                    "path": "src/a.py",
+                    "score": 12,
+                    "match_reasons": ["symbol:authenticate"],
+                }]
             })
         )
         c = RagClient(base_url="http://rag:8001", enabled=True)
-        r = await c.get_pr_context("ws", "proj", "main", ["a.py"], pr_title="fix")
-        assert len(r["context"]["relevant_code"]) == 1
+        r = await c.search_code(
+            "query",
+            "ws",
+            "proj",
+            "main",
+            repository_revision="abc123",
+            repository_generation_manifest_sha256="receipt",
+            collection_target="generation-collection",
+        )
+        assert len(r["results"]) == 1
+        payload = route.calls.last.request.content.decode()
+        assert '"repository_revision":"abc123"' in payload
+        assert '"repository_generation_manifest_sha256":"receipt"' in payload
+        assert '"collection_target":"generation-collection"' in payload
+        assert '"limit":8' in payload
+        assert r["results"][0]["match_reasons"] == ["symbol:authenticate"]
         await c.close()
 
     @pytest.mark.asyncio(loop_scope="function")
     @respx.mock
-    async def test_semantic_search_ok(self):
-        respx.post("http://rag:8001/query/search").mock(
-            return_value=httpx.Response(200, json={"results": [{"score": 0.9}]})
+    async def test_code_search_forwards_an_explicit_result_limit(self):
+        route = respx.post("http://rag:8001/query/code-search").mock(
+            return_value=httpx.Response(200, json={
+                "results": [],
+                "coverage": {
+                    "complete": False,
+                    "partial_reasons": ["explicit_result_limit"],
+                },
+            })
         )
         c = RagClient(base_url="http://rag:8001", enabled=True)
-        r = await c.semantic_search("query", "ws", "proj", "main", filter_language="python")
-        assert len(r["results"]) == 1
+
+        response = await c.search_code(
+            "query",
+            "ws",
+            "proj",
+            "main",
+            top_k=17,
+            repository_revision="abc123",
+            repository_generation_manifest_sha256="receipt",
+            collection_target="generation-collection",
+        )
+
+        assert route.calls.last.request.url.path == "/query/code-search"
+        assert route.calls.last.request.read()
+        assert b'"limit":17' in route.calls.last.request.content
+        assert response["coverage"]["complete"] is False
         await c.close()
 
     @pytest.mark.asyncio(loop_scope="function")
@@ -107,20 +125,8 @@ class TestRagClientSuccess:
 
     @pytest.mark.asyncio(loop_scope="function")
     @respx.mock
-    async def test_search_for_duplicates_ok(self):
-        respx.post("http://rag:8001/query/search").mock(
-            return_value=httpx.Response(200, json={"results": [{"text": "dup"}]})
-        )
-        c = RagClient(base_url="http://rag:8001", enabled=True)
-        r = await c.search_for_duplicates("ws", "proj", "main", ["find duplicate of X"])
-        assert len(r) == 1
-        assert r[0]["_source"] == "duplication"
-        await c.close()
-
-    @pytest.mark.asyncio(loop_scope="function")
-    @respx.mock
     async def test_get_deterministic_context_ok(self):
-        respx.post("http://rag:8001/query/deterministic").mock(
+        route = respx.post("http://rag:8001/query/deterministic").mock(
             return_value=httpx.Response(200, json={
                 "context": {"chunks": [{"text": "c"}], "changed_files": {}, "related_definitions": {}}
             })
@@ -128,6 +134,28 @@ class TestRagClientSuccess:
         c = RagClient(base_url="http://rag:8001", enabled=True)
         r = await c.get_deterministic_context("ws", "proj", ["main"], ["a.py"], pr_number=42)
         assert len(r["context"]["chunks"]) == 1
+        assert b'"limit_per_file"' not in route.calls.last.request.content
+        await c.close()
+
+    @pytest.mark.asyncio(loop_scope="function")
+    @respx.mock
+    async def test_get_deterministic_context_preserves_explicit_per_file_bound(self):
+        route = respx.post("http://rag:8001/query/deterministic").mock(
+            return_value=httpx.Response(200, json={
+                "context": {"chunks": [], "changed_files": {}, "related_definitions": {}}
+            })
+        )
+        c = RagClient(base_url="http://rag:8001", enabled=True)
+
+        await c.get_deterministic_context(
+            "ws",
+            "proj",
+            ["main"],
+            ["a.py"],
+            limit_per_file=7,
+        )
+
+        assert b'"limit_per_file":7' in route.calls.last.request.content
         await c.close()
 
     @pytest.mark.asyncio(loop_scope="function")
@@ -206,49 +234,12 @@ class TestRagClientSuccess:
 class TestRagClientErrors:
     @pytest.mark.asyncio(loop_scope="function")
     @respx.mock
-    async def test_get_pr_context_http_error(self):
-        respx.post("http://rag:8001/query/pr-context").mock(
-            return_value=httpx.Response(500)
+    async def test_code_search_error(self):
+        respx.post("http://rag:8001/query/code-search").mock(
+            side_effect=httpx.ConnectError("fail")
         )
         c = RagClient(base_url="http://rag:8001", enabled=True)
-        r = await c.get_pr_context("ws", "proj", "main", ["a.py"])
-        assert r["status"] == "error"
-        assert r["status_code"] == 500
-        assert "context" not in r
-        await c.close()
-
-    @pytest.mark.asyncio(loop_scope="function")
-    @respx.mock
-    async def test_get_pr_context_preserves_reindex_409_detail(self, caplog):
-        respx.post("http://rag:8001/query/pr-context").mock(
-            return_value=httpx.Response(
-                409,
-                json={
-                    "detail": "branch 'main' requires a full reindex",
-                },
-            )
-        )
-        c = RagClient(base_url="http://rag:8001", enabled=True)
-        with caplog.at_level(logging.DEBUG, logger="service.rag.rag_client"):
-            r = await c.get_pr_context("ws", "proj", "main", ["a.py"])
-        assert r == {
-            "status": "error",
-            "status_code": 409,
-            "error": "branch 'main' requires a full reindex",
-        }
-        assert not any(
-            record.levelno >= logging.WARNING
-            for record in caplog.records
-            if record.name == "service.rag.rag_client"
-        )
-        await c.close()
-
-    @pytest.mark.asyncio(loop_scope="function")
-    @respx.mock
-    async def test_semantic_search_error(self):
-        respx.post("http://rag:8001/query/search").mock(side_effect=httpx.ConnectError("fail"))
-        c = RagClient(base_url="http://rag:8001", enabled=True)
-        r = await c.semantic_search("q", "ws", "proj", "main")
+        r = await c.search_code("q", "ws", "proj", "main")
         assert r["status"] == "error"
         assert r["status_code"] is None
         assert r["results"] == []
@@ -403,11 +394,6 @@ class TestRagClientLifecycle:
         await c.close()
         assert query_client.is_closed
         assert mutation_client.is_closed
-
-    @pytest.mark.asyncio(loop_scope="function")
-    async def test_empty_queries_duplicates(self, enabled_client):
-        r = await enabled_client.search_for_duplicates("ws", "proj", "main", [])
-        assert r == []
 
     @pytest.mark.asyncio(loop_scope="function")
     async def test_empty_files_index(self, enabled_client):

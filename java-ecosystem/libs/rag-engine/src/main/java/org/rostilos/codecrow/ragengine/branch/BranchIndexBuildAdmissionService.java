@@ -100,7 +100,7 @@ public class BranchIndexBuildAdmissionService {
 
         if (projectStatus == ProjectStatusAdmission.UPDATING) {
             // The active exact generation is the authoritative completed
-            // checkpoint. Align a stale/failed legacy status under the branch
+            // checkpoint. Align a stale/failed UI projection under the branch
             // lock before switching it to UPDATING, all in this transaction.
             trackingService.preparePublishedGenerationForUpdate(
                     project,
@@ -110,9 +110,8 @@ public class BranchIndexBuildAdmissionService {
                     activeSource.getChunkCount(),
                     activeSource.getActivatedAt());
         }
-        Job job = jobService.createRagIndexJob(
+        Job job = jobService.createRepositoryIndexBuildJob(
                 project,
-                projectStatus == ProjectStatusAdmission.INDEXING,
                 triggerSource,
                 branch,
                 revision);

@@ -72,9 +72,9 @@ These features are platform-independent and available through the CodeCrow web U
 | Source Context Viewer       | Full source code browser with inline issue annotations for every analyzed file                        |
 | Quality Gates               | Configurable pass/fail thresholds per workspace                                                       |
 | Custom Rules                | Per-project enforce/suppress rules with glob-based file patterns                                      |
-| Analysis and RAG Scopes     | Per-project include/exclude scopes with synchronized analysis and indexing coverage                   |
-| RAG Configuration           | Per-project RAG controls, branch indexing status, last activity, progress, and reindex actions        |
-| Vector Storage Explorer     | Inspect semantic and PR chunks, architecture context, exact source, plugin state, and graph relations |
+| Analysis and Index Scopes   | Per-project include/exclude scopes with synchronized analysis and indexing coverage                   |
+| Repository Index Configuration | Per-project index controls, branch status, last activity, progress, and reindex actions            |
+| Repository Index Explorer   | Inspect source records, architecture context, plugin state, and graph relations                        |
 | Project Analytics           | Aggregated severity breakdown, analysis history, and branch health                                    |
 | AI Model Selection          | OpenRouter, OpenAI, Anthropic, Google AI, Google Vertex AI, and OpenAI-compatible connections         |
 | Workspace & Team Management | Roles (Owner, Admin, Member, Viewer), member invites, ownership transfer                              |
@@ -106,7 +106,7 @@ CodeCrow can send any reviewable text file to the configured model. That generic
 review is model-dependent and is distinct from the deterministic support listed
 below.
 
-| Language tier                                                                                                            | Model Review | Changed-File Syntax Plugin | Semantic RAG Query | Exact Plugin Facts |
+| Language tier                                                                                                            | Model Review | Changed-File Syntax Plugin | Structural Source Index | Exact Plugin Facts |
 | :----------------------------------------------------------------------------------------------------------------------- | :----------: | :------------------------: | :----------------: | :----------------: |
 | Java (`.java`)                                                                                                           |      ✅      |             ✅             |         ✅         |         ✅         |
 | Python (`.py`, `.pyi`, `.pyw`)                                                                                           |      ✅      |             ✅             |         ✅         |         ✅         |
@@ -120,11 +120,12 @@ below.
 | Bash / Shell, C, C++, CSS, Haskell, HTML, JSON, Scala                                                                    |      ✅      |             ✅             |      generic       |         —          |
 | Kotlin, Swift, Lua, Perl, COBOL, Objective-C, SQL, R, SCSS, Vue/Svelte SFCs, YAML/TOML/XML, Markdown/RST, and other text |      ✅      |          fallback          |      generic       |         —          |
 
-`generic` means language-aware or text chunking without a dedicated semantic RAG
-query. TSX uses the TypeScript RAG parser/query compatibility path but is not
-included in the TypeScript repository-fact session. C, C++, and Ruby ship RAG
-parser packages but currently have no dedicated semantic query, so the table
-reports their resulting generic chunk behavior rather than package availability.
+`generic` means language-aware or text-derived source records without a dedicated
+repository-graph implementation. TSX uses the TypeScript parser compatibility
+path but is not included in the TypeScript repository-fact session. C, C++, and
+Ruby ship parser packages but currently have no dedicated repository graph, so
+the table reports their resulting generic source-record behavior rather than
+package availability.
 `framework-dependent` means the base language tier does not emit those facts,
 but a selected framework plugin does. Ember can additionally enrich conservative
 `.hbs` template structure; this is not a general Handlebars language plugin.
@@ -152,30 +153,29 @@ replaces model review with a preset defect-rule engine.
 
 Plugins are selected automatically from bounded facts at the pinned repository
 revision. They are part of the local distribution, are not downloaded or
-hot-loaded at runtime, and cannot call an LLM or embedding provider. The generic
+hot-loaded at runtime, and cannot call an external model provider. The generic
 Java and Python hosts remain the fallback when no plugin implementation matches.
 
-## RAG and Incremental Indexing
+## Repository Index and Immutable Generations
 
-RAG is optional per project. Disabling it skips indexing and retrieval while the
-normal review pipeline continues.
+Repository indexing is optional per project. Disabling it skips persistent
+structural context while the normal review pipeline continues.
 
 | Capability          | Implemented Behavior                                                                                                                                       |
 | :------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Embeddings          | Deployment-level OpenRouter or Ollama configuration, separate from the project's review-model connection                                                   |
-| Retrieval           | Qdrant semantic search combined with deterministic metadata and exact-path lookup                                                                          |
-| Stored Context      | Semantic source chunks plus exact-source, architecture, graph, plugin snapshot, and repository-detection points                                            |
-| Full Reindex        | Builds a pending collection generation and atomically swaps the project alias only after successful completion                                             |
+| Retrieval           | Exact source, symbol, path, revision, architecture, and typed graph lookup in Qdrant                                                                         |
+| Stored Context      | Source records, architecture facts, graph relations, plugin snapshots, and repository-detection state                                                       |
+| Generation Build   | Builds and seals an immutable generation for one exact branch revision, then atomically activates its opaque target                                      |
 | Resilient Writes    | Quarantines malformed files and exact rejected points while retaining valid content; systemic Qdrant failures still prevent activation                    |
-| Incremental Reindex | Applies one pinned commit change set and replaces changed semantic chunks together with affected graph and state groups                                    |
+| Generation Refresh | Builds a complete snapshot for the new branch revision while readers retain the last complete active generation                                             |
 | PR Context          | Uses an immutable, commit-pinned PR overlay so changed files do not retrieve stale base-branch copies                                                      |
-| Compatibility Guard | Host, selection, descriptor, and implementation fingerprints are provenance only and never force a reindex or filter context; snapshot integrity and Qdrant vector shape remain enforced |
-| Prompt Budget       | Plugin and RAG evidence share bounded context budgets; plugins cannot create an additional model stage                                                     |
+| Compatibility Guard | Host, selection, descriptor, and implementation fingerprints are provenance only and never force a reindex or filter context; snapshot integrity and the Qdrant collection schema remain enforced |
+| Prompt Budget       | Plugin and repository evidence share bounded context budgets; plugins cannot create an additional model stage                                              |
 
-The Vector Storage Explorer exposes the different point types and their
+The Repository Index Explorer exposes the different record types and their
 relationships. Deterministic architecture and state points intentionally use
-stable content identities; they participate in graph invalidation and
-incremental replacement rather than behaving as unrelated source files.
+stable content identities; they participate in exact generation replacement
+rather than behaving as unrelated source files.
 
 ## Review Pipeline and Quality Controls
 
@@ -187,15 +187,13 @@ incremental replacement rather than behaving as unrelated source files.
 | Evidence Gate                | Validates changed-line location, visible evidence, plugin proof decisions, suppression, and duplicate identity before publication    |
 | Idempotent Evidence          | Persists deterministic execution, coverage, candidate, and finding identities for safe retry and lifecycle reconciliation            |
 | Failure Semantics            | A failed or incomplete batch is not interpreted as a clean review; incomplete coverage blocks publication                            |
-| Optional Model Extras        | Model-based RAG reranking and final semantic deduplication are disabled by default and add calls only when explicitly enabled        |
 | Queue Liveness               | Capacity-first consumers renew locks and report heartbeats; timeout is based on inactivity rather than total healthy-review duration |
-| Full-Pipeline Prompt Dry Run | Runs normal acquisition, enrichment, plugins, RAG, batching, and prompt assembly with a capture model instead of the review LLM      |
+| Full-Pipeline Prompt Dry Run | Runs normal acquisition, enrichment, plugins, repository context, batching, and prompt assembly with a capture model instead of the review LLM |
 | Capture and Replay Tooling   | Provides opt-in prompt capture, disconnected fixtures, replay, paired evaluation, and publication-gate tooling for operators         |
 
 Prompt dry-run is a deployment/operator switch, not a dashboard setting. It
 suppresses analysis persistence and VCS mutations and writes artifacts under
-`/app/logs/prompt-dry-runs`. It makes no review-model call, but an RAG-enabled run
-can still call the configured embedding provider. See the
+`/app/logs/prompt-dry-runs`. It makes no review-model call. See the
 [testing guide](https://codecrow.app/docs/developer/testing) for the exact
 configuration and audit procedure.
 
@@ -207,10 +205,10 @@ the [configuration guide](https://codecrow.app/docs/developer/configuration).
 ## Key Features
 
 - **Evidence-Bound Reviews**: Multi-stage analysis with immutable inputs, changed-hunk coverage, candidate provenance, deterministic validation, and publication gates.
-- **Context-Aware Reviews**: Optional semantic and deterministic RAG using Qdrant vector storage.
+- **Context-Aware Reviews**: Optional structural repository context using exact source and typed graph relations stored in Qdrant.
 - **Plugin-Based Enrichment**: Local language, framework, and domain plugins add exact context while generic hosts remain available for every project.
 - **Task-Aware PR Review**: When a project has a connected Jira task-management integration, PR analysis can include the linked task summary, description, status, priority, assignee, reporter, and URL. The setting `taskContextAnalysisEnabled` defaults to `true` and can be disabled per project through analysis settings.
-- **Incremental Analysis and Indexing**: Reviews focus publication on changed hunks while retrieving related source; branch updates replace changed chunks and invalidated graph/state groups.
+- **Delta Reviews, Immutable Indexes**: Repeat reviews can focus on new hunks, while every branch refresh publishes a complete revision-pinned repository-index generation.
 - **Multi-Tenant Architecture**: Securely manage multiple teams and projects from a single dashboard.
 - **Interactive Commands**: Command CodeCrow directly from PR comments using `/codecrow ask`, `/codecrow analyze`, `/codecrow review`, `/codecrow summarize`, and `/codecrow qa-doc`.
 - **QA Auto-Documentation**: Automatically generate QA testing documentation from PR analysis, store the latest document per PR in the CodeCrow dashboard, and post or update it on linked Jira tickets. Task IDs are auto-detected from branch names, PR titles, or PR descriptions — or you can specify one explicitly with `/codecrow qa-doc PROJ-123`.
@@ -229,13 +227,13 @@ For full setup guides, architectural deep-dives, and API reference, please visit
 
 High level components:
 
-- **Web frontend** (`frontend/`) – pinned React submodule for workspaces, projects, dashboards, RAG controls, and issue views.
+- **Web frontend** (`frontend/`) – pinned React submodule for workspaces, projects, dashboards, repository-index controls, and issue views.
 - **Web server / API** (`java-ecosystem/services/web-server/`) – main backend API, auth, workspaces/projects, and orchestration.
 - **Pipeline agent** (`java-ecosystem/services/pipeline-agent/`) – receives VCS webhooks, fetches repo/PR data, and coordinates analysis.
 - **Analysis plugins** (`analysis-plugins/`) – neutral contracts and independently owned language, framework, and domain implementations.
 - **Inference orchestrator** (`python-ecosystem/inference-orchestrator/`) – assembles bounded review stages, enforces evidence gates, and calls the configured review model. MCP tools are loaded only for flows that require them.
-- **RAG pipeline** (`python-ecosystem/rag-pipeline/`) – builds semantic and deterministic repository context in **Qdrant**.
-- **PostgreSQL, Redis, and Qdrant** – durable application state, queues/liveness coordination, and vector/architecture context respectively.
+- **Repository index pipeline** (`python-ecosystem/rag-pipeline/`) – builds exact source, architecture, plugin-state, and graph context in **Qdrant**.
+- **PostgreSQL, Redis, and Qdrant** – durable application state, queues/liveness coordination, and repository context respectively.
 
 See the [system design](https://codecrow.app/docs/developer/architecture),
 [plugin architecture](https://codecrow.app/docs/developer/plugin-architecture),
@@ -244,8 +242,8 @@ for the detailed invariants and failure behavior.
 
 ## Self-Hosting and Build Verification
 
-The interactive setup configures secrets and chooses OpenRouter or Ollama for
-embeddings. The local production build fetches and checks out the latest commit
+The interactive setup configures deployment and service secrets. The local
+production build fetches and checks out the latest commit
 from the frontend submodule's configured `main` branch, rejects local frontend
 drift, recreates the two isolated Python 3.11 CI environments, and runs the same
 Python, plugin-boundary, Maven `verify`, and observable-image Buildx gates as

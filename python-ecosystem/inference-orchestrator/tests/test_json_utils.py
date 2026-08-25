@@ -3,7 +3,17 @@ Unit tests for service.review.orchestrator.json_utils — clean_json_text.
 (parse_llm_response and repair_json_with_llm are async and need LLM mock — tested separately.)
 """
 import pytest
-from service.review.orchestrator.json_utils import clean_json_text
+from pydantic import BaseModel
+from unittest.mock import AsyncMock, MagicMock
+
+from service.review.orchestrator.json_utils import (
+    clean_json_text,
+    parse_llm_response,
+)
+
+
+class _Payload(BaseModel):
+    value: int
 
 
 class TestCleanJsonText:
@@ -69,3 +79,41 @@ class TestCleanJsonText:
         text = '```json\n{"incomplete": true}'
         result = clean_json_text(text)
         assert '"incomplete"' in result
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_zero_provider_repair_budget_never_invokes_model():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock()
+
+    with pytest.raises(ValueError, match="Failed to parse _Payload locally"):
+        await parse_llm_response(
+            "{not-json",
+            _Payload,
+            llm,
+            max_provider_repairs=0,
+        )
+
+    llm.with_structured_output.assert_not_called()
+    llm.ainvoke.assert_not_awaited()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_shared_provider_repair_budget_counts_structured_retry():
+    structured = MagicMock()
+    structured.ainvoke = AsyncMock(side_effect=RuntimeError("provider failed"))
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+    llm.ainvoke = AsyncMock()
+
+    with pytest.raises(ValueError):
+        await parse_llm_response(
+            "{not-json",
+            _Payload,
+            llm,
+            retries=2,
+            max_provider_repairs=1,
+        )
+
+    structured.ainvoke.assert_awaited_once()
+    llm.ainvoke.assert_not_awaited()

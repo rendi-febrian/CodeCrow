@@ -27,6 +27,7 @@ def _stable_index_representation(monkeypatch):
 
 def _make_index_manager():
     im = MagicMock()
+    im.config = SimpleNamespace(max_file_size_bytes=512 * 1024)
     mutation_context = MagicMock()
     mutation_context.__enter__.return_value = SimpleNamespace(
         assert_owned=MagicMock()
@@ -41,6 +42,17 @@ def _make_index_manager():
     im._collection_manager.resolve_collection_target.side_effect = (
         lambda collection_name: collection_name
     )
+    im._collection_manager.require_structural_collection.side_effect = (
+        lambda collection_name: collection_name
+    )
+    im.get_revision_preflight.return_value = {
+        "generation_manifest_sha256": "a" * 64,
+        "plugin_ids": [],
+        "plugin_fingerprint": "sha256:" + "0" * 64,
+        "plugin_descriptor_fingerprint": DESCRIPTOR_FINGERPRINT,
+        "plugin_implementation_fingerprint": IMPLEMENTATION_FINGERPRINT,
+        "index_representation_fingerprint": REPRESENTATION_FINGERPRINT,
+    }
     im.splitter.split_documents.return_value = []
     im.splitter.split_documents_resilient.side_effect = (
         lambda documents, capabilities=None: (
@@ -51,12 +63,16 @@ def _make_index_manager():
             (),
         )
     )
-    im._point_ops.embed_and_create_points.return_value = []
-    im._point_ops.upsert_points.return_value = (0, 0)
-    im._point_ops.process_and_upsert_chunks.return_value = (0, 0)
     im.qdrant_client.scroll.return_value = ([], None)
-    im._file_ops._replace_points.side_effect = (
-        lambda nodes, *_args: len(nodes)
+    im._pr_overlay_ops.replace_pr_overlay_generation.side_effect = (
+        lambda nodes, *_args, **_kwargs: (
+            len(nodes),
+            {
+                "overlay_generation_member_count": len(nodes),
+                "overlay_generation_members_sha256": "e" * 64,
+                "overlay_generation_manifest_sha256": "f" * 64,
+            },
+        )
     )
     im.plugin_catalog.registry.resolve.side_effect = lambda plugin_ids: [
         SimpleNamespace(id=plugin_id) for plugin_id in dict.fromkeys(plugin_ids)
@@ -79,6 +95,8 @@ def _request(files):
         base_branch="main",
         source_revision="head-commit",
         base_revision="base-commit",
+        base_generation_manifest_sha256="a" * 64,
+        collection_target="rag_ws__proj",
         repository_plugins=[],
         plugin_detection_evidence={},
         plugin_fingerprint="sha256:" + "0" * 64,
@@ -119,29 +137,14 @@ class TestIndexPRFiles:
             "ws", "proj", 42, "index-pr-overlay"
         )
 
-    @patch("rag_pipeline.api.routers.pr._get_index_manager")
-    def test_collection_target_without_base_revision_is_rejected(self, mock_get):
-        im = _make_index_manager()
-        mock_get.return_value = im
-        req = _request([])
-        req.base_revision = None
-        req.collection_target = "foreign-or-unbound-target"
-
-        from rag_pipeline.api.routers.pr import index_pr_files
-
-        with pytest.raises(HTTPException) as exception:
-            index_pr_files(req)
-
-        assert exception.value.status_code == 409
-        assert "requires an exact base revision" in exception.value.detail
-        im.qdrant_client.scroll.assert_not_called()
-
+    @patch("rag_pipeline.api.routers.pr.read_pr_overlay_generation")
     @patch("rag_pipeline.api.routers.pr.load_repository_snapshots")
     @patch("rag_pipeline.api.routers.pr._get_index_manager")
-    def test_identical_complete_generation_is_reused_without_embedding(
+    def test_identical_complete_generation_is_reused_without_rewriting(
         self,
         mock_get,
         mock_load_snapshots,
+        mock_read_overlay,
     ):
         from rag_pipeline.core.pr_overlay_identity import (
             ZERO_FINGERPRINT,
@@ -194,6 +197,11 @@ class TestIndexPRFiles:
         im.qdrant_client.scroll.return_value = ([existing], None)
         mock_get.return_value = im
         mock_load_snapshots.return_value = ((), (), None, None, None, None)
+        mock_read_overlay.return_value = {
+            "overlay_generation_member_count": 1,
+            "overlay_generation_members_sha256": "e" * 64,
+            "overlay_generation_manifest_sha256": "f" * 64,
+        }
 
         from rag_pipeline.api.routers.pr import index_pr_files
 
@@ -203,14 +211,16 @@ class TestIndexPRFiles:
         assert result["chunks_indexed"] == 1
         assert result["review_groups"] == [["src/Bar.java", "src/Foo.java"]]
         im.splitter.split_documents.assert_not_called()
-        im._file_ops._replace_points.assert_not_called()
+        im._pr_overlay_ops.replace_pr_overlay_generation.assert_not_called()
 
+    @patch("rag_pipeline.api.routers.pr.read_pr_overlay_generation")
     @patch("rag_pipeline.api.routers.pr.load_repository_snapshots")
     @patch("rag_pipeline.api.routers.pr._get_index_manager")
     def test_changed_base_revision_replaces_existing_generation(
         self,
         mock_get,
         mock_load_snapshots,
+        mock_read_overlay,
     ):
         existing = SimpleNamespace(payload={
             "pr_generation_fingerprint": "sha256:" + "9" * 64,
@@ -219,6 +229,7 @@ class TestIndexPRFiles:
         im.qdrant_client.scroll.return_value = ([existing], None)
         mock_get.return_value = im
         mock_load_snapshots.return_value = ((), (), None, None, None, None)
+        mock_read_overlay.return_value = None
         req = _request([])
 
         from rag_pipeline.api.routers.pr import index_pr_files
@@ -226,7 +237,7 @@ class TestIndexPRFiles:
         result = index_pr_files(req)
 
         assert result["status"] == "indexed"
-        im._file_ops._replace_points.assert_called_once()
+        im._pr_overlay_ops.replace_pr_overlay_generation.assert_called_once()
 
     @patch("rag_pipeline.api.routers.pr._get_index_manager")
     def test_success_with_files(self, mock_get):
@@ -252,6 +263,7 @@ class TestIndexPRFiles:
         assert result["pr_number"] == 42
         assert result["files_processed"] == 1
         assert result["chunks_indexed"] == 1
+        assert "source_storage_records_indexed" not in result
         assert mock_chunk.metadata["pr_generation_fingerprint"].startswith(
             "sha256:"
         )
@@ -267,8 +279,130 @@ class TestIndexPRFiles:
         )
         assert mock_chunk.metadata["content_state"] == "complete"
 
+    @patch("rag_pipeline.api.routers.pr.build_overlay_capabilities")
+    @patch("rag_pipeline.api.routers.pr.load_repository_snapshots")
     @patch("rag_pipeline.api.routers.pr._get_index_manager")
-    def test_partial_diff_is_not_parsed_or_embedded_as_source(self, mock_get):
+    def test_oversized_complete_source_is_omitted_from_parser_and_plugins(
+        self,
+        mock_get,
+        mock_load_snapshots,
+        mock_build_capabilities,
+    ):
+        im = _make_index_manager()
+        im.config.max_file_size_bytes = 10
+        im.plugin_runtime.repository_analysis_plugins.return_value = ("java",)
+        mock_get.return_value = im
+        mock_load_snapshots.return_value = (
+            (SimpleNamespace(
+                plugin_id="java",
+                kind="repository",
+                content="snapshot",
+            ),),
+            ("java",),
+            "sha256:capabilities",
+            DESCRIPTOR_FINGERPRINT,
+            IMPLEMENTATION_FINGERPRINT,
+            None,
+        )
+        mock_build_capabilities.return_value = _capabilities("java")
+        oversized = SimpleNamespace(
+            path="src/Large.java",
+            content="x" * 11,
+            change_type="MODIFIED",
+            content_state="complete",
+        )
+        req = _request([oversized])
+        req.repository_plugins = ["java"]
+        req.plugin_fingerprint = "sha256:capabilities"
+
+        from rag_pipeline.api.routers.pr import index_pr_files
+
+        result = index_pr_files(req)
+
+        assert result["status"] == "indexed"
+        assert result["chunks_indexed"] == 0
+        assert "source_storage_records_indexed" not in result
+        assert result["skipped_files"] == ["src/Large.java"]
+        assert result["diagnostics"][-1] == {
+            "code": "repository_file_size_limit_exceeded",
+            "message": (
+                "Complete PR source above the configured repository-index "
+                "file ceiling was omitted as a whole without truncation. "
+                "The PR diff remains review evidence."
+            ),
+            "paths": ["src/Large.java"],
+            "file_sizes_bytes": {"src/Large.java": 11},
+            "max_file_size_bytes": 10,
+        }
+        im.splitter.split_documents.assert_not_called()
+        im.plugin_runtime.start_repository_analysis.assert_not_called()
+        assert (
+            im._pr_overlay_ops.replace_pr_overlay_generation.call_args.args[0]
+            == []
+        )
+
+    @patch("rag_pipeline.api.routers.pr._get_index_manager")
+    def test_complete_source_at_exact_file_ceiling_is_indexed(self, mock_get):
+        im = _make_index_manager()
+        im.config.max_file_size_bytes = 10
+        mock_get.return_value = im
+        exact = SimpleNamespace(
+            path="src/Exact.java",
+            content="x" * 10,
+            change_type="ADDED",
+            content_state="complete",
+        )
+
+        from rag_pipeline.api.routers.pr import index_pr_files
+
+        result = index_pr_files(_request([exact]))
+
+        assert result["skipped_files"] == []
+        parsed_documents = im.splitter.split_documents.call_args.args[0]
+        assert [document.text for document in parsed_documents] == ["x" * 10]
+
+    @patch("rag_pipeline.api.routers.pr.build_overlay_capabilities")
+    @patch("rag_pipeline.api.routers.pr.load_repository_snapshots")
+    @patch("rag_pipeline.api.routers.pr._get_index_manager")
+    def test_architecture_only_file_is_not_generically_split(
+        self,
+        mock_get,
+        mock_load_snapshots,
+        mock_build_capabilities,
+    ):
+        from codecrow_plugins import FileDisposition
+
+        im = _make_index_manager()
+        im.plugin_runtime.repository_analysis_plugins.return_value = ()
+        im.plugin_runtime.file_disposition.return_value = (
+            FileDisposition.ARCHITECTURE_ONLY
+        )
+        mock_get.return_value = im
+        mock_load_snapshots.return_value = (
+            (),
+            ("magento",),
+            "sha256:target",
+            DESCRIPTOR_FINGERPRINT,
+            IMPLEMENTATION_FINGERPRINT,
+            None,
+        )
+        capabilities = _capabilities("magento")
+        mock_build_capabilities.return_value = capabilities
+
+        from rag_pipeline.api.routers.pr import index_pr_files
+
+        result = index_pr_files(_request([SimpleNamespace(
+            path="etc/module.xml",
+            content="<config />",
+            change_type="MODIFIED",
+        )]))
+
+        im.splitter.split_documents.assert_not_called()
+        assert result["chunks_indexed"] == 0
+        assert "source_storage_records_indexed" not in result
+
+    @patch("rag_pipeline.api.routers.pr._get_index_manager")
+    def test_partial_diff_is_not_parsed_or_stored_as_source(self, mock_get):
         im = _make_index_manager()
         mock_get.return_value = im
         partial = SimpleNamespace(
@@ -286,12 +420,12 @@ class TestIndexPRFiles:
         assert result["chunks_indexed"] == 0
         assert result["partial_files"] == ["src/service.py"]
         im.splitter.split_documents.assert_not_called()
-        assert im._file_ops._replace_points.call_args.args[0] == []
+        assert im._pr_overlay_ops.replace_pr_overlay_generation.call_args.args[0] == []
 
     @patch("rag_pipeline.api.routers.pr.build_overlay_capabilities")
     @patch("rag_pipeline.api.routers.pr.load_repository_snapshots")
     @patch("rag_pipeline.api.routers.pr._get_index_manager")
-    def test_partial_diff_fails_closed_for_repository_analysis(
+    def test_partial_diff_skips_repository_analysis_and_reports_fallback(
         self,
         mock_get,
         mock_load_snapshots,
@@ -327,15 +461,16 @@ class TestIndexPRFiles:
 
         from rag_pipeline.api.routers.pr import index_pr_files
 
-        with pytest.raises(HTTPException) as exc_info:
-            index_pr_files(req)
+        result = index_pr_files(req)
 
-        assert exc_info.value.status_code == 409
-        assert "requires complete changed-file source" in exc_info.value.detail
-        assert "src/Service.java" in exc_info.value.detail
+        assert result["status"] == "indexed"
+        assert result["partial_files"] == ["src/Service.java"]
+        assert result["diagnostics"][-1]["code"] == (
+            "partial_diff_source_omitted"
+        )
         im.splitter.split_documents.assert_not_called()
         im.plugin_runtime.start_repository_analysis.assert_not_called()
-        im._file_ops._replace_points.assert_not_called()
+        im._pr_overlay_ops.replace_pr_overlay_generation.assert_called_once()
 
     @patch("rag_pipeline.api.routers.pr._get_index_manager")
     def test_empty_content_clears_previous_generation(self, mock_get):
@@ -354,7 +489,7 @@ class TestIndexPRFiles:
         result = index_pr_files(req)
         assert result["status"] == "indexed"
         assert result["chunks_indexed"] == 0
-        assert im._file_ops._replace_points.call_args.args[0] == []
+        assert im._pr_overlay_ops.replace_pr_overlay_generation.call_args.args[0] == []
 
     @patch("rag_pipeline.api.routers.pr._get_index_manager")
     def test_deleted_only_request_clears_previous_generation(self, mock_get):
@@ -373,7 +508,7 @@ class TestIndexPRFiles:
         result = index_pr_files(req)
         assert result["status"] == "indexed"
         assert result["chunks_indexed"] == 0
-        assert im._file_ops._replace_points.call_args.args[0] == []
+        assert im._pr_overlay_ops.replace_pr_overlay_generation.call_args.args[0] == []
 
     @patch("rag_pipeline.api.routers.pr._get_index_manager")
     def test_replacement_does_not_predelete_existing_pr_points(self, mock_get):
@@ -400,17 +535,14 @@ class TestIndexPRFiles:
     @patch("rag_pipeline.api.routers.pr._get_index_manager")
     def test_value_error_raises_400(self, mock_get):
         im = _make_index_manager()
-        im._get_project_collection_name.side_effect = ValueError("bad input")
+        im._collection_manager.require_structural_collection.side_effect = (
+            ValueError("bad input")
+        )
         mock_get.return_value = im
 
         from rag_pipeline.api.routers.pr import index_pr_files
 
-        req = MagicMock()
-        req.workspace = "ws"
-        req.project = "proj"
-        req.pr_number = 42
-        req.branch = "feat"
-        req.files = []
+        req = _request([])
 
         with pytest.raises(HTTPException) as exc_info:
             index_pr_files(req)
@@ -419,17 +551,12 @@ class TestIndexPRFiles:
     @patch("rag_pipeline.api.routers.pr._get_index_manager")
     def test_internal_error_raises_500(self, mock_get):
         im = _make_index_manager()
-        im._ensure_collection_exists.side_effect = RuntimeError("qdrant down")
+        im.qdrant_client.scroll.side_effect = RuntimeError("qdrant down")
         mock_get.return_value = im
 
         from rag_pipeline.api.routers.pr import index_pr_files
 
-        req = MagicMock()
-        req.workspace = "ws"
-        req.project = "proj"
-        req.pr_number = 42
-        req.branch = "feat"
-        req.files = []
+        req = _request([])
 
         with pytest.raises(HTTPException) as exc_info:
             index_pr_files(req)
@@ -507,7 +634,6 @@ class TestIndexPRFiles:
         mock_build_capabilities.assert_called_once_with(
             im.plugin_catalog.registry,
             ("java", "spring"),
-            "sha256:new",
             (),
             revision="head-commit",
             detection_evidence={
@@ -665,7 +791,6 @@ class TestIndexPRFiles:
         mock_build_capabilities.assert_called_once_with(
             im.plugin_catalog.registry,
             ("bash", "css", "java", "python", "spring"),
-            "sha256:target-branch",
             (),
             revision="head-commit",
             detection_evidence={
@@ -748,7 +873,7 @@ class TestIndexPRFiles:
         result = index_pr_files(req)
 
         assert result["status"] == "indexed"
-        im._file_ops._replace_points.assert_called_once()
+        im._pr_overlay_ops.replace_pr_overlay_generation.assert_called_once()
 
     @patch("rag_pipeline.api.routers.pr.build_overlay_capabilities")
     @patch("rag_pipeline.api.routers.pr.load_repository_snapshots")
@@ -779,40 +904,7 @@ class TestIndexPRFiles:
         result = index_pr_files(req)
 
         assert result["status"] == "indexed"
-        im._file_ops._replace_points.assert_called_once()
-
-    @patch("rag_pipeline.api.routers.pr.build_overlay_capabilities")
-    @patch("rag_pipeline.api.routers.pr.load_repository_snapshots")
-    @patch("rag_pipeline.api.routers.pr._get_index_manager")
-    def test_legacy_index_without_plugin_content_identity_is_accepted(
-        self,
-        mock_get,
-        mock_load_snapshots,
-        mock_build_capabilities,
-    ):
-        im = _make_index_manager()
-        mock_get.return_value = im
-        mock_load_snapshots.return_value = (
-            (),
-            ("java",),
-            "sha256:capabilities",
-            None,
-            None,
-            None,
-        )
-        req = _request([])
-        req.repository_plugins = ["java"]
-        im.plugin_runtime.repository_analysis_plugins.return_value = ()
-        mock_build_capabilities.return_value = _capabilities("java")
-
-        from rag_pipeline.api.routers.pr import index_pr_files
-
-        result = index_pr_files(req)
-
-        assert result["status"] == "indexed"
-        im._file_ops._replace_points.assert_called_once()
-
-
+        im._pr_overlay_ops.replace_pr_overlay_generation.assert_called_once()
 # ─────────────────────────────────────────────────────────────
 # delete_pr_files
 # ─────────────────────────────────────────────────────────────
@@ -824,7 +916,9 @@ class TestDeletePRFiles:
         mock_get.return_value = im
 
         from rag_pipeline.api.routers.pr import delete_pr_files
-        result = delete_pr_files("ws", "proj", 42)
+        result = delete_pr_files(
+            "ws", "proj", 42, collection_target="rag_ws__proj"
+        )
         assert result["status"] == "deleted"
         assert result["pr_number"] == 42
         im.pr_overlay_mutation.assert_called_once_with(
@@ -874,7 +968,9 @@ class TestDeletePRFiles:
         mock_get.return_value = im
 
         from rag_pipeline.api.routers.pr import delete_pr_files
-        result = delete_pr_files("ws", "proj", 42)
+        result = delete_pr_files(
+            "ws", "proj", 42, collection_target="missing-target"
+        )
         assert result["status"] == "skipped"
 
     @patch("rag_pipeline.api.routers.pr._get_index_manager")
@@ -885,4 +981,6 @@ class TestDeletePRFiles:
 
         from rag_pipeline.api.routers.pr import delete_pr_files
         with pytest.raises(HTTPException):
-            delete_pr_files("ws", "proj", 42)
+            delete_pr_files(
+                "ws", "proj", 42, collection_target="rag_ws__proj"
+            )

@@ -170,6 +170,84 @@ query InvoiceLedger {
     }
 
 
+def test_data_contract_bounds_schema_declarations_with_diagnostic():
+    fields = "\n".join(
+        f"  a{index:04d}: String" for index in range(2048)
+    )
+    files = {
+        "schema/large.graphqls": (
+            "type Query {\n"
+            f"{fields}\n"
+            "  zz_tail: String\n"
+            "}\n"
+        ),
+        "client/tail.graphql": "query Tail { zz_tail }\n",
+    }
+    catalog = PluginCatalog.discover(PLUGINS_ROOT)
+    runtime = PluginRuntime(catalog)
+    capabilities = ProjectSelector(catalog.registry).select(RepositoryFacts(
+        revision=REVISION,
+        paths=tuple(sorted(files)),
+    ))
+    handle = runtime.start_repository_analysis(capabilities, REVISION)
+    handle.ingest(tuple(
+        FileArtifact(path, content)
+        for path, content in sorted(files.items())
+    ))
+
+    analysis, diagnostics = handle.finish()
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].code == "data-contract-candidate-limit"
+    assert diagnostics[0].path == "schema/large.graphqls"
+    assert diagnostics[0].recoverable is True
+    assert not any(
+        fact.kind == "data-contract-reference"
+        and fact.path == "client/tail.graphql"
+        and fact.target == "schema/large.graphqls::Query.zz_tail"
+        for fact in _facts(analysis)
+    )
+
+
+def test_data_contract_bounds_query_references_with_diagnostic():
+    selections = "\n".join(
+        f"  a{index:04d}" for index in range(2048)
+    )
+    files = {
+        "schema/large.graphqls": "type Query { zz_tail: String }\n",
+        "client/tail.graphql": (
+            "query Tail {\n"
+            f"{selections}\n"
+            "  zz_tail\n"
+            "}\n"
+        ),
+    }
+    catalog = PluginCatalog.discover(PLUGINS_ROOT)
+    runtime = PluginRuntime(catalog)
+    capabilities = ProjectSelector(catalog.registry).select(RepositoryFacts(
+        revision=REVISION,
+        paths=tuple(sorted(files)),
+    ))
+    handle = runtime.start_repository_analysis(capabilities, REVISION)
+    handle.ingest(tuple(
+        FileArtifact(path, content)
+        for path, content in sorted(files.items())
+    ))
+
+    analysis, diagnostics = handle.finish()
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].code == "data-contract-candidate-limit"
+    assert diagnostics[0].path == "client/tail.graphql"
+    assert diagnostics[0].recoverable is True
+    assert not any(
+        fact.kind == "data-contract-reference"
+        and fact.path == "client/tail.graphql"
+        and fact.target == "schema/large.graphqls::Query.zz_tail"
+        for fact in _facts(analysis)
+    )
+
+
 def test_graphql_parser_supports_shorthand_fragments_custom_roots_and_values():
     roots = dict(parse_schema_root_types(
         "schema { query: RootQuery } type RootQuery { user: User }",

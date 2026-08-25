@@ -110,6 +110,33 @@ class TestBuildBatches:
 
 class TestDedupBatchWithLlm:
     @pytest.mark.asyncio(loop_scope="function")
+    async def test_indivisible_oversized_group_is_retained_without_provider_call(self):
+        marker = "\U0001f9ea" * 20_000
+        issues = [
+            _real_issue(
+                line=10,
+                title="Workspace authorization is missing",
+                reason=f"{marker} first complete root-cause record",
+            ),
+            _real_issue(
+                line=40,
+                title="Workspace authorization is missing",
+                reason=f"{marker} second complete root-cause record",
+            ),
+        ]
+        llm = MagicMock()
+
+        result = await _dedup_batch_with_llm(
+            llm,
+            issues,
+            {0: "candidate_0", 1: "candidate_0"},
+            input_token_target=1_000,
+        )
+
+        assert result == issues
+        llm.with_structured_output.assert_not_called()
+
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_merges_only_explicit_high_confidence_group(self):
         llm = MagicMock()
         structured = MagicMock()

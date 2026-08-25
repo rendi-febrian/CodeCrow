@@ -377,10 +377,6 @@ def audit_prompt_dry_run(
             bool(retrieval_states)
             and set(retrieval_states) == {"complete"}
         ),
-        "semanticRetrievalHealthy": (
-            retrieval.get("semanticFailures") == 0
-            and retrieval.get("semanticDisabled") is False
-        ),
         "noPluginDiagnostics": (
             plugin_diagnostics.get("count") == 0
             and plugin_diagnostics.get("exceptionCount") == 0
@@ -448,9 +444,6 @@ def audit_prompt_dry_run(
             "stage1": dict(quality),
             "maxStage1EstimatedInputTokens": (
                 max_stage1_estimated_input_tokens
-            ),
-            "embeddingProviderCallsMeasured": artifact.get(
-                "embeddingProviderCallsMeasured"
             ),
             "expectedReviewIdentity": (
                 dict(expected_review_identity)

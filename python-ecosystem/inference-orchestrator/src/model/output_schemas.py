@@ -106,6 +106,24 @@ class CodeReviewIssue(BaseModel):
             return ""
         return str(v).strip()
 
+    @field_validator('isResolved', mode='before')
+    @classmethod
+    def normalize_null_resolution_state(cls, v):
+        """Treat an explicit JSON null like the field's existing false default."""
+        return False if v is None else v
+
+    @field_validator('evidenceRefs', 'relatedLocations', mode='before')
+    @classmethod
+    def normalize_null_empty_lists(cls, v):
+        """Treat an explicit JSON null like the fields' existing empty defaults."""
+        return [] if v is None else v
+
+    @field_validator('claimKind', mode='before')
+    @classmethod
+    def normalize_null_claim_kind(cls, v):
+        """Keep the internal claim-kind contract string-only for tolerant input."""
+        return "" if v is None else v
+
 
 class CodeReviewOutput(BaseModel):
     """Schema for the complete code review output."""

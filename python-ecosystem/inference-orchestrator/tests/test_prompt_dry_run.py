@@ -67,7 +67,7 @@ async def test_non_reviewable_hunk_manifest_completes_without_model_stage():
     assert "No text source hunks required model review" in result["comment"]
     assert rag.index_requests == []
     assert rag.requests == []
-    assert rag.semantic_requests == []
+    assert rag.code_search_requests == []
     terminal_event = next(
         event
         for event in events
@@ -106,7 +106,7 @@ async def test_metadata_only_diff_completes_without_model_or_rag_stage():
     assert "No text source hunks required model review" in result["comment"]
     assert rag.index_requests == []
     assert rag.requests == []
-    assert rag.semantic_requests == []
+    assert rag.code_search_requests == []
 
 
 @pytest.mark.asyncio
@@ -230,7 +230,7 @@ def _single_language_request(language: str) -> ReviewRequestDto:
 
 
 @pytest.mark.asyncio
-async def test_dry_run_captures_complete_baseline_without_provider_or_semantic_calls(
+async def test_dry_run_captures_complete_baseline_without_provider_calls(
     monkeypatch,
 ):
     def fail_provider_construction(*_args, **_kwargs):
@@ -252,7 +252,6 @@ async def test_dry_run_captures_complete_baseline_without_provider_or_semantic_c
     assert result["dryRun"] is True
     assert result["providerCalls"] == 0
     assert result["providerCallsScope"] == "review-llm-only"
-    assert result["embeddingProviderCallsMeasured"] is False
     assert result["providerConstructionGuard"] == {
         "enabled": True,
         "boundary": "LLMFactory.create_llm",
@@ -265,8 +264,6 @@ async def test_dry_run_captures_complete_baseline_without_provider_or_semantic_c
         "fullPipelineContext": False,
         "deterministicRagEnabled": True,
         "deterministicRagRequests": len(rag.requests),
-        "semanticRagEnabled": False,
-        "duplicationRagEnabled": False,
         "prIndexMutationEnabled": False,
         "mcpToolsEnabled": False,
     }
@@ -745,9 +742,6 @@ async def test_full_pipeline_capture_persists_real_context_artifact(
     assert summary["promptArtifact"][
         "providerCallsScope"
     ] == "review-llm-only"
-    assert summary["promptArtifact"][
-        "embeddingProviderCallsMeasured"
-    ] is False
     assert summary["promptArtifact"]["providerConstructionGuard"] == {
         "enabled": True,
         "boundary": "LLMFactory.create_llm",
@@ -755,7 +749,7 @@ async def test_full_pipeline_capture_persists_real_context_artifact(
     assert summary["promptArtifact"]["pipeline"]["completed"] is True
     assert report["providerCalls"] == 0
     assert report["simulation"]["fullPipelineContext"] is True
-    assert report["simulation"]["semanticRagEnabled"] is True
+    assert report["simulation"]["deterministicRagEnabled"] is True
     assert report["pipeline"]["completed"] is True
     assert report["pipeline"]["evidence"]["hunkCoverage"]["completed"] == 1
     assert report["pipeline"]["evidence"]["reviewUnits"] == {
@@ -925,7 +919,7 @@ async def test_review_snapshot_identity_fails_before_indexing_or_stage_zero(
 
     assert rag.index_requests == []
     assert rag.requests == []
-    assert rag.semantic_requests == []
+    assert rag.code_search_requests == []
     stage_0.assert_not_awaited()
 
 
@@ -938,7 +932,8 @@ def test_review_snapshot_allows_missing_optional_pr_identity():
     identity = validate_review_snapshot_identity(request)
 
     assert identity.source_branch is None
-    assert identity.base_revision is None
+    assert identity.target_head_revision is None
+    assert identity.merge_base_revision is None
 
 
 @pytest.mark.parametrize("revision", ["abc123", "HEAD", "release/10x"])
@@ -951,7 +946,20 @@ def test_review_snapshot_accepts_provider_native_git_revisions(revision):
     identity = validate_review_snapshot_identity(request)
 
     assert identity.head_revision == revision
-    assert identity.base_revision == revision
+    assert identity.target_head_revision == revision
+    assert identity.merge_base_revision == revision
+
+
+def test_review_snapshot_uses_target_head_instead_of_merge_base():
+    request = _request().model_copy(update={
+        "targetHeadCommitHash": "target-head",
+        "baseCommitHash": "merge-base",
+    })
+
+    identity = validate_review_snapshot_identity(request)
+
+    assert identity.target_head_revision == "target-head"
+    assert identity.merge_base_revision == "merge-base"
 
 
 @pytest.mark.asyncio
@@ -1012,11 +1020,8 @@ async def test_project_disabled_rag_clears_bindings_and_never_queries_client():
     rag.get_deterministic_context = AsyncMock(
         side_effect=AssertionError("disabled RAG must not retrieve")
     )
-    rag.get_pr_context = AsyncMock(
-        side_effect=AssertionError("disabled RAG must not retrieve")
-    )
-    rag.search_for_duplicates = AsyncMock(
-        side_effect=AssertionError("disabled RAG must not query duplicates")
+    rag.search_code = AsyncMock(
+        side_effect=AssertionError("disabled repository context must not search")
     )
     session = PromptCaptureSession(request=request)
     orchestrator = MultiStageReviewOrchestrator(
@@ -1027,15 +1032,13 @@ async def test_project_disabled_rag_clears_bindings_and_never_queries_client():
 
     result = await orchestrator.orchestrate_review(
         request,
-        rag_context={"relevant_code": ["DISABLED_GLOBAL_RAG_SENTINEL"]},
         processed_diff=DiffProcessor().process(request.rawDiff),
     )
 
     assert result["issues"] == []
     rag.index_pr_files.assert_not_awaited()
     rag.get_deterministic_context.assert_not_awaited()
-    rag.get_pr_context.assert_not_awaited()
-    rag.search_for_duplicates.assert_not_awaited()
+    rag.search_code.assert_not_awaited()
     assert all(
         getattr(request, field_name) is None
         for field_name in (
@@ -1058,7 +1061,10 @@ async def test_project_disabled_rag_clears_bindings_and_never_queries_client():
 @pytest.mark.asyncio
 async def test_pr_overlay_receives_one_exact_snapshot_identity():
     rag = DeterministicRagSpy()
-    request = _request()
+    request = _request().model_copy(update={
+        "targetHeadCommitHash": "target-head",
+        "baseCommitHash": "merge-base",
+    })
     orchestrator = MultiStageReviewOrchestrator(
         llm=object(),
         mcp_client=None,
@@ -1074,7 +1080,7 @@ async def test_pr_overlay_receives_one_exact_snapshot_identity():
     assert rag.index_requests[0]["branch"] == "main"
     assert rag.index_requests[0]["base_branch"] == "main"
     assert rag.index_requests[0]["source_revision"] == HEAD_REVISION
-    assert rag.index_requests[0]["base_revision"] == BASE_REVISION
+    assert rag.index_requests[0]["base_revision"] == "target-head"
 
 
 @pytest.mark.asyncio

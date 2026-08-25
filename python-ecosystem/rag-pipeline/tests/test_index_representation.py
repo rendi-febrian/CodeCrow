@@ -7,11 +7,12 @@ from rag_pipeline.core.index_representation import (
     INDEX_REPRESENTATION_PAYLOAD_KEY,
     _REPRESENTATION_DEPENDENCIES,
     _REPRESENTATION_SOURCE_PATHS,
-    branch_splitter_kwargs,
+    _runtime_representation_settings,
     compute_index_representation_fingerprint,
     observe_branch_representation,
     read_branch_index_representation,
 )
+from rag_pipeline.models.config import RAGConfig
 from rag_pipeline.core.pr_overlay_representation import (
     _PR_OVERLAY_DEPENDENCIES,
     _PR_OVERLAY_SOURCE_PATHS,
@@ -76,10 +77,22 @@ def test_fingerprint_is_deterministic_and_changes_with_source_or_dependency(
         root,
         dependency_versions=_dependencies(),
         runtime_settings={
-            "embedding_model": "other-model",
-            "embedding_dimension": 4096,
+            "excluded_patterns": ["vendor/**"],
         },
     )
+
+
+def test_runtime_representation_records_the_file_size_ceiling():
+    smaller = _runtime_representation_settings(
+        RAGConfig(max_file_size_bytes=256 * 1024)
+    )
+    larger = _runtime_representation_settings(
+        RAGConfig(max_file_size_bytes=512 * 1024)
+    )
+
+    assert smaller["max_file_size_bytes"] == 256 * 1024
+    assert larger["max_file_size_bytes"] == 512 * 1024
+    assert smaller != larger
 
 
 def test_pr_only_source_changes_do_not_invalidate_branch_representation(
@@ -139,18 +152,6 @@ def test_manager_wiring_is_pr_overlay_only_and_source_sets_are_disjoint(tmp_path
     )
 
 
-def test_branch_splitter_construction_is_part_of_runtime_identity():
-    config = SimpleNamespace(chunk_size=8000, chunk_overlap=200)
-
-    assert branch_splitter_kwargs(config) == {
-        "max_chunk_size": 8000,
-        "min_chunk_size": 200,
-        "chunk_overlap": 200,
-        "parser_threshold": 10,
-        "enrich_embedding_text": True,
-    }
-
-
 def test_branch_change_invalidates_both_branch_and_overlay_identity(tmp_path):
     root = _projection_root(tmp_path)
     branch_fingerprint = compute_index_representation_fingerprint(
@@ -177,7 +178,7 @@ def test_branch_change_invalidates_both_branch_and_overlay_identity(tmp_path):
     )
 
 
-def test_branch_identity_distinguishes_absent_legacy_and_current_points():
+def test_branch_identity_distinguishes_absent_unproven_and_current_points():
     client = SimpleNamespace()
     client.scroll = lambda **_kwargs: ([], None)
     assert read_branch_index_representation(
@@ -187,7 +188,7 @@ def test_branch_identity_distinguishes_absent_legacy_and_current_points():
     ) == (False, None)
 
     client.scroll = lambda **_kwargs: (
-        [SimpleNamespace(payload={"path": "legacy.php"})],
+        [SimpleNamespace(payload={"path": "unproven.php"})],
         None,
     )
     assert read_branch_index_representation(
@@ -229,7 +230,7 @@ def test_branch_identity_distinguishes_absent_legacy_and_current_points():
     ) is True
 
 
-def test_branch_identity_pages_past_pr_points_and_accepts_missing_pr_as_legacy():
+def test_branch_identity_pages_past_pr_points_and_accepts_missing_provenance():
     calls = []
 
     def scroll(**kwargs):
@@ -240,7 +241,7 @@ def test_branch_identity_pages_past_pr_points_and_accepts_missing_pr_as_legacy()
                 "next",
             )
         return (
-            [SimpleNamespace(payload={"path": "legacy.php"})],
+            [SimpleNamespace(payload={"path": "unproven.php"})],
             None,
         )
 

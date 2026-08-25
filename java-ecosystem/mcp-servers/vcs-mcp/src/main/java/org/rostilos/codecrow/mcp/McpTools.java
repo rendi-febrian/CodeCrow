@@ -10,6 +10,7 @@ import org.rostilos.codecrow.mcp.bitbucket.cloud.model.BitbucketBranchingModel;
 import org.rostilos.codecrow.mcp.bitbucket.cloud.model.BitbucketBranchingModelSettings;
 import org.rostilos.codecrow.mcp.bitbucket.cloud.model.BitbucketProjectBranchingModel;
 import org.rostilos.codecrow.mcp.filter.LargeContentFilter;
+import org.rostilos.codecrow.mcp.generic.LocalRepoClient;
 import org.rostilos.codecrow.mcp.generic.VcsMcpClient;
 import org.rostilos.codecrow.mcp.generic.VcsMcpClientFactory;
 import org.slf4j.Logger;
@@ -17,8 +18,15 @@ import org.slf4j.LoggerFactory;
 
 public class McpTools {
     private static final int MAX_SOURCE_WINDOW_LINES = 401;
+    static final String LOCAL_REPO_PATH_PROPERTY = "local.repo.path";
+    static final String LOCAL_REPO_TARGET_BRANCH_PROPERTY = "local.repo.targetBranch";
+    static final String LOCAL_REPO_REVISION_PROPERTY = "local.repo.revision";
+    static final String WORKSPACE_PROPERTY = "workspace";
+    static final String REPO_SLUG_PROPERTY = "repo.slug";
     private final VcsMcpClientFactory vcsMcpClientFactory;
     private VcsMcpClient vcsClient = null;
+    private VcsMcpClient localVcsClient = null;
+    private boolean localVcsClientResolved;
     private final LargeContentFilter largeContentFilter;
     private static final Logger LOGGER = LoggerFactory.getLogger(McpTools.class);
 
@@ -178,6 +186,13 @@ public class McpTools {
                         (String) arguments.get("projectKey"),
                         (String) arguments.get("branch")
                 );
+            case "getDirectoryByPath":
+                return getDirectoryByPath(
+                        (String) arguments.get("workspace"),
+                        (String) arguments.get("projectKey"),
+                        (String) arguments.get("branch"),
+                        (String) arguments.get("dirPath")
+                );
             default:
                 throw new IllegalArgumentException("Unknown tool: " + toolName);
         }
@@ -191,7 +206,52 @@ public class McpTools {
     }
 
     private VcsMcpClient getVcsClient(boolean callerToolLocalModeSupported) throws IOException {
-        return getVcsClient();
+        VcsMcpClient remoteClient = getVcsClient();
+        if (!callerToolLocalModeSupported) {
+            return remoteClient;
+        }
+        if (!localVcsClientResolved) {
+            localVcsClientResolved = true;
+            String localRepoPath = System.getProperty(LOCAL_REPO_PATH_PROPERTY);
+            String targetBranch = System.getProperty(LOCAL_REPO_TARGET_BRANCH_PROPERTY);
+            String targetRevision = System.getProperty(LOCAL_REPO_REVISION_PROPERTY);
+            if (localRepoPath != null
+                    && !localRepoPath.isBlank()
+                    && ((targetBranch != null && !targetBranch.isBlank())
+                    || (targetRevision != null && !targetRevision.isBlank()))) {
+                try {
+                    localVcsClient = new LocalRepoClient(
+                            remoteClient,
+                            localRepoPath,
+                            System.getProperty(WORKSPACE_PROPERTY),
+                            System.getProperty(REPO_SLUG_PROPERTY),
+                            targetBranch,
+                            targetRevision);
+                    LOGGER.info(
+                            "Local repository MCP reads enabled for target branch={} revision={} path={}",
+                            targetBranch,
+                            targetRevision,
+                            localRepoPath);
+                } catch (IOException | RuntimeException localRepositoryFailure) {
+                    LOGGER.warn(
+                            "Local repository MCP reads unavailable; using provider-backed VCS tools: {}",
+                            localRepositoryFailure.getMessage());
+                }
+            }
+        }
+        return localVcsClient != null ? localVcsClient : remoteClient;
+    }
+
+    private void requireRequestRepository(String workspace, String repoSlug) throws IOException {
+        String expectedWorkspace = System.getProperty(WORKSPACE_PROPERTY);
+        String expectedRepoSlug = System.getProperty(REPO_SLUG_PROPERTY);
+        if ((expectedWorkspace != null && !expectedWorkspace.isBlank()
+                && !expectedWorkspace.equals(workspace))
+                || (expectedRepoSlug != null && !expectedRepoSlug.isBlank()
+                && !expectedRepoSlug.equals(repoSlug))) {
+            throw new IOException(
+                    "Repository arguments do not match the request-bound repository");
+        }
     }
 
     public Map<String, Object> listRepositories(String workspace, Integer limit) {
@@ -335,6 +395,7 @@ public class McpTools {
             Integer endLine
     ) {
         try {
+            requireRequestRepository(workspace, repoSlug);
             String fileContent = getVcsClient(true).getBranchFileContent(workspace, repoSlug, branch, filePath);
             if (startLine != null && startLine > 0) {
                 return sourceWindow(fileContent, startLine, endLine);
@@ -416,7 +477,8 @@ public class McpTools {
 
     public Map<String,Object> getRootDirectory(String workspace, String projectKey, String branch) {
         try {
-            String rootDirectory = getVcsClient().getRootDirectory(workspace, projectKey, branch);
+            requireRequestRepository(workspace, projectKey);
+            String rootDirectory = getVcsClient(true).getRootDirectory(workspace, projectKey, branch);
             return Map.of("rootDirectory", rootDirectory);
         } catch (IOException e) {
             return Map.of("error", "Failed to get branch root repository tree: " + e.getMessage());
@@ -425,7 +487,9 @@ public class McpTools {
 
     public Map<String,Object> getDirectoryByPath(String workspace, String projectKey, String branch, String dirPath) {
         try {
-            String directoryContent = getVcsClient().getDirectoryByPath(workspace, projectKey, branch, dirPath);
+            requireRequestRepository(workspace, projectKey);
+            String directoryContent = getVcsClient(true).getDirectoryByPath(
+                    workspace, projectKey, branch, dirPath);
             return Map.of("directoryContent", directoryContent);
         } catch (IOException e) {
             return Map.of("error", "Failed to get branch directory content: " + e.getMessage());

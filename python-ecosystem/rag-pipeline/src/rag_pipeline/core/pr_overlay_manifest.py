@@ -8,15 +8,16 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from llama_index.core.schema import TextNode
 from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+from .documents import TextNode
 
 from .generation_manifest import (
     GenerationManifestError,
     compute_generation_members_digest,
-    verified_generation_member,
+    verify_generation_member_page,
 )
-from .repository_overlay import IncrementalIndexPreconditionError
+from .exact_index import ExactIndexPreconditionError
 
 
 PR_OVERLAY_MANIFEST_PAYLOAD_KEY = "pr_overlay_generation_manifest"
@@ -238,7 +239,7 @@ def read_pr_overlay_generation(
             limit=256,
             offset=offset,
             with_payload=True,
-            with_vectors=True,
+            with_vectors=False,
         )
         points.extend(batch)
         if offset is None:
@@ -252,7 +253,7 @@ def read_pr_overlay_generation(
         if (point.payload or {}).get(PR_OVERLAY_MANIFEST_PAYLOAD_KEY) is True
     ]
     if len(manifest_points) != 1:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "PR overlay generation manifest is missing or not unique"
         )
     manifest = manifest_points[0].payload or {}
@@ -281,7 +282,7 @@ def read_pr_overlay_generation(
         manifest.get(field) != expected
         for field, expected in expected_identity.items()
     ):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "PR overlay generation manifest identity does not match the request"
         )
     manifest_sha256 = manifest.get(
@@ -303,11 +304,11 @@ def read_pr_overlay_generation(
             and manifest_sha256 != expected_manifest_sha256
         )
     ):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "PR overlay generation manifest is invalid"
         )
     if len(members) != member_count:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "PR overlay generation membership is incomplete"
         )
     for point in members:
@@ -317,26 +318,24 @@ def read_pr_overlay_generation(
             for field, expected in expected_identity.items()
             if field not in {"pr_overlay_base_branch"}
         ):
-            raise IncrementalIndexPreconditionError(
+            raise ExactIndexPreconditionError(
                 "PR overlay contains a member outside the sealed generation"
             )
         if payload.get(PR_OVERLAY_MANIFEST_PAYLOAD_KEY) is True:
-            raise IncrementalIndexPreconditionError(
+            raise ExactIndexPreconditionError(
                 "PR overlay manifest was included as an ordinary member"
             )
     try:
-        observed_members = [
-            verified_generation_member(point) for point in members
-        ]
+        observed_members = verify_generation_member_page(members)
         observed_members_sha256 = compute_generation_members_digest(
             observed_members
         )
     except GenerationManifestError as exception:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "PR overlay generation member integrity failed"
         ) from exception
     if observed_members_sha256 != members_sha256:
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "PR overlay generation membership digest does not match its seal"
         )
     expected_content = pr_overlay_manifest_content(
@@ -360,7 +359,7 @@ def read_pr_overlay_generation(
     if hashlib.sha256(expected_content.encode("utf-8")).hexdigest() != (
         manifest_sha256
     ):
-        raise IncrementalIndexPreconditionError(
+        raise ExactIndexPreconditionError(
             "PR overlay generation manifest content failed integrity validation"
         )
     return {

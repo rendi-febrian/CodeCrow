@@ -21,7 +21,7 @@ BASE_INDEX_REPRESENTATION_FINGERPRINT = "sha256:" + "9" * 64
 class DeterministicRagSpy:
     def __init__(self):
         self.requests: list[dict] = []
-        self.semantic_requests: list[dict] = []
+        self.code_search_requests: list[dict] = []
         self.index_requests: list[dict] = []
         self.delete_requests: list[dict] = []
 
@@ -33,6 +33,7 @@ class DeterministicRagSpy:
                     "path": "src/shared.py",
                     "content": "SHARED_CONTEXT_SENTINEL = True",
                     "relationship": "imports",
+                    "_match_type": "architecture_relation",
                 }],
                 "changed_files": {},
                 "related_definitions": {},
@@ -40,12 +41,9 @@ class DeterministicRagSpy:
             }
         }
 
-    async def get_pr_context(self, **kwargs):
-        self.semantic_requests.append(kwargs)
-        return {"context": {"relevant_code": []}}
-
-    async def search_for_duplicates(self, **_kwargs):
-        return []
+    async def search_code(self, **kwargs):
+        self.code_search_requests.append(kwargs)
+        return {"results": []}
 
     async def index_pr_files(self, **kwargs):
         self.index_requests.append(kwargs)

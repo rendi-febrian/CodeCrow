@@ -10,9 +10,11 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.rostilos.codecrow.analysisengine.aiclient.AiAnalysisClient;
 import org.rostilos.codecrow.analysisengine.dto.request.ai.AiAnalysisRequest;
+import org.rostilos.codecrow.analysisengine.dto.request.ai.LocalRepositorySnapshot;
 import org.rostilos.codecrow.analysisengine.dto.request.processor.PrProcessRequest;
 import org.rostilos.codecrow.analysisengine.exception.AnalysisLockedException;
 import org.rostilos.codecrow.analysisengine.service.AnalysisLockService;
+import org.rostilos.codecrow.analysisengine.service.LocalRepositorySnapshotService;
 import org.rostilos.codecrow.analysisengine.service.PullRequestService;
 import org.rostilos.codecrow.commitgraph.service.AnalyzedCommitService;
 import org.rostilos.codecrow.vcsclient.VcsClientProvider;
@@ -77,6 +79,9 @@ class PullRequestAnalysisProcessorTest {
         private VcsClientProvider vcsClientProvider;
 
         @Mock
+        private LocalRepositorySnapshotService localRepositorySnapshotService;
+
+        @Mock
         private FileSnapshotService fileSnapshotService;
 
         @Mock
@@ -135,6 +140,7 @@ class PullRequestAnalysisProcessorTest {
                                 analysisLockService,
                                 analyzedCommitService,
                                 vcsClientProvider,
+                                localRepositorySnapshotService,
                                 fileSnapshotService,
                                 prIssueTrackingService,
                                 astScopeEnricher,
@@ -593,6 +599,51 @@ class PullRequestAnalysisProcessorTest {
                         when(aiAnalysisRequest.getRawDiff()).thenReturn("diff");
                         when(aiAnalysisRequest.getChangedFiles()).thenReturn(List.of("file.java"));
                         when(aiAnalysisClient.performAnalysis(any(), any())).thenReturn(aiResponse);
+                }
+
+                @Test
+                @DisplayName("should close a prepared local MCP snapshot when inference fails")
+                void shouldClosePreparedLocalMcpSnapshotWhenInferenceFails() throws Exception {
+                        PrProcessRequest request = createRequest();
+                        PullRequestAnalysisProcessor.EventConsumer consumer = mock(
+                                        PullRequestAnalysisProcessor.EventConsumer.class);
+                        stubReviewThroughAi(Map.of("comment", "unused", "issues", List.of()));
+                        reset(aiAnalysisClient);
+                        VcsRepoInfo repoInfo = project.getEffectiveVcsRepoInfo();
+                        when(repoInfo.getRepoWorkspace()).thenReturn("team");
+                        when(repoInfo.getRepoSlug()).thenReturn("repo");
+                        when(aiAnalysisRequest.getUseMcpTools()).thenReturn(true);
+                        when(aiAnalysisRequest.getTargetHeadCommitHash())
+                                        .thenReturn("target-head-sha");
+                        var prepared = mock(LocalRepositorySnapshotService.PreparedSnapshot.class);
+                        LocalRepositorySnapshot transport = new LocalRepositorySnapshot(
+                                        "/tmp/codecrow-pr-review-test",
+                                        "main",
+                                        "target-head-sha");
+                        when(prepared.transport()).thenReturn(transport);
+                        when(localRepositorySnapshotService.prepare(
+                                        vcsConnection,
+                                        "team",
+                                        "repo",
+                                        "main",
+                                        "target-head-sha"))
+                                        .thenReturn(Optional.of(prepared));
+                        when(aiAnalysisClient.performAnalysis(
+                                        eq(aiAnalysisRequest),
+                                        eq(transport),
+                                        any()))
+                                        .thenThrow(new IOException("inference unavailable"));
+
+                        Map<String, Object> result = processor.process(request, consumer, project);
+
+                        assertThat(result)
+                                        .containsEntry("status", "error")
+                                        .containsEntry("message", "inference unavailable");
+                        verify(prepared).close();
+                        verify(aiAnalysisClient).performAnalysis(
+                                        eq(aiAnalysisRequest),
+                                        eq(transport),
+                                        any());
                 }
 
                 private String stubCacheLookupPrerequisites() throws Exception {
@@ -1248,6 +1299,7 @@ class PullRequestAnalysisProcessorTest {
                                         analysisLockService,
                                         analyzedCommitService,
                                         vcsClientProvider,
+                                        localRepositorySnapshotService,
                                         fileSnapshotService,
                                         prIssueTrackingService,
                                         null, // astScopeEnricher

@@ -8,7 +8,7 @@ These models are used for the multi-stage PR review process:
 """
 
 from typing import Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from model.output_schemas import CodeReviewIssue
 
@@ -23,6 +23,18 @@ class FileReviewOutput(BaseModel):
     )
     confidence: str = Field(description="Confidence level (HIGH/MEDIUM/LOW)")
     note: str = Field(default="", description="Optional analysis note")
+
+    @field_validator("issues", mode="before")
+    @classmethod
+    def normalize_null_issues(cls, value):
+        """Treat an explicit JSON null like the field's existing empty default."""
+        return [] if value is None else value
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def normalize_null_note(cls, value):
+        """Keep the internal note contract string-only for tolerant LLM input."""
+        return "" if value is None else value
 
 
 class FileReviewBatchOutput(BaseModel):
@@ -107,6 +119,30 @@ class CrossFileIssue(BaseModel):
     )
     business_impact: str = Field(description="Concrete behavior or operation that is currently broken")
     suggestion: str = Field(description="Code change still required; never work already present in the diff")
+
+    @field_validator("primary_file", "claimKind", mode="before")
+    @classmethod
+    def normalize_null_empty_strings(cls, value):
+        """Apply the existing empty-string defaults to explicit JSON nulls."""
+        return "" if value is None else value
+
+    @field_validator("evidenceRefs", "coverageEvidenceRefs", mode="before")
+    @classmethod
+    def normalize_null_empty_lists(cls, value):
+        """Apply the existing empty-list defaults to explicit JSON nulls."""
+        return [] if value is None else value
+
+    @field_validator("findingScope", mode="before")
+    @classmethod
+    def normalize_null_finding_scope(cls, value):
+        """Apply the existing concrete-defect default to explicit JSON null."""
+        return "CONCRETE_DEFECT" if value is None else value
+
+    @field_validator("coverageRegression", mode="before")
+    @classmethod
+    def normalize_null_coverage_regression(cls, value):
+        """Apply the existing non-regression default to explicit JSON null."""
+        return False if value is None else value
 
 
 class CrossFileAnalysisResult(BaseModel):

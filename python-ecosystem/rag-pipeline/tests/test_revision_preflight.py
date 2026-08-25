@@ -8,12 +8,12 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     PointStruct,
-    PointVectors,
     VectorParams,
 )
 
 from rag_pipeline.core.generation_manifest import (
     GENERATION_MANIFEST_PATH,
+    GENERATION_MEMBER_DIGEST_PAYLOAD_KEY,
     GENERATION_SCHEMA,
     GenerationManifestError,
     build_generation_manifest_node,
@@ -29,7 +29,7 @@ from rag_pipeline.core.index_representation import (
 )
 from rag_pipeline.core.index_manager.manager import RAGIndexManager
 from rag_pipeline.core.index_manager.point_operations import PointOperations
-from rag_pipeline.core.repository_overlay import IncrementalIndexPreconditionError
+from rag_pipeline.core.exact_index import ExactIndexPreconditionError
 from rag_pipeline.core.revision_preflight import (
     read_repository_generation_manifest_receipt,
     read_repository_revision_preflight,
@@ -78,12 +78,12 @@ def _client_with_points(*payloads):
     client = QdrantClient(":memory:")
     client.create_collection(
         collection_name="repository",
-        vectors_config=VectorParams(size=2, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=1, distance=Distance.DOT),
     )
     client.upsert(
         collection_name="repository",
         points=[
-            PointStruct(id=index + 1, vector=[0.0, 0.0], payload=payload)
+            PointStruct(id=index + 1, vector=[1.0], payload=payload)
             for index, payload in enumerate(payloads)
         ],
     )
@@ -118,7 +118,6 @@ def _sealed_payloads(*payloads):
             compute_generation_member_digest(
                 point_id,
                 sealed_payload,
-                [0.0, 0.0],
             )
         )
         member_payloads.append(sealed_payload)
@@ -154,7 +153,6 @@ def _sealed_payloads(*payloads):
         compute_generation_member_digest(
             len(member_payloads) + 1,
             manifest_payload,
-            [0.0, 0.0],
         )
     )
     return (*member_payloads, manifest_payload)
@@ -209,7 +207,7 @@ def test_exact_revision_preflight_returns_verified_state_identity():
     ) is None
 
 
-def test_alias_receipt_reads_only_deterministic_manifest_point():
+def test_target_receipt_reads_only_deterministic_manifest_point():
     manifest = _complete_revision_payloads()[-1]
     client = MagicMock()
     client.retrieve.return_value = [SimpleNamespace(payload=manifest)]
@@ -249,7 +247,7 @@ def test_manifest_receipt_id_matches_point_storage_contract():
     )
 
 
-def test_alias_receipt_rejects_registry_digest_mismatch():
+def test_target_receipt_rejects_registry_digest_mismatch():
     manifest = _complete_revision_payloads()[-1]
     client = MagicMock()
     client.retrieve.return_value = [SimpleNamespace(payload=manifest)]
@@ -263,26 +261,6 @@ def test_alias_receipt_rejects_registry_digest_mismatch():
         COMMIT,
         "f" * 64,
     ) is None
-
-
-def test_alias_receipt_accepts_legacy_caller_without_registry_digest():
-    manifest = _complete_revision_payloads()[-1]
-    client = MagicMock()
-    client.retrieve.return_value = [SimpleNamespace(payload=manifest)]
-
-    receipt = read_repository_generation_manifest_receipt(
-        client,
-        "physical-generation",
-        "workspace",
-        "project",
-        "main",
-        COMMIT,
-    )
-
-    assert receipt["generation_manifest_sha256"] == manifest[
-        "generation_manifest_sha256"
-    ]
-    client.scroll.assert_not_called()
 
 
 def test_exact_revision_preflight_rejects_incomplete_repository_state():
@@ -300,7 +278,7 @@ def test_exact_revision_preflight_rejects_incomplete_repository_state():
     ))
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="incomplete",
     ):
         read_repository_revision_preflight(
@@ -320,7 +298,7 @@ def test_exact_revision_preflight_rejects_mixed_plugin_identity():
     client = _client_with_points(*state_payloads)
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="inconsistent repository build identity",
     ):
         read_repository_revision_preflight(
@@ -339,7 +317,7 @@ def test_exact_revision_preflight_rejects_deleted_ordinary_point():
     )
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="generation is incomplete",
     ):
         read_repository_revision_preflight(
@@ -359,7 +337,7 @@ def test_exact_revision_preflight_rejects_tampered_source_tree_receipt():
     client = _client_with_points(*payloads)
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="manifest failed integrity",
     ):
         read_repository_revision_preflight(
@@ -379,7 +357,7 @@ def test_exact_revision_preflight_rejects_tampered_selection_policy():
     client = _client_with_points(*payloads)
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="selection policy failed integrity",
     ):
         read_repository_revision_preflight(
@@ -395,12 +373,11 @@ def test_exact_revision_preflight_rejects_extra_ordinary_point():
     payload["generation_member_sha256"] = compute_generation_member_digest(
         4,
         payload,
-        [0.0, 0.0],
     )
     client = _client_with_points(*_complete_revision_payloads(), payload)
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="generation is incomplete",
     ):
         read_repository_revision_preflight(
@@ -420,7 +397,7 @@ def test_exact_revision_preflight_rejects_substituted_member_identity():
     client = _client_with_points(*payloads)
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="member content failed integrity",
     ):
         read_repository_revision_preflight(
@@ -440,28 +417,7 @@ def test_exact_revision_preflight_rejects_payload_substitution_with_stale_digest
     )
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
-        match="member content failed integrity",
-    ):
-        read_repository_revision_preflight(
-            client,
-            "repository",
-            "main",
-            COMMIT,
-        )
-
-
-def test_exact_revision_preflight_rejects_vector_substitution_with_stale_digest():
-    client = _client_with_points(*_complete_revision_payloads())
-    client.update_vectors(
-        collection_name="repository",
-        points=[
-            PointVectors(id=1, vector=[1.0, 1.0]),
-        ],
-    )
-
-    with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="member content failed integrity",
     ):
         read_repository_revision_preflight(
@@ -489,39 +445,28 @@ def test_pending_generation_seal_rejects_payload_substitution_with_stale_digest(
         )
 
 
-def test_pending_generation_seal_rejects_vector_substitution_with_stale_digest():
-    client = _client_with_points(*_complete_revision_payloads()[:-1])
-    client.update_vectors(
-        collection_name="repository",
-        points=[
-            PointVectors(id=1, vector=[1.0, 1.0]),
-        ],
-    )
-
-    with pytest.raises(GenerationManifestError, match="content digest"):
-        collect_generation_members(
-            client,
-            "repository",
-            "main",
-            COMMIT,
-        )
-
-
-def test_pending_generation_seal_binds_digest_to_qdrant_normalized_vector():
+def test_generation_seal_uses_precomputed_payload_digest_without_rewrites():
     payload = _identity_payload(path="Example.php", text="<?php")
-    # This is how the full indexer initially constructs a point: before Qdrant
-    # applies COSINE normalization.  The persisted vector therefore differs.
-    payload["generation_member_sha256"] = compute_generation_member_digest(
-        1, payload, [3.0, 4.0]
+    payload[GENERATION_MEMBER_DIGEST_PAYLOAD_KEY] = (
+        compute_generation_member_digest(1, payload)
     )
-    client = _client_with_points(payload)
-    client.update_vectors(
-        collection_name="repository",
-        points=[PointVectors(id=1, vector=[3.0, 4.0])],
+    point = SimpleNamespace(id=1, payload=payload)
+    client = MagicMock()
+    client.scroll.return_value = ([point], None)
+    progress = []
+
+    members = seal_generation_members(
+        client,
+        "repository",
+        "main",
+        COMMIT,
+        progress_callback=progress.append,
     )
 
-    assert seal_generation_members(client, "repository", "main", COMMIT) == 1
-    assert len(collect_generation_members(client, "repository", "main", COMMIT)) == 1
+    assert members == [(1, payload[GENERATION_MEMBER_DIGEST_PAYLOAD_KEY])]
+    assert progress == [1]
+    client.retrieve.assert_not_called()
+    client.upsert.assert_not_called()
 
 
 def test_exact_revision_preflight_rejects_mixed_branch_revisions():
@@ -536,7 +481,7 @@ def test_exact_revision_preflight_rejects_mixed_branch_revisions():
     )
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="mixed repository revisions",
     ):
         read_repository_revision_preflight(
@@ -547,13 +492,13 @@ def test_exact_revision_preflight_rejects_mixed_branch_revisions():
         )
 
 
-def test_exact_revision_preflight_rejects_legacy_unsealed_revision():
+def test_exact_revision_preflight_rejects_unsealed_revision():
     client = _client_with_points(
         _identity_payload(path="Example.php", text="<?php"),
     )
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="generation manifest is missing",
     ):
         read_repository_revision_preflight(
@@ -566,22 +511,25 @@ def test_exact_revision_preflight_rejects_legacy_unsealed_revision():
 
 def test_exact_revision_preflight_verifies_members_while_scrolling_pages():
     payload = _identity_payload(path="Example.php", text="<?php")
-    point = SimpleNamespace(id=1, payload=payload, vector=[0.0, 0.0])
+    point = SimpleNamespace(id=1, payload=payload, vector=None)
     client = MagicMock()
     verified = []
 
     def scroll(**kwargs):
-        if kwargs.get("with_vectors") is True and kwargs.get("offset") is None:
+        if kwargs.get("with_vectors") is False and kwargs.get("offset") is None:
             return [point], "next-page"
-        if kwargs.get("with_vectors") is True:
+        if kwargs.get("with_vectors") is False:
             assert verified == [1]
             raise RuntimeError("stop after proving streamed verification")
         raise AssertionError("unexpected scan before the revision pages finish")
 
     client.scroll.side_effect = scroll
     with patch(
-        "rag_pipeline.core.revision_preflight.verified_generation_member",
-        side_effect=lambda observed: verified.append(observed.id) or (observed.id, "d" * 64),
+        "rag_pipeline.core.revision_preflight.verify_generation_member_page",
+        side_effect=lambda observed: (
+            verified.extend(point.id for point in observed)
+            or [(point.id, "d" * 64) for point in observed]
+        ),
     ):
         with pytest.raises(
             RuntimeError,
@@ -643,6 +591,7 @@ def test_index_manager_publishes_coordinates_after_build_compatibility_check(
         "project",
         "main",
         COMMIT,
+        collection_target="generation-target",
     )
     result["plugin_ids"].append("caller-mutation")
     cached_result = manager.get_revision_preflight(
@@ -650,11 +599,15 @@ def test_index_manager_publishes_coordinates_after_build_compatibility_check(
         "project",
         "main",
         COMMIT,
+        collection_target="generation-target",
     )
 
     assert result["workspace"] == "workspace"
     assert result["project"] == "project"
     assert result["point_count"] == 2
+    assert result["current_index_representation_fingerprint"] == (
+        "sha256:representation"
+    )
     assert cached_result["plugin_ids"] == ["php", "magento"]
     mock_read.assert_called_once_with(
         manager.qdrant_client,
@@ -684,7 +637,7 @@ def test_index_manager_rejects_generation_from_different_project(mock_read):
     }
 
     with pytest.raises(
-        IncrementalIndexPreconditionError,
+        ExactIndexPreconditionError,
         match="coordinates",
     ):
         manager.get_revision_preflight(
@@ -692,6 +645,7 @@ def test_index_manager_rejects_generation_from_different_project(mock_read):
             "project",
             "main",
             COMMIT,
+            collection_target="generation-target",
         )
 
 
@@ -720,66 +674,8 @@ def test_index_manager_retains_stale_representation_as_provenance(mock_read):
         "project",
         "main",
         COMMIT,
+        collection_target="generation-target",
     )
 
     assert result["index_representation_fingerprint"] == "sha256:stale"
-
-
-@patch(
-    "rag_pipeline.core.index_manager.manager."
-    "read_repository_generation_manifest_receipt"
-)
-@patch(
-    "rag_pipeline.core.index_manager.manager."
-    "read_repository_revision_preflight"
-)
-def test_alias_publication_uses_bounded_registry_receipt(
-    mock_full_preflight,
-    mock_manifest_receipt,
-):
-    manager = object.__new__(RAGIndexManager)
-    manager.config = SimpleNamespace(qdrant_collection_prefix="code")
-    manager.qdrant_client = MagicMock()
-    manager._collection_manager = MagicMock()
-    manager._collection_manager.resolve_collection_target.return_value = (
-        "physical-generation"
-    )
-    manager._mutation_coordinator = MagicMock()
-    lease = SimpleNamespace(assert_owned=MagicMock())
-    manager._mutation_coordinator.acquire.return_value.__enter__.return_value = (
-        lease
-    )
-    mock_manifest_receipt.return_value = {
-        "workspace": "workspace",
-        "project": "project",
-        "branch": "main",
-        "commit": COMMIT,
-        "generation_manifest_sha256": "e" * 64,
-    }
-
-    aliases = manager.publish_generation_aliases(
-        "workspace",
-        "project",
-        "main",
-        COMMIT,
-        "generation-target",
-        "e" * 64,
-        publish_branch_alias=True,
-        publish_legacy_project_alias=False,
-    )
-
-    assert aliases == ["code_workspace__project__main"]
-    mock_manifest_receipt.assert_called_once_with(
-        manager.qdrant_client,
-        "physical-generation",
-        "workspace",
-        "project",
-        "main",
-        COMMIT,
-        "e" * 64,
-    )
-    mock_full_preflight.assert_not_called()
-    lease.assert_owned.assert_called_once()
-    manager._collection_manager.atomic_assign_aliases.assert_called_once_with({
-        "code_workspace__project__main": "physical-generation",
-    })
+    assert result["current_index_representation_fingerprint"] == "sha256:current"

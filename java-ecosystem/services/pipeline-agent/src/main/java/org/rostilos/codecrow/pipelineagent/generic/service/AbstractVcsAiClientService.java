@@ -105,7 +105,7 @@ public abstract class AbstractVcsAiClientService implements VcsAiClientService {
         String currentCommit = request.getCommitHash();
         PullRequestData pullRequest = pullRequestData(
                 null, null, request.sourceBranchName, request.targetBranchName,
-                null, currentCommit);
+                null, null, currentCommit);
         PreparedDiff preparedDiff = PreparedDiff.empty(previousCommit, currentCommit);
 
         log.info("Building pull request analysis: project={}, AI model={}, provider={}, connection={}",
@@ -121,6 +121,7 @@ public abstract class AbstractVcsAiClientService implements VcsAiClientService {
                         metadata.description(),
                         metadata.sourceBranch(),
                         metadata.targetBranch(),
+                        metadata.targetHeadCommit(),
                         metadata.baseCommit(),
                         metadata.headCommit());
             } catch (IOException metadataError) {
@@ -209,6 +210,7 @@ public abstract class AbstractVcsAiClientService implements VcsAiClientService {
                         ? preparedDiff.deltaDiff() : null)
                 .withPreviousCommitHash(previousCommit)
                 .withCurrentCommitHash(currentCommit)
+                .withTargetHeadCommitHash(pullRequest.targetHeadCommit())
                 .withBaseCommitHash(pullRequest.baseCommit())
                 .withEnrichmentData(enrichment)
                 .withProjectCapabilities(projectCapabilities);
@@ -508,6 +510,7 @@ public abstract class AbstractVcsAiClientService implements VcsAiClientService {
             String description,
             String sourceBranch,
             String targetBranch,
+            String targetHeadCommit,
             String baseCommit,
             String headCommit) {
         return new PullRequestData(
@@ -515,6 +518,7 @@ public abstract class AbstractVcsAiClientService implements VcsAiClientService {
                 description,
                 sourceBranch,
                 targetBranch,
+                targetHeadCommit,
                 baseCommit,
                 headCommit);
     }
@@ -537,6 +541,7 @@ public abstract class AbstractVcsAiClientService implements VcsAiClientService {
             String description,
             String sourceBranch,
             String targetBranch,
+            String targetHeadCommit,
             String baseCommit,
             String headCommit) {}
 
