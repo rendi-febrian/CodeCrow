@@ -20,6 +20,7 @@ from service.review.orchestrator.stage_1_file_review import (
     _diff_contains_complete_added_source,
     _find_diff_file_for_path,
     _split_hunk_by_lines,
+    _chunk_diff_with_ownership,
     _chunk_diff_preserving_hunks,
     _expand_oversized_diff_batches,
     _format_batch_metadata_json,
@@ -126,6 +127,39 @@ class TestChunkFiles:
 # ── Stage 1 prepared context ────────────────────────────────────
 
 class TestStage1PreparedContext:
+    def test_incremental_stage_1_reuses_validated_diff_snapshot(self):
+        raw_diff = """\
+diff --git a/src/current.py b/src/current.py
+--- a/src/current.py
++++ b/src/current.py
+@@ -1 +1 @@
+-old
++new
+"""
+        processed = DiffProcessor().process(raw_diff)
+        request = MagicMock(
+            rawDiff=raw_diff,
+            deltaDiff=raw_diff,
+            enrichmentData=None,
+            taskContext=None,
+        )
+
+        with patch.object(
+            DiffProcessor,
+            "process",
+            side_effect=AssertionError("Stage 1 must not reparse the delta"),
+        ):
+            prepared = _build_stage_1_prepared_context(
+                request,
+                processed,
+                is_incremental=True,
+            )
+
+        assert prepared.diff_source is processed
+        assert tuple(prepared.diff_source.hunk_manifest()) == tuple(
+            processed.hunk_manifest()
+        )
+
     def test_diff_lookup_uses_suffix_index(self):
         request = MagicMock(deltaDiff=None, taskContext=None, enrichmentData=None)
         processed = ProcessedDiff(files=[
@@ -510,6 +544,73 @@ diff --git a/src/after_limit.py b/src/after_limit.py
 
 
 class TestLargeDiffSegmentation:
+    def test_known_hunks_cannot_be_silently_attached_to_hunkless_content(self):
+        raw_diff = """\
+diff --git a/src/current.py b/src/current.py
+--- a/src/current.py
++++ b/src/current.py
+@@ -1 +1 @@
+-old
++new
+"""
+        diff_file = DiffProcessor().process(raw_diff).files[0]
+
+        with pytest.raises(RuntimeError, match="parsed 0, manifest has 1"):
+            _chunk_diff_with_ownership(
+                "[compacted planning summary]",
+                max_tokens=100,
+                known_hunks=tuple(diff_file.hunks),
+                path=diff_file.path,
+            )
+
+    def test_compacted_diff_without_raw_request_uses_lossless_hunk_manifest(self):
+        raw_diff = """\
+diff --git a/src/big.py b/src/big.py
+--- a/src/big.py
++++ b/src/big.py
+@@ -1 +1,3 @@
+-old
++first_changed_line()
++second_changed_line()
+"""
+        processed = DiffProcessor(max_file_size=80).process(raw_diff)
+        diff_file = processed.files[0]
+        assert "CodeCrow Summary" in diff_file.content
+        request = MagicMock(
+            rawDiff="",
+            deltaDiff=None,
+            enrichmentData=None,
+            taskContext=None,
+        )
+        prepared = _build_stage_1_prepared_context(
+            request,
+            processed,
+            is_incremental=False,
+        )
+        file_info = ReviewFile(
+            path=diff_file.path,
+            focus_areas=[],
+            risk_level="MEDIUM",
+        )
+
+        expanded = _expand_oversized_diff_batches(
+            [[{"file": file_info, "priority": "MEDIUM"}]],
+            prepared,
+            diff_chunk_token_budget=100,
+        )
+
+        items = [item for batch in expanded for item in batch]
+        assert {
+            hunk_id
+            for item in items
+            for hunk_id in item["_hunk_ids"]
+        } == {diff_file.hunks[0].id}
+        assert all("_diff_override" in item for item in items)
+        rendered = "\n".join(item["_diff_override"] for item in items)
+        assert "+first_changed_line()" in rendered
+        assert "+second_changed_line()" in rendered
+        assert "CodeCrow Summary" not in rendered
+
     def test_chunk_diff_preserves_file_header_and_hunk_headers(self):
         diff = """\
 diff --git a/src/big.py b/src/big.py
@@ -2376,6 +2477,70 @@ class TestCreateSmartBatchesWrapper:
 
 
 class TestStage1Scheduling:
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_hunk_ownership_fails_before_any_batch_model_call(self):
+        raw_diff = """\
+diff --git a/src/current.py b/src/current.py
+--- a/src/current.py
++++ b/src/current.py
+@@ -1 +1 @@
+-old
++new
+"""
+        processed = DiffProcessor().process(raw_diff)
+        file_info = ReviewFile(
+            path="src/current.py",
+            focus_areas=[],
+            risk_level="MEDIUM",
+        )
+        batches = [[{"file": file_info, "priority": "MEDIUM"}]]
+        unowned_batches = [[{
+            **batches[0][0],
+            "_review_unit_id": "sha256:unit-without-hunk",
+            "_hunk_ids": (),
+        }]]
+        request = MagicMock(
+            deltaDiff=None,
+            rawDiff=raw_diff,
+            taskContext=None,
+            enrichmentData=None,
+            changedFiles=[file_info.path],
+        )
+
+        async def fake_batches(**kwargs):
+            return batches
+
+        with patch(
+            "service.review.orchestrator.stage_1_file_review."
+            "create_smart_batches_wrapper",
+            side_effect=fake_batches,
+        ), patch(
+            "service.review.orchestrator.stage_1_file_review."
+            "_expand_oversized_diff_batches",
+            return_value=unowned_batches,
+        ), patch(
+            "service.review.orchestrator.stage_1_file_review.review_file_batch",
+            new_callable=AsyncMock,
+            return_value=[],
+        ) as review_batch:
+            with pytest.raises(
+                RuntimeError,
+                match="before model execution",
+            ):
+                await execute_stage_1_file_reviews(
+                    llm=MagicMock(),
+                    request=request,
+                    plan=ReviewPlan(
+                        analysis_summary="x",
+                        file_groups=[],
+                        cross_file_concerns=[],
+                    ),
+                    rag_client=None,
+                    processed_diff=processed,
+                )
+
+        review_batch.assert_not_awaited()
+
     @pytest.mark.asyncio(loop_scope="function")
     async def test_batches_run_with_bounded_concurrency(self):
         files = [ReviewFile(path=f"src/f{i}.py", focus_areas=[], risk_level="MEDIUM") for i in range(3)]

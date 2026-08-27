@@ -10,7 +10,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from model.dtos import ReviewRequestDto
 from model.output_schemas import CodeReviewIssue
@@ -45,10 +45,7 @@ from service.review.orchestrator.stage_helpers import (
     emit_progress,
     format_project_rules,
 )
-from service.review.plugin_context import (
-    apply_plugin_file_policy,
-    review_plugin_context,
-)
+from service.review.plugin_context import review_plugin_context
 from service.review.candidate_ledger import CandidateEvidenceLedger
 from service.review.prompt_diagnostics import record_prompt_diagnostic
 
@@ -217,6 +214,23 @@ class Stage1ReviewUnitState:
                 "Stage 1 review-unit coverage is incomplete: " + ", ".join(missing)
             )
 
+    def assert_hunk_ownership(self, expected_hunk_ids: Iterable[str]) -> None:
+        """Prove exact hunk ownership before any paid review-model call."""
+        expected = set(expected_hunk_ids)
+        owned = set(self.units_by_hunk)
+        missing = sorted(expected - owned)
+        if missing:
+            raise RuntimeError(
+                "Stage 1 review units omitted reviewable hunk identities before "
+                "model execution: " + ", ".join(missing)
+            )
+        unexpected = sorted(owned - expected)
+        if unexpected:
+            raise RuntimeError(
+                "Stage 1 review units reported unknown hunk identities before "
+                "model execution: " + ", ".join(unexpected)
+            )
+
     @property
     def reviewed_hunk_ids(self) -> tuple[str, ...]:
         return tuple(sorted(
@@ -297,12 +311,11 @@ def _build_stage_1_prepared_context(
     processed_diff: Optional[ProcessedDiff],
     is_incremental: bool,
 ) -> Stage1PreparedContext:
+    # ``processed_diff`` is the host-validated review snapshot and owns the
+    # hunk identities used by coverage, candidate provenance, and publication.
+    # Re-parsing an incremental delta here can apply a later plugin projection
+    # and silently create a different hunk disposition set for Stage 1.
     diff_source = processed_diff
-    if is_incremental and request.deltaDiff:
-        diff_source = apply_plugin_file_policy(
-            request,
-            DiffProcessor().process(request.deltaDiff),
-        )
 
     diff_by_path: Dict[str, Optional[Any]] = {}
     if diff_source:
@@ -1399,6 +1412,11 @@ def _chunk_diff_with_ownership(
 
     header = "".join(header_lines)
     body_budget = max(1, max_chars - len(header))
+    if known_hunks and len(known_hunks) != len(hunks):
+        raise RuntimeError(
+            f"Diff hunk manifest mismatch for {path or '<unknown>'}: "
+            f"parsed {len(hunks)}, manifest has {len(known_hunks)}"
+        )
     if not hunks:
         chunks: List[_DiffReviewChunk] = []
         current = ""
@@ -1411,12 +1429,6 @@ def _chunk_diff_with_ownership(
         if current:
             chunks.append(_DiffReviewChunk(current))
         return chunks or [_DiffReviewChunk(diff_content)]
-
-    if known_hunks and len(known_hunks) != len(hunks):
-        raise RuntimeError(
-            f"Diff hunk manifest mismatch for {path or '<unknown>'}: "
-            f"parsed {len(hunks)}, manifest has {len(known_hunks)}"
-        )
 
     hunk_ids: List[Optional[str]] = []
     for index, hunk in enumerate(hunks):
@@ -1491,6 +1503,26 @@ def _review_unit_id(path: str, chunk: _DiffReviewChunk) -> str:
     return "sha256:" + digest
 
 
+def _render_hunk_manifest_diff(diff_file: Any) -> str:
+    """Rebuild prompt evidence from the lossless manifest after compaction."""
+    path = normalize_repository_path(getattr(diff_file, "path", ""))
+    old_path = normalize_repository_path(
+        getattr(diff_file, "old_path", None) or path
+    )
+    old_marker = (
+        "/dev/null"
+        if getattr(diff_file, "change_type", None) is DiffChangeType.ADDED
+        else f"a/{old_path}"
+    )
+    parts = [
+        f"diff --git a/{old_path} b/{path}",
+        f"--- {old_marker}",
+        f"+++ b/{path}",
+    ]
+    parts.extend(hunk.content for hunk in diff_file.hunks)
+    return "\n".join(parts) + "\n"
+
+
 def _expand_oversized_diff_batches(
     batches: List[List[Dict[str, Any]]],
     prepared_context: Stage1PreparedContext,
@@ -1512,6 +1544,16 @@ def _expand_oversized_diff_batches(
                 use_full_diff=_item_requests_full_diff(item),
             )
             diff_content = diff_file.content if diff_file else ""
+            reconstructed_from_manifest = bool(
+                diff_file
+                and diff_file.hunks
+                and _diff_limit_reason_allows_full_review(diff_file.skip_reason)
+            )
+            if reconstructed_from_manifest:
+                # The raw request diff may be unavailable to a direct caller,
+                # but DiffProcessor retains every original hunk before replacing
+                # oversized file content with a compact planning summary.
+                diff_content = _render_hunk_manifest_diff(diff_file)
             chunks = _chunk_diff_with_ownership(
                 diff_content,
                 diff_chunk_token_budget,
@@ -1524,6 +1566,8 @@ def _expand_oversized_diff_batches(
                 review_item = dict(item)
                 review_item["_review_unit_id"] = _review_unit_id(file_path, chunk)
                 review_item["_hunk_ids"] = chunk.hunk_ids
+                if reconstructed_from_manifest:
+                    review_item["_diff_override"] = chunk.content
                 current_batch.append(review_item)
                 continue
 
@@ -2205,6 +2249,18 @@ async def execute_stage_1_file_reviews(
     )
     batches = _expand_oversized_diff_batches(batches, prepared_context)
     review_unit_state.register_batches(batches)
+    if prepared_context.diff_source is not None:
+        expected_hunk_ids = tuple(
+            hunk.id
+            for hunk in prepared_context.diff_source.hunk_manifest()
+            if hunk.disposition is HunkDisposition.REVIEWABLE
+        )
+        review_unit_state.assert_hunk_ownership(expected_hunk_ids)
+        logger.info(
+            "Stage 1 review-unit ownership preflight complete: %d reviewable "
+            "hunk(s) assigned before model execution",
+            len(expected_hunk_ids),
+        )
 
     total_review_units = sum(len(batch) for batch in batches)
     unique_file_paths = {
