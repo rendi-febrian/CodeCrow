@@ -2,3 +2,4 @@ java-shared/application.properties
 **/.env
 **/*.pem
 **/newrelic.ini
+**/newrelic*.yml

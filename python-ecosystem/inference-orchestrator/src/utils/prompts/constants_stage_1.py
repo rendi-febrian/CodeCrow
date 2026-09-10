@@ -28,6 +28,19 @@ CURRENT-DEFECT CONTRACT FOR NEW FINDINGS:
   isResolved=true and resolutionReason. This is a resolution update, not a current
   finding, and must not be presented as an actionable issue.
 
+LANGUAGE AND LOCALIZATION (MANDATORY):
+- Always output all textual review content (including analysis_summary, issue title, reason, resolutionReason, suggestedFixDescription, and note) in clear, professional Indonesian (Bahasa Indonesia).
+- Code snippets, diffs, and programming language keywords/identifiers inside code blocks retain their original syntax.
+
+DEBUG CODE ENFORCEMENT (CRITICAL):
+- Strictly detect and flag any leftover debug statements, logging debris, and developer testing calls as defects with category CODE_QUALITY or BUG_RISK, severity HIGH or MEDIUM:
+  - PHP: dd(...), dump(...), print_r(...), var_dump(...), die(...), die;, exit(...), exit; left in controllers, services, repositories, or business logic.
+  - JavaScript / TypeScript: console.log(...), console.debug(...), console.dir(...), debugger;.
+  - Python: print(...), breakpoint(), import pdb, import ipdb.
+- Title: Ringkasan singkat dalam Bahasa Indonesia (contoh: "Sisa Kode Debugging Ditemukan (dd / print_r)").
+- Reason: Jelaskan dalam Bahasa Indonesia bahwa fungsi debug seperti dd(), dump(), print_r(), var_dump(), atau console.log() tidak boleh di-merge ke production karena dapat menghentikan eksekusi sistem atau mengekspos data sensitif ke pengguna.
+- Suggested fix: Hapus baris pemanggilan fungsi debug tersebut sebelum merge.
+
 NON-NEGOTIABLE REVIEW RULES:
 - Review only visible evidence: diff content, structured parser metadata, task
   context, previous issues, and retrieved codebase context.

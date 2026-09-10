@@ -48,7 +48,7 @@ services:
     image: redis:7-alpine
     container_name: codecrow-redis
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:6389:6379"
     volumes:
       - redis_data:/data
     networks:
@@ -87,14 +87,14 @@ services:
       SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-codecrow_user}
       SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
 
-      SPRING_JPA_HIBERNATE_DDL_AUTO: validate
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
       SPRING_JPA_SHOW_SQL: "false"
       SPRING_JPA_PROPERTIES_HIBERNATE_FORMAT_SQL: "false"
       SPRING_JPA_DATABASE_PLATFORM: org.hibernate.dialect.PostgreSQLDialect
       SPRING_CONFIG_LOCATION: file:/app/config/application.properties
 
       # Flyway database migrations (web-server is the migration owner)
-      SPRING_FLYWAY_ENABLED: "true"
+      SPRING_FLYWAY_ENABLED: "false"
       SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
       SPRING_FLYWAY_BASELINE_VERSION: "0"
       SPRING_FLYWAY_LOCATIONS: classpath:db/migration/managed
@@ -108,6 +108,7 @@ services:
       MANAGEMENT_ENDPOINT_HEALTH_SHOW_DETAILS: when-authorized
       LOGGING_FILE_NAME: /app/logs/codecrow-web-application.log
 
+      CODECROW_SECURITY_CORS_ALLOWED_ORIGINS: "http://codecrow.abangexpress.co.id,https://codecrow.abangexpress.co.id,http://localhost:*,https://*.abangexpress.co.id"
       CODECROW_INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?INTERNAL_API_SECRET must be set in .env}
       CODECROW_RAG_API_SECRET: ${INTERNAL_API_SECRET:?INTERNAL_API_SECRET must be set in .env}
       CODECROW_PIPELINE_AGENT_BASE_URL: http://pipeline-agent:8082
@@ -142,7 +143,7 @@ services:
       SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-codecrow_user}
       SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
 
-      SPRING_JPA_HIBERNATE_DDL_AUTO: validate
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
       SPRING_JPA_SHOW_SQL: "false"
       SPRING_JPA_PROPERTIES_HIBERNATE_FORMAT_SQL: "false"
       SPRING_JPA_DATABASE_PLATFORM: org.hibernate.dialect.PostgreSQLDialect
@@ -158,6 +159,7 @@ services:
       SPRING_REDIS_PORT: 6379
       RAG_API_URL: http://rag-pipeline:8001
       RAG_ENABLED: "true"
+      CODECROW_SECURITY_CORS_ALLOWED_ORIGINS: "http://codecrow.abangexpress.co.id,https://codecrow.abangexpress.co.id,http://localhost:*,https://*.abangexpress.co.id"
       CODECROW_INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?INTERNAL_API_SECRET must be set in .env}
       CODECROW_RAG_API_SECRET: ${INTERNAL_API_SECRET:?INTERNAL_API_SECRET must be set in .env}
       ANALYSIS_MAX_FILES: ${ANALYSIS_MAX_FILES:-150}
@@ -302,11 +304,12 @@ services:
     image: ghcr.io/${GITHUB_REPOSITORY_OWNER:-rostilos}/codecrow-web-frontend:latest
     container_name: codecrow-web-frontend
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9088:8080"
     networks:
       - codecrow-network
     volumes:
       - web_frontend_logs:/app/logs
+      - ../frontend/dist:/usr/share/nginx/html:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:8080 || exit 1"]
       interval: 30s

@@ -128,6 +128,9 @@ Do not treat a newly added fix as duplication merely because another subsystem
 solves a related null/error case differently. Report only a proven redundant or
 conflicting execution path that remains after the PR.
 
+LANGUAGE AND LOCALIZATION (MANDATORY):
+- Always write all descriptions, titles, explanations, business impacts, suggestions, and recommendations in clear, professional Indonesian (Bahasa Indonesia).
+
 Output Format
 Return ONLY valid JSON:
 
