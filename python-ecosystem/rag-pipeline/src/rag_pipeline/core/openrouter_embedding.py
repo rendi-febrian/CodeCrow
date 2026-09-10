@@ -270,6 +270,7 @@ class OpenRouterEmbedding(BaseEmbedding):
             request_kwargs = {
                 "input": input_value,
                 "model": self._config["model"],
+                "encoding_format": "float",
             }
             if extra_body is not None:
                 request_kwargs["extra_body"] = extra_body
