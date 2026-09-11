@@ -35,8 +35,8 @@ class McpToolExecutor:
             "max_calls": 3,
         },
         "stage_3": {
-            "tools": {"getBranchFileContent", "getPullRequestComments"},
-            "max_calls": 5,
+            "tools": {"getBranchFileContent", "getPullRequestComments", "getPullRequest", "getPullRequestDiff"},
+            "max_calls": 8,
         },
     }
 
@@ -213,6 +213,58 @@ class McpToolExecutor:
                                 if self.stage == "stage_3"
                                 else ["branch", "filePath"]
                             ),
+                        },
+                    },
+                })
+            elif tool_name == "getPullRequest":
+                definitions.append({
+                    "type": "function",
+                    "function": {
+                        "name": "getPullRequest",
+                        "description": "Get details of a pull request from this repository or dependency repository (e.g. AXDatabase).",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "workspace": {
+                                    "type": "string",
+                                    "description": "Workspace or organization name (e.g. Abang-Express)"
+                                },
+                                "repoSlug": {
+                                    "type": "string",
+                                    "description": "Repository slug or name (e.g. AXDatabase)"
+                                },
+                                "pullRequestId": {
+                                    "type": "string",
+                                    "description": "Pull request number / ID"
+                                },
+                            },
+                            "required": ["repoSlug", "pullRequestId"],
+                        },
+                    },
+                })
+            elif tool_name == "getPullRequestDiff":
+                definitions.append({
+                    "type": "function",
+                    "function": {
+                        "name": "getPullRequestDiff",
+                        "description": "Get the file diff and changes of a pull request from this repository or dependency repository (e.g. AXDatabase) to verify schema migrations.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "workspace": {
+                                    "type": "string",
+                                    "description": "Workspace or organization name (e.g. Abang-Express)"
+                                },
+                                "repoSlug": {
+                                    "type": "string",
+                                    "description": "Repository slug or name (e.g. AXDatabase)"
+                                },
+                                "pullRequestId": {
+                                    "type": "string",
+                                    "description": "Pull request number / ID"
+                                },
+                            },
+                            "required": ["repoSlug", "pullRequestId"],
                         },
                     },
                 })

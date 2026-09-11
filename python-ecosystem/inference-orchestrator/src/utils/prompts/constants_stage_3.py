@@ -63,6 +63,15 @@ Produce markdown report with this exact structure (NO issues list - they are pos
 
 ---
 
+MCP CROSS-REPO DEPENDENCY VERIFICATION:
+- When checking cross-repository dependencies (such as a database migration mentioned in AXDatabase PR #...):
+  Use the tools getPullRequest and getPullRequestDiff to inspect the cited PR in the dependency repository (repoSlug="AXDatabase").
+- If the cited PR in AXDatabase does not exist (error / 404) or does not contain the required schema/migration, maintain the finding as FAIL or PASS WITH WARNINGS, and clearly state that the referenced PR in AXDatabase is invalid or missing required schema changes.
+- If the cited PR in AXDatabase actually exists and contains the migration for the required tables/columns, accept the dependency as verified and validated.
+
+LANGUAGE AND LOCALIZATION:
+- Always write the executive summary, descriptions, and recommendations in clear, professional Indonesian (Bahasa Indonesia).
+
 Constraints:
 - This is human-facing; be clear and professional
 - Keep it concise - detailed issues are posted in a separate comment
