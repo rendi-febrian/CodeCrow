@@ -31,6 +31,11 @@ EMBEDDING_MODEL_DIMENSIONS = {
     "nomic-embed-text": 768,
     "mxbai-embed-large": 1024,
     "all-minilm": 384,
+    # Google / Vertex AI models
+    "text-embedding-004": 768,
+    "text-embedding-005": 768,
+    "gemini-embedding-001": 3072,
+    "gemini-embedding-2": 3072,
     # Default fallback
     "default": 1536,
 }
@@ -180,6 +185,8 @@ class RAGConfig(BaseModel):
         elif self.embedding_provider == "ollama":
             logger.info(f"Using Ollama local embeddings with model: {self.ollama_model}")
             logger.info(f"Ollama base URL: {self.ollama_base_url}")
+        elif self.embedding_provider in ("google", "vertex", "google_vertex", "gemini"):
+            logger.info("Using Google/Vertex AI embeddings")
         else:
             logger.warning(f"Unknown embedding provider '{self.embedding_provider}', defaulting to 'ollama'")
             self.embedding_provider = "ollama"

@@ -290,6 +290,10 @@ services:
       - rag_logs:/app/logs
       - ./config/rag-pipeline/.env:/app/.env
       - ./config/rag-pipeline/newrelic.ini:/app/newrelic.ini:ro
+      - ./config/rag-pipeline/vertex-service-account.json:/app/config/vertex-service-account.json:ro
+      - ../python-ecosystem/rag-pipeline/src/rag_pipeline/core/google_embedding.py:/app/src/rag_pipeline/core/google_embedding.py:ro
+      - ../python-ecosystem/rag-pipeline/src/rag_pipeline/core/embedding_factory.py:/app/src/rag_pipeline/core/embedding_factory.py:ro
+      - ../python-ecosystem/rag-pipeline/src/rag_pipeline/models/config.py:/app/src/rag_pipeline/models/config.py:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s

@@ -3,3 +3,4 @@ java-shared/application.properties
 **/*.pem
 **/newrelic.ini
 **/newrelic*.yml
+**/vertex-service-account.json

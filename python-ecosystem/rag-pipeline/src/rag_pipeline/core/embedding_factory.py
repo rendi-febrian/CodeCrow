@@ -1,6 +1,6 @@
 """
 Embedding factory for creating embedding models based on configuration.
-Supports switching between local (Ollama) and cloud (OpenRouter) providers.
+Supports switching between local (Ollama) and cloud (OpenRouter / Google Vertex) providers.
 """
 
 import logging
@@ -21,15 +21,6 @@ def create_embedding_model(
     *,
     workload: str = "index",
 ) -> BaseEmbedding:
-    """
-    Create an embedding model based on the configuration.
-    
-    Args:
-        config: RAGConfig with embedding provider settings
-        
-    Returns:
-        BaseEmbedding instance (OllamaEmbedding or OpenRouterEmbedding)
-    """
     provider = config.embedding_provider.lower()
     
     if provider == "ollama":
@@ -41,7 +32,25 @@ def create_embedding_model(
             timeout=timeout,
             expected_dim=config.embedding_dim
         )
-    
+    elif provider in ("google", "vertex", "google_vertex", "gemini"):
+        from .google_embedding import GoogleEmbedding
+        mode = os.getenv("GOOGLE_EMBEDDING_MODE", "vertex")
+        sa_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH", "/app/config/vertex-service-account.json")
+        api_key = os.getenv("GOOGLE_API_KEY", "")
+        model = os.getenv("GOOGLE_EMBEDDING_MODEL", "text-embedding-004")
+        location = os.getenv("GOOGLE_VERTEX_LOCATION", "us-central1")
+        project_id = os.getenv("GOOGLE_VERTEX_PROJECT", "optimum-octane-506706-p8")
+        
+        logger.info(f"Creating Google/Vertex embedding model: {model} (mode={mode})")
+        return GoogleEmbedding(
+            mode=mode,
+            model=model,
+            service_account_path=sa_path,
+            api_key=api_key,
+            project_id=project_id,
+            location=location,
+            expected_dim=config.embedding_dim or (768 if mode == "vertex" else 3072)
+        )
     elif provider == "openrouter":
         timeout = float(os.getenv("OPENROUTER_TIMEOUT", "300"))
         provider_sort = (
@@ -50,8 +59,7 @@ def create_embedding_model(
             else config.openrouter_index_provider_sort
         )
         logger.info(
-            "Creating OpenRouter embedding model: %s "
-            "(workload=%s timeout=%ss provider_sort=%s)",
+            "Creating OpenRouter embedding model: %s (workload=%s timeout=%ss provider_sort=%s)",
             config.openrouter_model,
             workload,
             timeout,
@@ -71,7 +79,6 @@ def create_embedding_model(
             service_max_in_flight=config.openrouter_max_in_flight,
             redis_url=os.getenv("REDIS_URL", "redis://redis:6379/1"),
         )
-    
     else:
         logger.warning(f"Unknown embedding provider '{provider}', defaulting to Ollama")
         timeout = float(os.getenv("OLLAMA_TIMEOUT", "120"))
@@ -84,15 +91,6 @@ def create_embedding_model(
 
 
 def get_embedding_model_info(config: RAGConfig) -> dict:
-    """
-    Get information about the configured embedding model.
-    
-    Args:
-        config: RAGConfig with embedding provider settings
-        
-    Returns:
-        Dictionary with provider info
-    """
     provider = config.embedding_provider.lower()
     
     if provider == "ollama":
@@ -102,6 +100,14 @@ def get_embedding_model_info(config: RAGConfig) -> dict:
             "base_url": config.ollama_base_url,
             "embedding_dim": config.embedding_dim,
             "type": "local"
+        }
+    elif provider in ("google", "vertex", "google_vertex", "gemini"):
+        return {
+            "provider": "google_vertex",
+            "model": os.getenv("GOOGLE_EMBEDDING_MODEL", "text-embedding-004"),
+            "base_url": f"https://{os.getenv('GOOGLE_VERTEX_LOCATION', 'us-central1')}-aiplatform.googleapis.com",
+            "embedding_dim": config.embedding_dim or 768,
+            "type": "cloud"
         }
     elif provider == "openrouter":
         return {
